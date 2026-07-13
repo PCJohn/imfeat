@@ -1,8 +1,9 @@
-"""imfeat benchmark: latency vs the old two-package pipeline, and the
-latency/accuracy trade-off of `stride` across input sizes and channel counts.
+"""imfeat benchmark: the latency/accuracy trade-off of `stride`, swept across input
+sizes and channel counts.
 
-Quality is measured against the stride=1 output of the SAME extractor (the exact
-answer), per feature group, on the finest pyramid level.
+Quality is always measured against the stride=1 output of the SAME configuration (the
+exact answer), per feature group, on the finest pyramid level -- so every row compares
+like with like.
 
 Run: python bench_compare.py
 """
@@ -139,61 +140,27 @@ def head(title):
 def main():
     T = 256
     grid = [(e, e) for e in EXPS]
-    img = synth(T, 3)
-
-    head(f"1. Fused vs separate packages   ({T}x{T}x3, {len(EXPS)} levels, stride=2)")
-    try:
-        import structstats as ss
-        import tensorstats as ts
-
-        sc = ts.StatsComputer(
-            shape=(T, T, 3),
-            axes=[(0, 1)],
-            stride=(2, 2, 1),
-            grid=[(e, e, 2) for e in EXPS],
-        )
-        st1 = ss.StructComputer(shape=(T, T), grid=grid, stride=2)
-        st3 = ss.StructComputer(shape=(T, T, 3), grid=grid, stride=2)
-        fc = imfeat.FeatureComputer((T, T, 3), grid=grid, stride=2)
-        v = np.ascontiguousarray(img[:, :, 2])
-        old_fg = bench(lambda: (sc.compute(img), st1.features(v)))
-        old_all = bench(lambda: (sc.compute(img), st3.features(img)))
-        new = bench(lambda: fc.features(img))
-        print(
-            f"  tensorstats(3ch) + structstats(1ch)  [framegate today] : {old_fg:7.3f} ms"
-        )
-        print(
-            f"  tensorstats(3ch) + structstats(3ch)  [target]          : {old_all:7.3f} ms"
-        )
-        print(
-            f"  imfeat, fused, moments+structure on 3ch                : {new:7.3f} ms"
-        )
-        print(
-            f"  -> {old_fg / new:.2f}x vs framegate-today, {old_all / new:.2f}x vs target"
-        )
-    except ImportError:
-        print("  (tensorstats/structstats not installed -- skipped)")
 
     head(
-        f"2. Stride: latency vs accuracy   ({T}x{T}x3)\n"
+        f"1. Stride: latency vs accuracy   ({T}x{T}x3)\n"
         "   Errors vs the exact stride=1 output. mean_err/std_err in grey levels;\n"
         "   ori_deg is coherence-weighted; energy_r/cnt_r/hog_cos: 1.0 = exact."
     )
     table(sweep(T, 3))
 
     head(
-        "3. Input size   (3ch; each block's speedup/errors are vs its own stride=1)\n"
+        "2. Input size   (3ch; each block's speedup/errors are vs its own stride=1)\n"
         f"   * = stride exceeds the finest cell width (n/{1 << EXPS[0]}), so only one column\n"
         "   per cell is sampled -- the knob has saturated and accuracy collapses."
     )
     for n in (128, 256, 512, 1024):
         table(sweep(n, 3), f"{n}x{n}x3")
 
-    head(f"4. Channel count   ({T}x{T}; every feature computed on every channel)")
+    head(f"3. Channel count   ({T}x{T}; every feature computed on every channel)")
     for c in (1, 2, 3, 4, 8, 16):
         table(sweep(T, c), f"C={c}")
 
-    head(f"5. Per-channel cost   ({T}x{T}, stride=2): SIMD packs 4 channels per vector")
+    head(f"4. Per-channel cost   ({T}x{T}, stride=2): SIMD packs 4 channels per vector")
     for c in (1, 2, 3, 4, 8, 16):
         im = synth(T, c)
         fc = imfeat.FeatureComputer(im.shape, grid=grid, stride=2)
