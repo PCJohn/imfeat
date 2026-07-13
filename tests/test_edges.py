@@ -140,6 +140,62 @@ def test_power_sum_headroom_on_a_large_frame():
     )
 
 
+# ---------------- parity with the suites imfeat replaces ---------------------
+def test_stride_none_equals_one():
+    img = rng.integers(0, 256, (64, 64, 3), dtype=np.uint8)
+    a = imfeat.FeatureComputer(img.shape, grid=[(3, 3)], stride=None).features(img)
+    b = imfeat.FeatureComputer(img.shape, grid=[(3, 3)], stride=1).features(img)
+    for k in a:
+        assert np.array_equal(a[k], b[k]), k
+
+
+def test_empty_cell_is_zero():
+    """A stride coarser than the cell height skips whole cell-rows. Those cells have
+    no samples: every feature must be a finite zero, not a NaN from a 0/0."""
+    img = rng.integers(0, 256, (256, 256), dtype=np.uint8)
+    fc = imfeat.FeatureComputer(img.shape, grid=[(5, 5)], stride=(16, 1))  # 8px cells
+    raw, f = fc.compute(img), fc.features(img)
+    assert raw["struct_0"][0, 0, 3] > 0 and raw["struct_0"][1, 0, 3] == 0
+    for g in ("mom", "struct", "hog", "cnt"):
+        assert np.all(f[f"{g}_0"][1::2] == 0.0), g  # the skipped cell-rows
+        assert np.isfinite(f[f"{g}_0"]).all(), g
+
+
+def test_pyramid_equals_separate_computers():
+    """One computer with K levels == K computers with one level each."""
+    img = rng.integers(0, 256, (128, 128, 3), dtype=np.uint8)
+    grid = [(4, 4), (3, 3), (1, 1)]
+    joint = imfeat.FeatureComputer(img.shape, grid=grid).features(img)
+    for i, g in enumerate(grid):
+        solo = imfeat.FeatureComputer(img.shape, grid=[g]).features(img)
+        for grp in ("mom", "struct", "hog", "cnt"):
+            assert np.array_equal(joint[f"{grp}_{i}"], solo[f"{grp}_0"]), f"{grp} lvl{i}"
+
+
+@pytest.mark.parametrize("v", [0, 255])
+def test_uniform_extremes(v):
+    """Saturated inputs: no gradient, no extrema, no spread -- and no division blowups."""
+    img = np.full((64, 64), v, np.uint8)
+    f = imfeat.FeatureComputer(img.shape, grid=[(3, 3)]).features(img)
+    assert np.all(f["mom_0"][..., 0] == v) and np.all(f["mom_0"][..., 1:] == 0.0)
+    assert np.all(f["struct_0"] == 0.0) and np.all(f["cnt_0"] == 0.0)
+    assert np.all(f["hog_0"] == 0.0) and np.isfinite(f["struct_0"]).all()
+
+
+def test_gaussian_blob_localizes():
+    """A compact blob: variance and edge energy both peak on its slope (not its
+    flatter apex), within a cell of the centre, and its peak is one strict local max."""
+    n, cy, cx = 128, 88, 40
+    y, x = np.mgrid[0:n, 0:n]
+    img = (255 * np.exp(-(((x - cx) ** 2 + (y - cy) ** 2) / (2 * 6.0**2)))).astype(np.uint8)
+    f = imfeat.FeatureComputer(img.shape, grid=[(4, 4)]).features(img)  # 8px cells
+    cell = np.array([cy * 16 // n, cx * 16 // n])
+    for key, band in (("mom_0", 1), ("struct_0", 0)):  # variance, edge energy
+        peak = np.array(np.unravel_index(np.argmax(f[key][..., band]), (16, 16)))
+        assert np.abs(peak - cell).max() <= 1, f"{key} peaked at {peak}, blob at {cell}"
+    assert imfeat.FeatureComputer(img.shape, grid=[(0, 0)]).compute(img)["cnt_global"][0] == 1
+
+
 # ---------------- API errors --------------------------------------------------
 def test_input_validation():
     fc = imfeat.FeatureComputer((32, 32), grid=[(2, 2)])
