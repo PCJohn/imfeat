@@ -1,0 +1,18 @@
+[build-system]
+requires = ["scikit-build-core>=0.9", "nanobind>=2.0"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "imfeat"
+version = "0.1.0"
+description = "Fast single-pass image feature extraction: moments + gradient structure statistics"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = ["numpy"]
+
+[project.optional-dependencies]
+dev = ["pytest", "numpy", "opencv-python"]
+
+[tool.scikit-build]
+cmake.build-type = "Release"
+wheel.packages = ["src/imfeat"]
