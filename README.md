@@ -70,9 +70,23 @@ FeatureComputer(shape, grid, stride=None, channels=None, channel_axis=-1)
 Both return a flat dict keyed `{group}_{level}` for `group` in
 `struct | hog | cnt | mom` and `level` in `0..K-1 | global`.
 
+## Cost
+
+One pass over a 256x256x3 frame, 4 pyramid levels, every feature on every channel:
+~1.0 ms at stride 2, ~2.5 ms at stride 1 (AVX2 laptop class). Roughly half of that is
+the accumulator maths -- HOG's orientation binning is the single largest item -- and
+half is the per-row preparation and per-cell flush. Pyramid depth is free (coarser
+levels are sums of finer cells) and `features()` costs the same as `compute()` (the
+derivation is negligible next to the sweep). Channels are cheap after the first: the
+channel is the SIMD lane, so C=3 costs ~1.7x C=1, and beyond the 4-lane group the
+marginal cost is ~0.27 ms/channel at 256x256.
+
+`bench_compare.py` reports latency against the old two-package pipeline plus the
+accuracy cost of `stride`, swept over input sizes and channel counts.
+
 ## Build
 
 ```
 pip install .
-pytest tests -q
+pytest tests -q          # 351 tests: exactness vs numpy oracles, semantics, edges
 ```

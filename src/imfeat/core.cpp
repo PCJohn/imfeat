@@ -20,14 +20,20 @@
 namespace nb = nanobind;
 
 // imfeat -- single-pass multi-channel image statistics. See __init__.py.
+//
 // Per finest cell per channel we keep NSUM int64 additive sums:
 //   [0..3] Sxx Syy Sxy count | [4..12] HOG(9) | [13,14] local-max/min counts
 //   | [15..18] S1 S2 S3 S4 (raw power sums of the pixel value).
-// Everything is additive, so pyramid levels and the global reduction are exact
-// sums of the finest cells -- the image is read exactly once. Central moments
-// and the tensor eigen-features are nonlinear, so they are derived at the end.
-// Channels share ONE spatial traversal: each pixel updates its channel's slot.
-// Input axis order is normalised to (H, W, C) by the wrapper (zero-copy).
+// Every sum is additive, so pyramid levels and the global reduction are exact
+// sums of the finest cells -- the image is read exactly once. Central moments and
+// the tensor eigen-features are nonlinear, so they are derived at the end.
+//
+// Two nested loops, one traversal:
+//   prepare_row  -- flat, branch-free, auto-vectorized over W*C: Sobel gx/gy and
+//                   the 8-neighbourhood max/min envelopes for every pixel of the
+//                   row. Border clamping happens here, so the hot loop has none.
+//   accumulate_row -- channels-in-lanes SIMD over the row's cells; reads only the
+//                   prepared rows (5 loads/pixel) and scatters into cell sums.
 
 namespace
 {
@@ -47,10 +53,11 @@ constexpr int NF = NF_S + HB + 2; // 16 derived float32 per cell per channel
 constexpr int64_t RAYSCALE = 1 << 14;
 constexpr double PI = 3.14159265358979323846;
 
-// SIMD groups channels into vector lanes. SIMD_CH is the lane cap of the int32
-// tag (a 128-bit vector holds 4 int32); every SIMD scratch array is sized from it.
-// SIMD_PAD (bytes in a 128-bit vector) pads the interleaved row buffers so a LoadU
-// reading a full vector past the last channel of the last column stays in-bounds.
+// The CHANNEL is the SIMD lane. SIMD_CH is the lane cap of the int32 tag (a
+// 128-bit vector holds 4); channels are processed in groups of that many, so every
+// scratch array is sized from it. SIMD_PAD (bytes in a 128-bit vector) pads the
+// interleaved row buffers so a full-vector LoadU past the last channel of the last
+// column stays in-bounds -- the surplus lanes are computed and then discarded.
 constexpr int SIMD_CH = 4;
 constexpr int SIMD_PAD = 16;
 
@@ -59,19 +66,16 @@ inline int clampi(int v, int hi)
   return v < 0 ? 0 : (v > hi ? hi : v);
 }
 
-// Channels-in-lanes SIMD kernel: the CHANNEL is the vector lane. Sweeps a whole
-// row of `ncell` finest cells (each `cw` wide) in one call, resetting the
-// accumulators at each cell start and flushing them to that cell at its end. One
-// call per row (rather than one per cell) amortises the per-call setup -- the
-// vector descriptors and the ray-direction broadcasts -- over the row; the pixel
-// loop itself runs at the same rate either way. Reads interleaved vs/vd
-// (vsb[c*strideC + ch]) and raw rows. Bit-exact to accumulate_run.
-static void accumulate_row_simd(const int16_t *IF_RESTRICT vsb, const int16_t *IF_RESTRICT vdb,
-                                const uint8_t *IF_RESTRICT r0, const uint8_t *IF_RESTRICT r1,
-                                const uint8_t *IF_RESTRICT r2, int strideC, int ch0, int cw,
-                                int ncell, int hi_c, int n, int sx,
-                                const int32_t *IF_RESTRICT hcx, const int32_t *IF_RESTRICT hcy,
-                                int cellstride, int64_t *IF_RESTRICT rowbase)
+// Sweeps one row of `ncell` finest cells (each `cw` px wide) for one group of `n`
+// channels, resetting the accumulators at each cell start and flushing them at its
+// end. One call per row (not per cell) amortises the vector-descriptor and
+// ray-direction setup over the whole row.
+void accumulate_row(const int16_t *IF_RESTRICT gxb, const int16_t *IF_RESTRICT gyb,
+                    const uint8_t *IF_RESTRICT vb, const uint8_t *IF_RESTRICT mxb,
+                    const uint8_t *IF_RESTRICT mnb, int strideC, int ch0, int cw, int ncell,
+                    int n, int sx, const int32_t *IF_RESTRICT hcx,
+                    const int32_t *IF_RESTRICT hcy, int cellstride,
+                    int64_t *IF_RESTRICT rowbase)
 {
   namespace hn = hwy::HWY_NAMESPACE;
   const hn::CappedTag<int32_t, SIMD_CH> d;
@@ -81,14 +85,11 @@ static void accumulate_row_simd(const int16_t *IF_RESTRICT vsb, const int16_t *I
   const auto zero = hn::Zero(d);
   const int HL = (int)hn::Lanes(d64);
 
-  auto vs_at = [&](int col) {
-    return hn::PromoteTo(d, hn::LoadU(d16, vsb + (size_t)col * strideC + ch0));
+  auto i16_at = [&](const int16_t *p, int col) {
+    return hn::PromoteTo(d, hn::LoadU(d16, p + (size_t)col * strideC + ch0));
   };
-  auto vd_at = [&](int col) {
-    return hn::PromoteTo(d, hn::LoadU(d16, vdb + (size_t)col * strideC + ch0));
-  };
-  auto raw_at = [&](const uint8_t *row, int col) {
-    return hn::PromoteTo(d, hn::LoadU(d8, row + (size_t)col * strideC + ch0));
+  auto u8_at = [&](const uint8_t *p, int col) {
+    return hn::PromoteTo(d, hn::LoadU(d8, p + (size_t)col * strideC + ch0));
   };
 
   hn::VFromD<decltype(d)> hcxv[HB - 1], hcyv[HB - 1];
@@ -112,13 +113,10 @@ static void accumulate_row_simd(const int16_t *IF_RESTRICT vsb, const int16_t *I
     for (int k = 0; k < HB * n; ++k)
       hog[k] = 0;
     int64_t colcount = 0;
-    const int c0 = e * cw, c1 = c0 + cw;
-    for (int c = c0; c < c1; c += sx)
+    const int c1 = e * cw + cw;
+    for (int c = e * cw; c < c1; c += sx)
     {
-      const int cm = clampi(c - 1, hi_c), cp = clampi(c + 1, hi_c);
-      const auto gx = hn::Sub(vs_at(cp), vs_at(cm));
-      const auto vdc = vd_at(c);
-      const auto gy = hn::Add(hn::Add(vd_at(cm), hn::Add(vdc, vdc)), vd_at(cp));
+      const auto gx = i16_at(gxb, c), gy = i16_at(gyb, c);
       const auto gx2 = hn::Mul(gx, gx), gy2 = hn::Mul(gy, gy), gxy = hn::Mul(gx, gy);
       axl = hn::Add(axl, hn::PromoteLowerTo(d64, gx2));
       axh = hn::Add(axh, hn::PromoteUpperTo(d64, gx2));
@@ -137,15 +135,14 @@ static void accumulate_row_simd(const int16_t *IF_RESTRICT vsb, const int16_t *I
         const auto t = hn::Sub(hn::Mul(hcxv[j], qy), hn::Mul(hcyv[j], qx));
         b = hn::Sub(b, hn::VecFromMask(d, hn::Ge(t, zero))); // b += (t >= 0)
       }
-      const auto g2 = hn::Add(gx2, gy2);
       hn::StoreU(b, d, blane);
-      hn::StoreU(g2, d, g2lane);
+      hn::StoreU(hn::Add(gx2, gy2), d, g2lane);
       for (int l = 0; l < n; ++l)
         if (g2lane[l])
           hog[l * HB + blane[l]] += (int64_t)g2lane[l];
-      // raw power sums: v <= 255 so v*v fits int32; the cubes/quartics are
-      // accumulated in int64 lanes (v^4 = 4.2e9 already overflows int32).
-      const auto v = raw_at(r1, c);
+      // power sums: v <= 255 so v*v fits int32, but v^4 (4.2e9) does not -- the
+      // cubes and quartics accumulate in int64 lanes.
+      const auto v = u8_at(vb, c);
       const auto v2 = hn::Mul(v, v);
       const auto v1l = hn::PromoteLowerTo(d64, v), v1h = hn::PromoteUpperTo(d64, v);
       const auto v2l = hn::PromoteLowerTo(d64, v2), v2h = hn::PromoteUpperTo(d64, v2);
@@ -157,16 +154,9 @@ static void accumulate_row_simd(const int16_t *IF_RESTRICT vsb, const int16_t *I
       ph[2] = hn::Add(ph[2], hn::Mul(v2h, v1h));
       pl[3] = hn::Add(pl[3], hn::Mul(v2l, v2l));
       ph[3] = hn::Add(ph[3], hn::Mul(v2h, v2h));
-      // strict 8-neighbour extrema; load each neighbour once, reduce as a tree
-      const auto p00 = raw_at(r0, cm), p01 = raw_at(r0, c), p02 = raw_at(r0, cp);
-      const auto p10 = raw_at(r1, cm), p12 = raw_at(r1, cp);
-      const auto p20 = raw_at(r2, cm), p21 = raw_at(r2, c), p22 = raw_at(r2, cp);
-      const auto mx = hn::Max(hn::Max(hn::Max(p00, p01), hn::Max(p02, p10)),
-                              hn::Max(hn::Max(p12, p20), hn::Max(p21, p22)));
-      const auto mn = hn::Min(hn::Min(hn::Min(p00, p01), hn::Min(p02, p10)),
-                              hn::Min(hn::Min(p12, p20), hn::Min(p21, p22)));
-      nmaxv = hn::Sub(nmaxv, hn::VecFromMask(d, hn::Gt(v, mx)));
-      nminv = hn::Sub(nminv, hn::VecFromMask(d, hn::Lt(v, mn)));
+      // strict 8-neighbour extrema, against the envelopes prepare_row built
+      nmaxv = hn::Sub(nmaxv, hn::VecFromMask(d, hn::Gt(v, u8_at(mxb, c))));
+      nminv = hn::Sub(nminv, hn::VecFromMask(d, hn::Lt(v, u8_at(mnb, c))));
     }
     hn::StoreU(axl, d64, xx);
     hn::StoreU(axh, d64, xx + HL);
@@ -211,15 +201,18 @@ struct Level
 class FeatureComputer
 {
   int h_ = 0, w_ = 0, c_ = 1, sy_ = 1, sx_ = 1;
-  bool ident_ = true; // channels are 0..c_-1 (the whole image, in order)
+  bool interleaved_ = false; // source rows are already the (H,W,C) layout we want
   std::vector<int> chan_;
+  std::vector<int64_t> coff_; // per-selected-channel offset within a pixel
   std::vector<Level> levels_;
   std::vector<int> row_cell_;
-  std::vector<int64_t> coff_;            // per-selected-channel byte offset
-  std::vector<int16_t> vs_, vd_;         // per-row planar Sobel caches (scalar path), c_*w each
-  std::vector<int16_t> vsi_, vdi_;       // interleaved padded Sobel caches (SIMD path)
-  std::vector<uint8_t> ri0_, ri1_, ri2_; // interleaved padded raw rows (SIMD path)
   int32_t hcx_[HB - 1] = {}, hcy_[HB - 1] = {};
+
+  // Per-row scratch, all interleaved (c * c_ + k) and padded by SIMD_PAD. One row
+  // is a few KB, so it stays hot in L1 across the whole cell sweep.
+  std::vector<uint8_t> r0_, r1_, r2_, cmx_, cmn_, mx_, mn_;
+  std::vector<int16_t> vs_, vd_, gx_, gy_;
+
   std::vector<int64_t> graw_;
   std::vector<float> gfeat_;
   std::vector<double> gmom_;
@@ -251,7 +244,7 @@ class FeatureComputer
 
   // Central moments [mean, var, m3, m4] (float64) from the raw power sums.
   // Shifting by K = round(mean) before the binomial expansion keeps every
-  // intermediate exact in int64 and kills the cancellation that S2/n - mu^2
+  // intermediate exact in int64 and kills the cancellation that S2/n - mean^2
   // suffers on low-variance cells; the residual d = (S1 - nK)/n is <= 0.5.
   void derive_moments(const int64_t *IF_RESTRICT s, double *IF_RESTRICT m) const
   {
@@ -276,76 +269,73 @@ class FeatureComputer
     m[3] = u4 - 4.0 * d * u3 + 6.0 * d2 * u2 - 3.0 * d2 * d2;
   }
 
-  // One channel's column run within one finest cell -> its accumulator slot.
-  void accumulate_run(const int16_t *IF_RESTRICT vs, const int16_t *IF_RESTRICT vd,
-                      const uint8_t *IF_RESTRICT r0, const uint8_t *IF_RESTRICT r1,
-                      const uint8_t *IF_RESTRICT r2, int64_t cs, int c0, int c1, int hi_c,
-                      int64_t *IF_RESTRICT acc) const
+  // Gather rows r-1, r, r+1 into the interleaved scratch, then compute -- for every
+  // pixel of the row, flat over W*C and branch-free, so the compiler vectorizes it
+  // over columns -- the Sobel gradients and the 8-neighbour max/min envelopes. All
+  // border clamping is confined here (two fix-up columns), so the SIMD cell loop
+  // that follows is a straight walk with no bounds logic.
+  void prepare_row(const uint8_t *IF_RESTRICT img, int r, int64_t rs, int64_t cs)
   {
-    int64_t axx = 0, ayy = 0, axy = 0, acnt = 0, nmax = 0, nmin = 0;
-    int64_t hog[HB] = {0}, ps[NMOM] = {0};
-    for (int c = c0; c < c1; c += sx_)
+    const int hi_r = h_ - 1, WC = w_ * c_;
+    const uint8_t *rows[3] = {img + (int64_t)clampi(r - 1, hi_r) * rs, img + (int64_t)r * rs,
+                              img + (int64_t)clampi(r + 1, hi_r) * rs};
+    uint8_t *dst[3] = {r0_.data(), r1_.data(), r2_.data()};
+    for (int i = 0; i < 3; ++i)
     {
-      const int cm = clampi(c - 1, hi_c), cp = clampi(c + 1, hi_c);
-      const int gx = vs[cp] - vs[cm];
-      const int gy = vd[cm] + 2 * vd[c] + vd[cp];
-      const int64_t g2 = (int64_t)gx * gx + (int64_t)gy * gy;
-      axx += (int64_t)gx * gx;
-      ayy += (int64_t)gy * gy;
-      axy += (int64_t)gx * gy;
-      ++acnt;
-      int qx = gx, qy = gy;
-      if (qy < 0 || (qy == 0 && qx < 0))
-      {
-        qx = -qx;
-        qy = -qy;
-      }
-      if (g2)
-      {
-        int b = 0;
-        for (int j = 0; j < HB - 1; ++j)
-          b += (hcx_[j] * qy - hcy_[j] * qx) >= 0;
-        hog[b] += g2;
-      }
-      const int64_t km = (int64_t)cm * cs, kc = (int64_t)c * cs, kp = (int64_t)cp * cs;
-      const int v = r1[kc];
-      const int64_t x = v, x2 = x * x;
-      ps[0] += x;
-      ps[1] += x2;
-      ps[2] += x2 * x;
-      ps[3] += x2 * x2;
-      const int nb[8] = {r0[km], r0[kc], r0[kp], r1[km], r1[kp], r2[km], r2[kc], r2[kp]};
-      int mx = nb[0], mn = nb[0];
-      for (int t = 1; t < 8; ++t)
-      {
-        mx = nb[t] > mx ? nb[t] : mx;
-        mn = nb[t] < mn ? nb[t] : mn;
-      }
-      nmax += v > mx;
-      nmin += v < mn;
+      if (interleaved_)
+        std::memcpy(dst[i], rows[i], (size_t)WC);
+      else
+        for (int c = 0; c < w_; ++c)
+          for (int k = 0; k < c_; ++k)
+            dst[i][(size_t)c * c_ + k] = rows[i][(int64_t)c * cs + coff_[k]];
     }
-    acc[SXX] += axx;
-    acc[SYY] += ayy;
-    acc[SXY] += axy;
-    acc[CNT] += acnt;
-    for (int b = 0; b < HB; ++b)
-      acc[HOG0 + b] += hog[b];
-    acc[NMAX] += nmax;
-    acc[NMIN] += nmin;
-    for (int k = 0; k < NMOM; ++k)
-      acc[PS0 + k] += ps[k];
-  }
-
-  static int simd_lanes()
-  {
-    namespace hn = hwy::HWY_NAMESPACE;
-    const hn::CappedTag<int32_t, SIMD_CH> d;
-    return (int)hn::Lanes(d);
+    const uint8_t *IF_RESTRICT a = r0_.data(), *IF_RESTRICT b = r1_.data(),
+                               *IF_RESTRICT e = r2_.data();
+    // Three flat, branch-free loops over W*C, each auto-vectorized (the uint8 min/max
+    // ones 16 lanes wide). Kept separate so no loop carries a mixed-width dependency
+    // the vectorizer would refuse.
+    for (int o = 0; o < WC; ++o)
+    {
+      vs_[o] = (int16_t)(a[o] + 2 * b[o] + e[o]); // vertical Sobel: smooth, difference
+      vd_[o] = (int16_t)(e[o] - a[o]);
+      cmx_[o] = a[o] > e[o] ? a[o] : e[o]; // the column's two off-centre rows; the
+      cmn_[o] = a[o] < e[o] ? a[o] : e[o]; //   horizontal 3-window below completes it
+    }
+    const int C = c_;
+    for (int o = C; o < WC - C; ++o)
+    {
+      gx_[o] = (int16_t)(vs_[o + C] - vs_[o - C]);
+      gy_[o] = (int16_t)(vd_[o - C] + 2 * vd_[o] + vd_[o + C]);
+    }
+    // 8-neighbour envelopes. The centre is excluded from its own: the middle row
+    // contributes only b[o-C] and b[o+C] -- which collapse onto the centre at a border
+    // column, exactly as a replicate-padded 3x3 does, so a border pixel can never be a
+    // strict extremum.
+    for (int o = C; o < WC - C; ++o)
+    {
+      uint8_t hi = cmx_[o - C] > cmx_[o + C] ? cmx_[o - C] : cmx_[o + C];
+      uint8_t lo = cmn_[o - C] < cmn_[o + C] ? cmn_[o - C] : cmn_[o + C];
+      const uint8_t bhi = b[o - C] > b[o + C] ? b[o - C] : b[o + C];
+      const uint8_t blo = b[o - C] < b[o + C] ? b[o - C] : b[o + C];
+      hi = hi > cmx_[o] ? hi : cmx_[o];
+      lo = lo < cmn_[o] ? lo : cmn_[o];
+      mx_[o] = hi > bhi ? hi : bhi;
+      mn_[o] = lo < blo ? lo : blo;
+    }
+    const int last = (w_ - 1) * C, step = w_ > 1 ? C : 0;
+    for (int k = 0; k < C; ++k) // the two border columns, clamped
+      for (int o : {k, last + k})
+      {
+        const int om = o == k ? k : last - step + k, op = o == k ? k + step : last + k;
+        gx_[o] = (int16_t)(vs_[op] - vs_[om]);
+        gy_[o] = (int16_t)(vd_[om] + 2 * vd_[o] + vd_[op]);
+        mx_[o] = std::max({cmx_[om], cmx_[o], cmx_[op], b[om], b[op]});
+        mn_[o] = std::min({cmn_[om], cmn_[o], cmn_[op], b[om], b[op]});
+      }
   }
 
   void accumulate(const uint8_t *IF_RESTRICT img, int64_t rs, int64_t cs, int64_t chs)
   {
-    const int hi_r = h_ - 1, hi_c = w_ - 1;
     Level &fine = levels_[0];
     const int nfx = fine.nx, cw = w_ / nfx;
     int64_t *IF_RESTRICT fb = fine.buf.data();
@@ -353,122 +343,55 @@ class FeatureComputer
 
     for (int k = 0; k < c_; ++k)
       coff_[k] = (int64_t)chan_[k] * chs;
-    // channels-in-lanes needs the selected channels gathered into interleaved
-    // rows first; that gather is cheap, so SIMD applies for any layout.
-    const bool simd = c_ >= 2;
-    const int L = simd ? simd_lanes() : 1;
-    const bool memcpy_row = ident_ && chs == 1 && cs == c_;
+    interleaved_ = chs == 1 && cs == c_ && chan_[0] == 0 && chan_.back() == c_ - 1;
 
+    namespace hn = hwy::HWY_NAMESPACE;
+    const int L = (int)hn::Lanes(hn::CappedTag<int32_t, SIMD_CH>());
     for (int r = 0; r < h_; r += sy_)
     {
-      const uint8_t *IF_RESTRICT b0 = img + (int64_t)clampi(r - 1, hi_r) * rs;
-      const uint8_t *IF_RESTRICT b1 = img + (int64_t)r * rs;
-      const uint8_t *IF_RESTRICT b2 = img + (int64_t)clampi(r + 1, hi_r) * rs;
-      if (simd)
-      { // interleaved, padded raw rows -> flat (auto-vectorizable) vertical Sobel
-        auto fill = [&](uint8_t *IF_RESTRICT dst, const uint8_t *IF_RESTRICT src) {
-          if (memcpy_row)
-            std::memcpy(dst, src, (size_t)w_ * c_); // contiguous HWC row: already interleaved
-          else
-            for (int c = 0; c < w_; ++c)
-              for (int k = 0; k < c_; ++k)
-                dst[(size_t)c * c_ + k] = src[(int64_t)c * cs + coff_[k]];
-        };
-        fill(ri0_.data(), b0);
-        fill(ri1_.data(), b1);
-        fill(ri2_.data(), b2);
-        const int WC = w_ * c_;
-        for (int o = 0; o < WC; ++o)
-        {
-          vsi_[o] = (int16_t)(ri0_[o] + 2 * ri1_[o] + ri2_[o]);
-          vdi_[o] = (int16_t)(ri2_[o] - ri0_[o]);
-        }
-      }
-      else
-      { // planar vertical Sobel cache: vs_[k * w_ + c]
-        for (int k = 0; k < c_; ++k)
-        {
-          const int64_t off = coff_[k];
-          int16_t *IF_RESTRICT vs = vs_.data() + (size_t)k * w_;
-          int16_t *IF_RESTRICT vd = vd_.data() + (size_t)k * w_;
-          for (int c = 0; c < w_; ++c)
-          {
-            const int64_t j = (int64_t)c * cs + off;
-            vs[c] = (int16_t)(b0[j] + 2 * b1[j] + b2[j]);
-            vd[c] = (int16_t)(b2[j] - b0[j]);
-          }
-        }
-      }
+      prepare_row(img, r, rs, cs);
       int64_t *IF_RESTRICT rb = fb + (size_t)(row_cell_[r] * nfx) * c_ * NSUM;
-      if (simd)
-        for (int ch0 = 0; ch0 < c_; ch0 += L)
-          accumulate_row_simd(vsi_.data(), vdi_.data(), ri0_.data(), ri1_.data(), ri2_.data(),
-                              c_, ch0, cw, nfx, hi_c, std::min(L, c_ - ch0), sx_, hcx_, hcy_,
-                              c_ * NSUM, rb + (size_t)ch0 * NSUM);
-      else
-        for (int e = 0; e < nfx; ++e)
-        {
-          const int c0 = e * cw, c1 = c0 + cw;
-          for (int k = 0; k < c_; ++k)
-          {
-            const int64_t off = coff_[k];
-            accumulate_run(vs_.data() + (size_t)k * w_, vd_.data() + (size_t)k * w_, b0 + off,
-                           b1 + off, b2 + off, cs, c0, c1, hi_c,
-                           rb + (size_t)(e * c_ + k) * NSUM);
-          }
-        }
+      for (int ch0 = 0; ch0 < c_; ch0 += L)
+        accumulate_row(gx_.data(), gy_.data(), r1_.data(), mx_.data(), mn_.data(), c_, ch0, cw,
+                       nfx, std::min(L, c_ - ch0), sx_, hcx_, hcy_, c_ * NSUM,
+                       rb + (size_t)ch0 * NSUM);
     }
 
+    const int stripe = c_ * NSUM;
     for (size_t lvl = 1; lvl < levels_.size(); ++lvl)
     {
       const Level &p = levels_[lvl - 1];
       Level &lv = levels_[lvl];
-      const int64_t *IF_RESTRICT pb = p.buf.data();
-      int64_t *IF_RESTRICT lb = lv.buf.data();
-      const int pnx = p.nx, stripe = c_ * NSUM;
       std::fill(lv.buf.begin(), lv.buf.end(), (int64_t)0);
       for (int i = 0; i < p.ny; ++i)
-      {
-        const int ci = (i / lv.fy) * lv.nx;
-        for (int j = 0; j < pnx; ++j)
+        for (int j = 0; j < p.nx; ++j)
         {
-          const int64_t *IF_RESTRICT sc = pb + ((size_t)i * pnx + j) * stripe;
-          int64_t *IF_RESTRICT dc = lb + ((size_t)(ci + j / lv.fx)) * stripe;
+          const int64_t *IF_RESTRICT sc = p.buf.data() + ((size_t)i * p.nx + j) * stripe;
+          int64_t *IF_RESTRICT dc =
+              lv.buf.data() + ((size_t)(i / lv.fy) * lv.nx + j / lv.fx) * stripe;
           for (int t = 0; t < stripe; ++t)
             dc[t] += sc[t];
         }
-      }
     }
 
+    const Level &last = levels_.back();
+    std::fill(graw_.begin(), graw_.end(), (int64_t)0);
+    for (size_t cell = 0, nc = (size_t)last.ny * last.nx; cell < nc; ++cell)
     {
-      const Level &last = levels_.back();
-      const int64_t *IF_RESTRICT lb = last.buf.data();
-      const size_t nc = (size_t)last.ny * last.nx;
-      const int stripe = c_ * NSUM;
-      std::fill(graw_.begin(), graw_.end(), (int64_t)0);
-      for (size_t cell = 0; cell < nc; ++cell)
-      {
-        const int64_t *IF_RESTRICT s = lb + cell * stripe;
-        for (int t = 0; t < stripe; ++t)
-          graw_[t] += s[t];
-      }
+      const int64_t *IF_RESTRICT s = last.buf.data() + cell * stripe;
+      for (int t = 0; t < stripe; ++t)
+        graw_[t] += s[t];
     }
   }
 
   void derive()
   {
     for (Level &L : levels_)
-    {
-      const int64_t *IF_RESTRICT b = L.buf.data();
-      float *IF_RESTRICT f = L.feat.data();
-      double *IF_RESTRICT m = L.mom.data();
-      const size_t nc = (size_t)L.ny * L.nx * c_;
-      for (size_t cell = 0; cell < nc; ++cell)
+      for (size_t cell = 0, nc = (size_t)L.ny * L.nx * c_; cell < nc; ++cell)
       {
-        derive_cell(b + cell * NSUM, f + cell * NF);
-        derive_moments(b + cell * NSUM, m + cell * NMOM);
+        derive_cell(L.buf.data() + cell * NSUM, L.feat.data() + cell * NF);
+        derive_moments(L.buf.data() + cell * NSUM, L.mom.data() + cell * NMOM);
       }
-    }
     for (int k = 0; k < c_; ++k)
     {
       derive_cell(graw_.data() + (size_t)k * NSUM, gfeat_.data() + (size_t)k * NF);
@@ -489,9 +412,6 @@ public:
     c_ = (int)chan_.size();
     sy_ = (int)stride[0];
     sx_ = (int)stride[1];
-    ident_ = (int64_t)c_ == (dims.size() > 2 ? dims[2] : 1);
-    for (int k = 0; k < c_ && ident_; ++k)
-      ident_ = chan_[k] == k;
 
     for (int k = 1; k < HB; ++k)
     {
@@ -528,21 +448,24 @@ public:
       levels_.push_back(std::move(L));
     }
 
-    const Level &f = levels_[0];
     row_cell_.resize(h_);
     for (int r = 0; r < h_; ++r)
-      row_cell_[r] = (int)((int64_t)r * f.ny / h_);
+      row_cell_[r] = (int)((int64_t)r * levels_[0].ny / h_);
+
     coff_.assign(c_, 0);
-    vs_.resize((size_t)c_ * w_);
-    vd_.resize((size_t)c_ * w_);
-    // interleaved SIMD buffers, padded so a full-vector LoadU past the last
-    // channel of the last column stays in-bounds (the extra lanes are ignored).
     const size_t wcp = (size_t)c_ * w_ + SIMD_PAD;
-    vsi_.assign(wcp, 0);
-    vdi_.assign(wcp, 0);
-    ri0_.assign(wcp, 0);
-    ri1_.assign(wcp, 0);
-    ri2_.assign(wcp, 0);
+    r0_.assign(wcp, 0);
+    r1_.assign(wcp, 0);
+    r2_.assign(wcp, 0);
+    cmx_.assign(wcp, 0);
+    cmn_.assign(wcp, 0);
+    mx_.assign(wcp, 0);
+    mn_.assign(wcp, 0);
+    vs_.assign(wcp, 0);
+    vd_.assign(wcp, 0);
+    gx_.assign(wcp, 0);
+    gy_.assign(wcp, 0);
+
     graw_.assign((size_t)c_ * NSUM, 0);
     gfeat_.assign((size_t)c_ * NF, 0.0f);
     gmom_.assign((size_t)c_ * NMOM, 0.0);
@@ -569,33 +492,26 @@ public:
   {
     accumulate(img, rs, cs, chs);
     derive();
-    nb::list out, mom;
+    nb::list feat, mom;
     for (Level &L : levels_)
     {
-      out.append(nb::ndarray<nb::numpy, float>(L.feat.data(), L.fshape.size(), L.fshape.data(),
-                                               nb::handle()));
+      feat.append(nb::ndarray<nb::numpy, float>(L.feat.data(), L.fshape.size(), L.fshape.data(),
+                                                nb::handle()));
       mom.append(nb::ndarray<nb::numpy, double>(L.mom.data(), L.mshape.size(), L.mshape.data(),
                                                 nb::handle()));
     }
-    out.append(nb::ndarray<nb::numpy, float>(gfeat_.data(), gfeat_shape_.size(),
-                                             gfeat_shape_.data(), nb::handle()));
+    feat.append(nb::ndarray<nb::numpy, float>(gfeat_.data(), gfeat_shape_.size(),
+                                              gfeat_shape_.data(), nb::handle()));
     mom.append(nb::ndarray<nb::numpy, double>(gmom_.data(), gmom_shape_.size(),
                                               gmom_shape_.data(), nb::handle()));
     nb::list both;
-    both.append(out);
+    both.append(feat);
     both.append(mom);
     return both;
   }
 };
 
 using Arr = nb::ndarray<nb::numpy, const uint8_t, nb::device::cpu>;
-
-void strides_of(const Arr &a, int64_t &rs, int64_t &cs, int64_t &chs)
-{
-  rs = a.stride(0);
-  cs = a.stride(1);
-  chs = a.ndim() > 2 ? a.stride(2) : 0;
-}
 } // namespace
 
 NB_MODULE(imfeat_core, m)
@@ -609,17 +525,14 @@ NB_MODULE(imfeat_core, m)
       .def(
           "raw",
           [](FeatureComputer &self, Arr a) {
-            int64_t rs, cs, chs;
-            strides_of(a, rs, cs, chs);
-            return self.raw(a.data(), rs, cs, chs);
+            return self.raw(a.data(), a.stride(0), a.stride(1), a.ndim() > 2 ? a.stride(2) : 0);
           },
           nb::arg("arr"))
       .def(
           "features",
           [](FeatureComputer &self, Arr a) {
-            int64_t rs, cs, chs;
-            strides_of(a, rs, cs, chs);
-            return self.features(a.data(), rs, cs, chs);
+            return self.features(a.data(), a.stride(0), a.stride(1),
+                                 a.ndim() > 2 ? a.stride(2) : 0);
           },
           nb::arg("arr"));
 }
