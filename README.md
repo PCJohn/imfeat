@@ -4,7 +4,8 @@ Fast, exact, single-pass image feature extraction on CPU.
 
 `imfeat` walks an image **once** and returns, for every channel and every cell of a dyadic
 pyramid: intensity **moments**, gradient **structure-tensor** features, an **orientation
-histogram**, and **extrema densities**. It is a C++/[Highway](https://github.com/google/highway)
+histogram**, **extrema densities** and a rotation-invariant **LBP** histogram — plus
+**cross-channel** covariance between every pair of channels. It is a C++/[Highway](https://github.com/google/highway)
 SIMD core behind a small [nanobind](https://github.com/wjakob/nanobind) Python API.
 
 It is built for the front of a real-time vision pipeline: hand-crafted, well-understood,
@@ -58,7 +59,7 @@ allocated up front and reused, so steady-state extraction allocates nothing.
 ### `.features(img) -> dict[str, np.ndarray]`
 
 The derived, model-ready maps. Keys are `{group}_{level}`, for `group` in
-`mom | struct | hog | cnt` and `level` in `0 .. K-1` plus `global`:
+`mom | struct | hog | cnt | lbp | xchan` and `level` in `0 .. K-1` plus `global`:
 
 | key | shape | dtype | contents |
 |---|---|---|---|
@@ -66,15 +67,23 @@ The derived, model-ready maps. Keys are `{group}_{level}`, for `group` in
 | `struct_i` | `(cy, cx, C, 5)` | float32 | `imfeat.FEATURES` — energy, coherence, ori_cos, ori_sin, cornerness |
 | `hog_i` | `(cy, cx, C, 9)` | float32 | `imfeat.HOG_FEATURES`, L1-normalised |
 | `cnt_i` | `(cy, cx, C, 2)` | float32 | `imfeat.COUNT_FEATURES` — local_max, local_min |
-| `*_global` | `(C, …)` | | the same four groups, reduced over the whole frame |
+| `lbp_i` | `(cy, cx, C, 10)` | float32 | `imfeat.LBP_FEATURES`, L1-normalised |
+| `xchan_i` | `(cy, cx, P, 2)` | float32 | `imfeat.CROSS_FEATURES` — cov, corr, per channel pair |
+| `*_global` | `(C, …)` | | the same groups, reduced over the whole frame |
 
 The `C` axis is dropped entirely for 2-D `(H, W)` input.
+
+`xchan_i` is the one group that is **not** per channel: it carries one row per *pair* of
+channels, `P = C*(C-1)/2`, listed in `fc.channel_pairs` as index pairs into the selected
+channels. It is absent when there are no pairs — a single channel, or `C > 8`, where the
+quadratic pair count is not worth paying silently.
 
 ### `.compute(img) -> dict[str, np.ndarray]`
 
 The **raw int64 accumulators**, same keys, before any nonlinear derivation: `struct_i` is
 `[Sxx, Syy, Sxy, count]`, `mom_i` the power sums `[S1, S2, S3, S4]`, `hog_i` the
-unnormalised gradient energy per bin, `cnt_i` the raw counts.
+unnormalised gradient energy per bin, `cnt_i` and `lbp_i` the raw counts, and `xchan_i`
+the raw products `sum(v_i * v_j)`, shape `(cy, cx, P)`.
 
 These are **purely additive**, which makes them composable: sum them over cells, levels,
 channels or *frames* and you get the exact accumulator of the union. Pool however your
@@ -91,8 +100,10 @@ var  = ps[:, 1] / n - mean**2
 
 ### Constants
 
-`imfeat.MOMENTS`, `imfeat.FEATURES`, `imfeat.HOG_FEATURES` and `imfeat.COUNT_FEATURES` name
-the last axis of each group, in order, so nothing has to be indexed by magic number.
+`imfeat.MOMENTS`, `imfeat.FEATURES`, `imfeat.HOG_FEATURES`, `imfeat.COUNT_FEATURES`,
+`imfeat.LBP_FEATURES` and `imfeat.CROSS_FEATURES` name the last axis of each group, in
+order, so nothing has to be indexed by magic number. `fc.channel_pairs` names the pair axis
+of `xchan_i`.
 
 ---
 
@@ -186,12 +197,44 @@ Since the border is replicate-padded, a border pixel sits inside its own neighbo
 therefore can never be a strict extremum. That is deliberate, and consistent across the
 four sides.
 
+### 5. Rotation-invariant uniform LBP — `lbp_i`, 10 values
+
+The LBP^riu2_{8,1} histogram of Ojala et al. (2002). Each pixel is compared to its 8
+neighbours in **circular order**; the resulting 8-bit sign pattern is called *uniform* if it
+has at most two circular 0→1 transitions, and is then labelled by its popcount (0..8). Bin 9
+collects everything else. The popcount and the transition count are both invariant to
+rotating the ring, which is where the rotation invariance comes from.
+
+This is the one group with properties **no other feature here has**:
+
+* **invariant to any monotonic change of the intensity map** (only the sign of each
+  comparison matters) — so it survives gamma, exposure and contrast changes that move every
+  moment and every gradient statistic;
+* **invariant to 90° rotations and reflections** exactly, and largely to arbitrary rotation.
+
+Read it as a micro-texture descriptor: bins 0/8 are flat or spot-like neighbourhoods, the
+middle bins are edges and corners of varying sharpness, bin 9 is high-frequency clutter.
+
+The comparison is `neighbour >= centre`, so a flat neighbourhood is all-ones — a flat image
+lands entirely in bin 8. The border is replicate-padded, consistently with `cnt_i`.
+
+### 6. Cross-channel covariance — `xchan_i`, 2 values per channel pair
+
+For each unordered pair of channels, `[cov, corr]`: the covariance and the Pearson
+correlation of the two channels' pixel values over the cell. Everything else in `imfeat`
+treats each channel independently; this is the only feature that says anything about how
+they *relate*. On RGB it separates neutral regions (all pairs ~+1) from saturated colour;
+on HSV or opponent spaces it picks up chromatic structure a per-channel statistic cannot.
+
+Only one new accumulator per pair is needed — the raw product `sum(v_i * v_j)` — because the
+means and variances are already in `mom_i`.
+
 ---
 
 ## The one-pass design
 
 Every per-pixel quantity is accumulated as an **additive int64 sum** into the finest cell of
-its channel — 19 sums per cell per channel:
+its channel — 29 sums per cell per channel:
 
 | slots | contents |
 |---|---|
@@ -199,6 +242,10 @@ its channel — 19 sums per cell per channel:
 | 4..12 | HOG: gradient energy per orientation bin |
 | 13,14 | strict local max / min counts |
 | 15..18 | `S1 S2 S3 S4` — power sums of the pixel value |
+| 19..28 | LBP^riu2 bin counts |
+
+plus, per cell, one further int64 per channel *pair* — `sum(v_i * v_j)` — the only sum that
+is not per channel.
 
 Two consequences fall out, and they are the whole design:
 
@@ -226,15 +273,20 @@ per-pixel feature vector for a model.
 
 Measured on a 256×256×3 frame, 4 pyramid levels, every feature on all 3 channels (Apple
 M-series; an AVX2 laptop lands within ~20%). Errors are against the exact `stride=1` output:
-`energy_r` is the correlation of the edge-energy map, `hog_cos` the mean cosine similarity
-of the histograms.
+`energy_r` is the correlation of the edge-energy map, `hog_cos` and `lbp_cos` the mean cosine
+similarity of the histograms. (The error columns are properties of the algorithm, not the
+machine; `bench_compare.py` prints these and `xchan_r` on any host.)
 
-| stride | ms | speedup | mean err (grey levels) | energy_r | orientation err | hog_cos |
-|---|---|---|---|---|---|---|
-| 1 | 1.35 | 1.0× | 0.0 | 1.000 | 0.0° | 1.000 |
-| **2** | **0.63** | **2.1×** | **4.3** | **0.952** | **3.6°** | **0.923** |
-| 4 | 0.36 | 3.8× | 10.7 | 0.824 | 4.9° | 0.832 |
-| 8 | 0.24 | 5.6× | 23.0 | 0.583 | 5.3° | 0.755 |
+| stride | ms | speedup | mean err (grey levels) | energy_r | orientation err | hog_cos | lbp_cos |
+|---|---|---|---|---|---|---|---|
+| 1 | 1.35 | 1.0× | 0.0 | 1.000 | 0.0° | 1.000 | 1.000 |
+| **2** | **0.63** | **2.1×** | **4.3** | **0.952** | **3.6°** | **0.923** | **0.990** |
+| 4 | 0.36 | 3.8× | 10.7 | 0.824 | 4.9° | 0.832 | 0.958 |
+| 8 | 0.24 | 5.6× | 23.0 | 0.583 | 5.3° | 0.755 | 0.834 |
+
+The LBP histogram degrades far more gracefully under subsampling than the extrema density
+does (`cnt_r` falls to 0.53 by stride 4), because it is a histogram over many pixels rather
+than a count of rare events.
 
 **The stride rule: keep `cell_width / stride ≥ 4`.** Stride's real currency is *samples per
 cell*, not pixels per image. At 256² on a 32×32 grid the cells are 8 px wide, so `stride=2`

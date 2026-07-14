@@ -219,8 +219,15 @@ def test_channel_subset():
         img
     )
     for k in full:
+        if k.startswith("xchan"):  # cross-channel maps have no per-channel axis
+            continue
         assert np.array_equal(sub[k][..., 0, :], full[k][..., 2, :]), k
         assert np.array_equal(sub[k][..., 1, :], full[k][..., 0, :]), k
+    # selected channels [2, 0] -> the single pair (0,1) is full's pair (0,2)
+    fc = imfeat.FeatureComputer(img.shape, grid=[(5, 5)], channels=[2, 0])
+    assert fc.channel_pairs == [(0, 1)]
+    pairs = imfeat.FeatureComputer(img.shape, grid=[(5, 5)]).channel_pairs
+    assert np.allclose(sub["xchan_0"][:, :, 0], full["xchan_0"][:, :, pairs.index((0, 2))])
 
 
 def test_channel_axis_first():

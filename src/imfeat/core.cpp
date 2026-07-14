@@ -23,7 +23,8 @@ namespace nb = nanobind;
 //
 // Per finest cell per channel we keep NSUM int64 additive sums:
 //   [0..3] Sxx Syy Sxy count | [4..12] HOG(9) | [13,14] local-max/min counts
-//   | [15..18] S1 S2 S3 S4 (raw power sums of the pixel value).
+//   | [15..18] S1 S2 S3 S4 (raw power sums of the pixel value) | [19..28] LBP^riu2(10).
+// Alongside, one int64 per channel PAIR: Sum(v_i * v_j), the only cross-channel sum.
 // Every sum is additive, so pyramid levels and the global reduction are exact
 // sums of the finest cells -- the image is read exactly once. Central moments and
 // the tensor eigen-features are nonlinear, so they are derived at the end.
@@ -47,9 +48,17 @@ constexpr int HOG0 = NCOMP;                      // 4
 constexpr int NMAX = HOG0 + HB, NMIN = NMAX + 1; // 13, 14
 constexpr int PS0 = NMIN + 1;                    // 15: S1 S2 S3 S4
 constexpr int NMOM = 4;
-constexpr int NSUM = PS0 + NMOM;  // 19 int64 sums per cell per channel
-constexpr int NF_S = 5;           // tensor-derived float channels
-constexpr int NF = NF_S + HB + 2; // 16 derived float32 per cell per channel
+// LBP^riu2_{8,1} (Ojala 2002): 10 bins -- popcount 0..8 for the "uniform" codes
+// (<=2 circular 0/1 transitions), plus one catch-all bin for the rest.
+constexpr int LBPB = 10;
+constexpr int LBP0 = PS0 + NMOM;         // 19
+constexpr int NSUM = LBP0 + LBPB;        // 29 int64 sums per cell per channel
+constexpr int NF_S = 5;                  // tensor-derived float channels
+constexpr int NF = NF_S + HB + 2 + LBPB; // 26 derived float32 per cell per channel
+// Cross-channel products Sum(v_i * v_j) over the C*(C-1)/2 unordered pairs. Off for
+// C=1 (no pairs) and for C > XMAX (hyperspectral: the pair count would explode).
+constexpr int XMAX = 8;
+constexpr int NXF = 2; // derived per pair: [cov, corr]
 constexpr int64_t RAYSCALE = 1 << 14;
 constexpr double PI = 3.14159265358979323846;
 
@@ -61,9 +70,24 @@ constexpr double PI = 3.14159265358979323846;
 constexpr int SIMD_CH = 4;
 constexpr int SIMD_PAD = 16;
 
-inline int clampi(int v, int hi)
+inline int clampi(int v, int hi) { return v < 0 ? 0 : (v > hi ? hi : v); }
+
+// Rotation-invariant uniform LBP of one pixel. `a`/`b`/`e` are rows r-1/r/r+1 and
+// om/o/op the columns left/centre/right; the 8 neighbours are read in circular
+// order (NW N NE E SE S SW W), which is what makes the transition count U -- and
+// hence the uniformity test -- rotation-invariant. Sign test is p >= centre, so a
+// flat neighbourhood is code 255 -> U=0 -> bin 8. Branch-free; the caller's flat
+// loop over W*C vectorizes.
+inline uint8_t lbp_riu2(const uint8_t *IF_RESTRICT a, const uint8_t *IF_RESTRICT b,
+                        const uint8_t *IF_RESTRICT e, int om, int o, int op)
 {
-  return v < 0 ? 0 : (v > hi ? hi : v);
+  const uint8_t c = b[o];
+  const uint8_t s0 = a[om] >= c, s1 = a[o] >= c, s2 = a[op] >= c, s3 = b[op] >= c,
+                s4 = e[op] >= c, s5 = e[o] >= c, s6 = e[om] >= c, s7 = b[om] >= c;
+  const uint8_t pc = (uint8_t)(s0 + s1 + s2 + s3 + s4 + s5 + s6 + s7);
+  const uint8_t u = (uint8_t)((s0 ^ s1) + (s1 ^ s2) + (s2 ^ s3) + (s3 ^ s4) + (s4 ^ s5) +
+                              (s5 ^ s6) + (s6 ^ s7) + (s7 ^ s0));
+  return u <= 2 ? pc : (uint8_t)(LBPB - 1);
 }
 
 // Sweeps one row of `ncell` finest cells (each `cw` px wide) for one group of `n`
@@ -72,8 +96,8 @@ inline int clampi(int v, int hi)
 // ray-direction setup over the whole row.
 void accumulate_row(const int16_t *IF_RESTRICT gxb, const int16_t *IF_RESTRICT gyb,
                     const uint8_t *IF_RESTRICT vb, const uint8_t *IF_RESTRICT mxb,
-                    const uint8_t *IF_RESTRICT mnb, int strideC, int ch0, int cw, int ncell,
-                    int n, int sx, const int32_t *IF_RESTRICT hcx,
+                    const uint8_t *IF_RESTRICT mnb, const uint8_t *IF_RESTRICT lbb, int strideC,
+                    int ch0, int cw, int ncell, int n, int sx, const int32_t *IF_RESTRICT hcx,
                     const int32_t *IF_RESTRICT hcy, int cellstride,
                     int64_t *IF_RESTRICT rowbase)
 {
@@ -85,12 +109,10 @@ void accumulate_row(const int16_t *IF_RESTRICT gxb, const int16_t *IF_RESTRICT g
   const auto zero = hn::Zero(d);
   const int HL = (int)hn::Lanes(d64);
 
-  auto i16_at = [&](const int16_t *p, int col) {
-    return hn::PromoteTo(d, hn::LoadU(d16, p + (size_t)col * strideC + ch0));
-  };
-  auto u8_at = [&](const uint8_t *p, int col) {
-    return hn::PromoteTo(d, hn::LoadU(d8, p + (size_t)col * strideC + ch0));
-  };
+  auto i16_at = [&](const int16_t *p, int col)
+  { return hn::PromoteTo(d, hn::LoadU(d16, p + (size_t)col * strideC + ch0)); };
+  auto u8_at = [&](const uint8_t *p, int col)
+  { return hn::PromoteTo(d, hn::LoadU(d8, p + (size_t)col * strideC + ch0)); };
 
   hn::VFromD<decltype(d)> hcxv[HB - 1], hcyv[HB - 1];
   for (int j = 0; j < HB - 1; ++j)
@@ -98,7 +120,7 @@ void accumulate_row(const int16_t *IF_RESTRICT gxb, const int16_t *IF_RESTRICT g
     hcxv[j] = hn::Set(d, hcx[j]);
     hcyv[j] = hn::Set(d, hcy[j]);
   }
-  int64_t hog[HB * SIMD_CH];
+  int64_t hog[HB * SIMD_CH], lbp[LBPB * SIMD_CH];
   int32_t blane[SIMD_CH], g2lane[SIMD_CH], nmxa[SIMD_CH], nmna[SIMD_CH];
   int64_t xx[SIMD_CH], yy[SIMD_CH], xy[SIMD_CH], ps[NMOM][SIMD_CH];
 
@@ -112,6 +134,8 @@ void accumulate_row(const int16_t *IF_RESTRICT gxb, const int16_t *IF_RESTRICT g
     auto nmaxv = zero, nminv = zero;
     for (int k = 0; k < HB * n; ++k)
       hog[k] = 0;
+    for (int k = 0; k < LBPB * n; ++k)
+      lbp[k] = 0;
     int64_t colcount = 0;
     const int c1 = e * cw + cw;
     for (int c = e * cw; c < c1; c += sx)
@@ -157,6 +181,12 @@ void accumulate_row(const int16_t *IF_RESTRICT gxb, const int16_t *IF_RESTRICT g
       // strict 8-neighbour extrema, against the envelopes prepare_row built
       nmaxv = hn::Sub(nmaxv, hn::VecFromMask(d, hn::Gt(v, u8_at(mxb, c))));
       nminv = hn::Sub(nminv, hn::VecFromMask(d, hn::Lt(v, u8_at(mnb, c))));
+      // LBP: prepare_row already reduced the neighbourhood to a bin index; just vote.
+      // Read the bytes directly -- promoting them to a vector only to store them back
+      // costs more than the n scalar increments.
+      const uint8_t *IF_RESTRICT lp = lbb + (size_t)c * strideC + ch0;
+      for (int l = 0; l < n; ++l)
+        ++lbp[l * LBPB + lp[l]];
     }
     hn::StoreU(axl, d64, xx);
     hn::StoreU(axh, d64, xx + HL);
@@ -185,17 +215,44 @@ void accumulate_row(const int16_t *IF_RESTRICT gxb, const int16_t *IF_RESTRICT g
       a[NMIN] += nmna[l];
       for (int k = 0; k < NMOM; ++k)
         a[PS0 + k] += ps[k][l];
+      for (int j = 0; j < LBPB; ++j)
+        a[LBP0 + j] += lbp[l * LBPB + j];
     }
+  }
+}
+
+// Cross-channel raw products, one pass over the same already-cached prepared row.
+// Channels are the SIMD lane in accumulate_row, so a pairwise product would be a
+// cross-lane shuffle; this stays scalar over pairs and vectorizes over columns.
+void accumulate_cross_row(const uint8_t *IF_RESTRICT vb, int strideC, int cw, int ncell, int sx,
+                          int np, const int *IF_RESTRICT pi, const int *IF_RESTRICT pj,
+                          int64_t *IF_RESTRICT rowbase)
+{
+  int64_t s[XMAX * (XMAX - 1) / 2];
+  for (int e = 0; e < ncell; ++e)
+  {
+    const int c0 = e * cw, c1 = c0 + cw;
+    for (int p = 0; p < np; ++p)
+      s[p] = 0;
+    for (int c = c0; c < c1; c += sx)
+    {
+      const uint8_t *IF_RESTRICT v = vb + (size_t)c * strideC; // load the pixel once
+      for (int p = 0; p < np; ++p)
+        s[p] += (int64_t)v[pi[p]] * (int64_t)v[pj[p]];
+    }
+    int64_t *IF_RESTRICT acc = rowbase + (size_t)e * np;
+    for (int p = 0; p < np; ++p)
+      acc[p] += s[p];
   }
 }
 
 struct Level
 {
   int ny = 0, nx = 0, fy = 0, fx = 0;
-  std::vector<int64_t> buf;
-  std::vector<float> feat;
+  std::vector<int64_t> buf, xbuf;
+  std::vector<float> feat, xfeat;
   std::vector<double> mom;
-  std::vector<size_t> rshape, fshape, mshape;
+  std::vector<size_t> rshape, fshape, mshape, xrshape, xfshape;
 };
 
 class FeatureComputer
@@ -207,16 +264,18 @@ class FeatureComputer
   std::vector<Level> levels_;
   std::vector<int> row_cell_;
   int32_t hcx_[HB - 1] = {}, hcy_[HB - 1] = {};
+  int np_ = 0;               // number of channel pairs (0 if C<2 or C>XMAX)
+  std::vector<int> pi_, pj_; // the pairs, in (i<j) lexicographic order
 
   // Per-row scratch, all interleaved (c * c_ + k) and padded by SIMD_PAD. One row
   // is a few KB, so it stays hot in L1 across the whole cell sweep.
-  std::vector<uint8_t> r0_, r1_, r2_, cmx_, cmn_, mx_, mn_;
+  std::vector<uint8_t> r0_, r1_, r2_, cmx_, cmn_, mx_, mn_, lb_;
   std::vector<int16_t> vs_, vd_, gx_, gy_;
 
-  std::vector<int64_t> graw_;
-  std::vector<float> gfeat_;
+  std::vector<int64_t> graw_, gxraw_;
+  std::vector<float> gfeat_, gxfeat_;
   std::vector<double> gmom_;
-  std::vector<size_t> graw_shape_, gfeat_shape_, gmom_shape_;
+  std::vector<size_t> graw_shape_, gfeat_shape_, gmom_shape_, gxraw_shape_, gxfeat_shape_;
 
   // Structure-tensor + HOG + extrema features (float32).
   void derive_cell(const int64_t *IF_RESTRICT s, float *IF_RESTRICT f) const
@@ -240,6 +299,25 @@ class FeatureComputer
       f[NF_S + b] = (float)((double)s[HOG0 + b] * invh);
     f[NF_S + HB + 0] = (float)((double)s[NMAX] * invn);
     f[NF_S + HB + 1] = (float)((double)s[NMIN] * invn);
+    // the LBP bins partition the cell's pixels, so their sum is exactly the count
+    for (int b = 0; b < LBPB; ++b)
+      f[NF_S + HB + 2 + b] = (float)((double)s[LBP0 + b] * invn);
+  }
+
+  // Cross-channel covariance and Pearson correlation per channel pair, from the raw
+  // products and the cell's already-derived per-channel [mean, var].
+  void derive_cross(const double *IF_RESTRICT m, int64_t n, const int64_t *IF_RESTRICT x,
+                    float *IF_RESTRICT f) const
+  {
+    const double invn = n > 0 ? 1.0 / (double)n : 0.0;
+    for (int p = 0; p < np_; ++p)
+    {
+      const double *mi = m + (size_t)pi_[p] * NMOM, *mj = m + (size_t)pj_[p] * NMOM;
+      const double cov = (double)x[p] * invn - mi[0] * mj[0];
+      const double den = std::sqrt(mi[1] * mj[1]);
+      f[p * NXF] = (float)cov;
+      f[p * NXF + 1] = (float)(den > 0.0 ? cov / den : 0.0);
+    }
   }
 
   // Central moments [mean, var, m3, m4] (float64) from the raw power sums.
@@ -289,8 +367,14 @@ class FeatureComputer
           for (int k = 0; k < c_; ++k)
             dst[i][(size_t)c * c_ + k] = rows[i][(int64_t)c * cs + coff_[k]];
     }
+    // Alias every scratch buffer through a restrict pointer: via the std::vector
+    // members the compiler cannot prove the reads and writes are disjoint, and it
+    // silently drops the flat loops below back to scalar.
     const uint8_t *IF_RESTRICT a = r0_.data(), *IF_RESTRICT b = r1_.data(),
                                *IF_RESTRICT e = r2_.data();
+    const uint8_t *IF_RESTRICT cmx = cmx_.data(), *IF_RESTRICT cmn = cmn_.data();
+    uint8_t *IF_RESTRICT mx = mx_.data(), *IF_RESTRICT mn = mn_.data(),
+                         *IF_RESTRICT lb = lb_.data();
     // Three flat, branch-free loops over W*C, each auto-vectorized (the uint8 min/max
     // ones 16 lanes wide). Kept separate so no loop carries a mixed-width dependency
     // the vectorizer would refuse.
@@ -311,16 +395,45 @@ class FeatureComputer
     // contributes only b[o-C] and b[o+C] -- which collapse onto the centre at a border
     // column, exactly as a replicate-padded 3x3 does, so a border pixel can never be a
     // strict extremum.
-    for (int o = C; o < WC - C; ++o)
+    // Envelopes and LBP codes for the interior, explicitly vectorized over columns.
+    // gcc will not auto-vectorize this one: eight base pointers with runtime +/-C
+    // offsets blow past its alias-versioning budget even with __restrict__, and it
+    // silently emits scalar code. Highway gives 16-32 uint8 lanes and is portable.
+    namespace hn = hwy::HWY_NAMESPACE;
+    const hn::ScalableTag<uint8_t> du;
+    const int NL = (int)hn::Lanes(du);
+    const auto one = hn::Set(du, 1), nonuni = hn::Set(du, LBPB - 1), two = hn::Set(du, 2);
+    auto bit = [&](const uint8_t *p, int o, hn::VFromD<decltype(du)> c) { // p[o] >= c
+      return hn::And(hn::VecFromMask(du, hn::Ge(hn::LoadU(du, p + o), c)), one);
+    };
+    int i = C;
+    for (; i + NL <= WC - C; i += NL)
     {
-      uint8_t hi = cmx_[o - C] > cmx_[o + C] ? cmx_[o - C] : cmx_[o + C];
-      uint8_t lo = cmn_[o - C] < cmn_[o + C] ? cmn_[o - C] : cmn_[o + C];
-      const uint8_t bhi = b[o - C] > b[o + C] ? b[o - C] : b[o + C];
-      const uint8_t blo = b[o - C] < b[o + C] ? b[o - C] : b[o + C];
-      hi = hi > cmx_[o] ? hi : cmx_[o];
-      lo = lo < cmn_[o] ? lo : cmn_[o];
-      mx_[o] = hi > bhi ? hi : bhi;
-      mn_[o] = lo < blo ? lo : blo;
+      const auto cm = hn::LoadU(du, cmx + i), cn = hn::LoadU(du, cmn + i);
+      const auto bm = hn::LoadU(du, b + i - C), bp = hn::LoadU(du, b + i + C);
+      hn::StoreU(hn::Max(hn::Max(hn::LoadU(du, cmx + i - C), hn::LoadU(du, cmx + i + C)),
+                         hn::Max(cm, hn::Max(bm, bp))),
+                 du, mx + i);
+      hn::StoreU(hn::Min(hn::Min(hn::LoadU(du, cmn + i - C), hn::LoadU(du, cmn + i + C)),
+                         hn::Min(cn, hn::Min(bm, bp))),
+                 du, mn + i);
+      const auto c = hn::LoadU(du, b + i); // LBP: 8 neighbours in circular order
+      const auto s0 = bit(a, i - C, c), s1 = bit(a, i, c), s2 = bit(a, i + C, c),
+                 s3 = bit(b, i + C, c), s4 = bit(e, i + C, c), s5 = bit(e, i, c),
+                 s6 = bit(e, i - C, c), s7 = bit(b, i - C, c);
+      const auto pc = hn::Add(hn::Add(hn::Add(s0, s1), hn::Add(s2, s3)),
+                              hn::Add(hn::Add(s4, s5), hn::Add(s6, s7)));
+      const auto u = hn::Add(hn::Add(hn::Add(hn::Xor(s0, s1), hn::Xor(s1, s2)),
+                                     hn::Add(hn::Xor(s2, s3), hn::Xor(s3, s4))),
+                             hn::Add(hn::Add(hn::Xor(s4, s5), hn::Xor(s5, s6)),
+                                     hn::Add(hn::Xor(s6, s7), hn::Xor(s7, s0))));
+      hn::StoreU(hn::IfThenElse(hn::Le(u, two), pc, nonuni), du, lb + i);
+    }
+    for (; i < WC - C; ++i)
+    {
+      mx[i] = std::max({cmx[i - C], cmx[i], cmx[i + C], b[i - C], b[i + C]});
+      mn[i] = std::min({cmn[i - C], cmn[i], cmn[i + C], b[i - C], b[i + C]});
+      lb[i] = lbp_riu2(a, b, e, i - C, i, i + C);
     }
     const int last = (w_ - 1) * C, step = w_ > 1 ? C : 0;
     for (int k = 0; k < C; ++k) // the two border columns, clamped
@@ -329,8 +442,9 @@ class FeatureComputer
         const int om = o == k ? k : last - step + k, op = o == k ? k + step : last + k;
         gx_[o] = (int16_t)(vs_[op] - vs_[om]);
         gy_[o] = (int16_t)(vd_[om] + 2 * vd_[o] + vd_[op]);
-        mx_[o] = std::max({cmx_[om], cmx_[o], cmx_[op], b[om], b[op]});
-        mn_[o] = std::min({cmn_[om], cmn_[o], cmn_[op], b[om], b[op]});
+        mx[o] = std::max({cmx[om], cmx[o], cmx[op], b[om], b[op]});
+        mn[o] = std::min({cmn[om], cmn[o], cmn[op], b[om], b[op]});
+        lb[o] = lbp_riu2(a, b, e, om, o, op);
       }
   }
 
@@ -340,6 +454,7 @@ class FeatureComputer
     const int nfx = fine.nx, cw = w_ / nfx;
     int64_t *IF_RESTRICT fb = fine.buf.data();
     std::fill(fine.buf.begin(), fine.buf.end(), (int64_t)0);
+    std::fill(fine.xbuf.begin(), fine.xbuf.end(), (int64_t)0);
 
     for (int k = 0; k < c_; ++k)
       coff_[k] = (int64_t)chan_[k] * chs;
@@ -352,9 +467,12 @@ class FeatureComputer
       prepare_row(img, r, rs, cs);
       int64_t *IF_RESTRICT rb = fb + (size_t)(row_cell_[r] * nfx) * c_ * NSUM;
       for (int ch0 = 0; ch0 < c_; ch0 += L)
-        accumulate_row(gx_.data(), gy_.data(), r1_.data(), mx_.data(), mn_.data(), c_, ch0, cw,
-                       nfx, std::min(L, c_ - ch0), sx_, hcx_, hcy_, c_ * NSUM,
+        accumulate_row(gx_.data(), gy_.data(), r1_.data(), mx_.data(), mn_.data(), lb_.data(),
+                       c_, ch0, cw, nfx, std::min(L, c_ - ch0), sx_, hcx_, hcy_, c_ * NSUM,
                        rb + (size_t)ch0 * NSUM);
+      if (np_)
+        accumulate_cross_row(r1_.data(), c_, cw, nfx, sx_, np_, pi_.data(), pj_.data(),
+                             fine.xbuf.data() + (size_t)(row_cell_[r] * nfx) * np_);
     }
 
     const int stripe = c_ * NSUM;
@@ -363,40 +481,60 @@ class FeatureComputer
       const Level &p = levels_[lvl - 1];
       Level &lv = levels_[lvl];
       std::fill(lv.buf.begin(), lv.buf.end(), (int64_t)0);
+      std::fill(lv.xbuf.begin(), lv.xbuf.end(), (int64_t)0);
       for (int i = 0; i < p.ny; ++i)
         for (int j = 0; j < p.nx; ++j)
         {
-          const int64_t *IF_RESTRICT sc = p.buf.data() + ((size_t)i * p.nx + j) * stripe;
-          int64_t *IF_RESTRICT dc =
-              lv.buf.data() + ((size_t)(i / lv.fy) * lv.nx + j / lv.fx) * stripe;
+          const size_t src = (size_t)i * p.nx + j;
+          const size_t dst = (size_t)(i / lv.fy) * lv.nx + j / lv.fx;
+          const int64_t *IF_RESTRICT sc = p.buf.data() + src * stripe;
+          int64_t *IF_RESTRICT dc = lv.buf.data() + dst * stripe;
           for (int t = 0; t < stripe; ++t)
             dc[t] += sc[t];
+          const int64_t *IF_RESTRICT sx = p.xbuf.data() + src * np_;
+          int64_t *IF_RESTRICT dx = lv.xbuf.data() + dst * np_;
+          for (int t = 0; t < np_; ++t)
+            dx[t] += sx[t];
         }
     }
 
     const Level &last = levels_.back();
     std::fill(graw_.begin(), graw_.end(), (int64_t)0);
+    std::fill(gxraw_.begin(), gxraw_.end(), (int64_t)0);
     for (size_t cell = 0, nc = (size_t)last.ny * last.nx; cell < nc; ++cell)
     {
       const int64_t *IF_RESTRICT s = last.buf.data() + cell * stripe;
       for (int t = 0; t < stripe; ++t)
         graw_[t] += s[t];
+      const int64_t *IF_RESTRICT x = last.xbuf.data() + cell * np_;
+      for (int t = 0; t < np_; ++t)
+        gxraw_[t] += x[t];
     }
   }
 
   void derive()
   {
     for (Level &L : levels_)
-      for (size_t cell = 0, nc = (size_t)L.ny * L.nx * c_; cell < nc; ++cell)
+      for (size_t cell = 0, nc = (size_t)L.ny * L.nx; cell < nc; ++cell)
       {
-        derive_cell(L.buf.data() + cell * NSUM, L.feat.data() + cell * NF);
-        derive_moments(L.buf.data() + cell * NSUM, L.mom.data() + cell * NMOM);
+        const int64_t *IF_RESTRICT s = L.buf.data() + cell * c_ * NSUM;
+        double *IF_RESTRICT m = L.mom.data() + cell * c_ * NMOM;
+        for (int k = 0; k < c_; ++k)
+        {
+          derive_cell(s + (size_t)k * NSUM, L.feat.data() + (cell * c_ + k) * NF);
+          derive_moments(s + (size_t)k * NSUM, m + (size_t)k * NMOM);
+        }
+        if (np_)
+          derive_cross(m, s[CNT], L.xbuf.data() + cell * np_,
+                       L.xfeat.data() + cell * np_ * NXF);
       }
     for (int k = 0; k < c_; ++k)
     {
       derive_cell(graw_.data() + (size_t)k * NSUM, gfeat_.data() + (size_t)k * NF);
       derive_moments(graw_.data() + (size_t)k * NSUM, gmom_.data() + (size_t)k * NMOM);
     }
+    if (np_)
+      derive_cross(gmom_.data(), graw_[CNT], gxraw_.data(), gxfeat_.data());
   }
 
 public:
@@ -412,6 +550,17 @@ public:
     c_ = (int)chan_.size();
     sy_ = (int)stride[0];
     sx_ = (int)stride[1];
+
+    pi_.clear();
+    pj_.clear();
+    if (c_ >= 2 && c_ <= XMAX)
+      for (int i = 0; i < c_; ++i)
+        for (int j = i + 1; j < c_; ++j)
+        {
+          pi_.push_back(i);
+          pj_.push_back(j);
+        }
+    np_ = (int)pi_.size();
 
     for (int k = 1; k < HB; ++k)
     {
@@ -442,9 +591,13 @@ public:
       L.buf.assign((size_t)L.ny * L.nx * c_ * NSUM, 0);
       L.feat.assign((size_t)L.ny * L.nx * c_ * NF, 0.0f);
       L.mom.assign((size_t)L.ny * L.nx * c_ * NMOM, 0.0);
+      L.xbuf.assign((size_t)L.ny * L.nx * np_, 0);
+      L.xfeat.assign((size_t)L.ny * L.nx * np_ * NXF, 0.0f);
       L.rshape = {(size_t)L.ny, (size_t)L.nx, (size_t)c_, (size_t)NSUM};
       L.fshape = {(size_t)L.ny, (size_t)L.nx, (size_t)c_, (size_t)NF};
       L.mshape = {(size_t)L.ny, (size_t)L.nx, (size_t)c_, (size_t)NMOM};
+      L.xrshape = {(size_t)L.ny, (size_t)L.nx, (size_t)np_};
+      L.xfshape = {(size_t)L.ny, (size_t)L.nx, (size_t)np_, (size_t)NXF};
       levels_.push_back(std::move(L));
     }
 
@@ -461,6 +614,7 @@ public:
     cmn_.assign(wcp, 0);
     mx_.assign(wcp, 0);
     mn_.assign(wcp, 0);
+    lb_.assign(wcp, 0);
     vs_.assign(wcp, 0);
     vd_.assign(wcp, 0);
     gx_.assign(wcp, 0);
@@ -469,21 +623,48 @@ public:
     graw_.assign((size_t)c_ * NSUM, 0);
     gfeat_.assign((size_t)c_ * NF, 0.0f);
     gmom_.assign((size_t)c_ * NMOM, 0.0);
+    gxraw_.assign((size_t)np_, 0);
+    gxfeat_.assign((size_t)np_ * NXF, 0.0f);
     graw_shape_ = {(size_t)c_, (size_t)NSUM};
     gfeat_shape_ = {(size_t)c_, (size_t)NF};
     gmom_shape_ = {(size_t)c_, (size_t)NMOM};
+    gxraw_shape_ = {(size_t)np_};
+    gxfeat_shape_ = {(size_t)np_, (size_t)NXF};
+  }
+
+  // The channel pairs, as flat [i0, j0, i1, j1, ...]; empty when cross-channel is off.
+  std::vector<int> pairs() const
+  {
+    std::vector<int> out;
+    for (int p = 0; p < np_; ++p)
+    {
+      out.push_back(pi_[p]);
+      out.push_back(pj_[p]);
+    }
+    return out;
   }
 
   nb::list raw(const uint8_t *IF_RESTRICT img, int64_t rs, int64_t cs, int64_t chs)
   {
     accumulate(img, rs, cs, chs);
-    nb::list out;
+    nb::list out, cross;
     for (Level &L : levels_)
+    {
       out.append(nb::ndarray<nb::numpy, int64_t>(L.buf.data(), L.rshape.size(), L.rshape.data(),
                                                  nb::handle()));
+      if (np_)
+        cross.append(nb::ndarray<nb::numpy, int64_t>(L.xbuf.data(), L.xrshape.size(),
+                                                     L.xrshape.data(), nb::handle()));
+    }
     out.append(nb::ndarray<nb::numpy, int64_t>(graw_.data(), graw_shape_.size(),
                                                graw_shape_.data(), nb::handle()));
-    return out;
+    if (np_)
+      cross.append(nb::ndarray<nb::numpy, int64_t>(gxraw_.data(), gxraw_shape_.size(),
+                                                   gxraw_shape_.data(), nb::handle()));
+    nb::list both;
+    both.append(out);
+    both.append(cross);
+    return both;
   }
 
   // Two parallel lists: the float32 structure features and the float64 moments
@@ -492,22 +673,29 @@ public:
   {
     accumulate(img, rs, cs, chs);
     derive();
-    nb::list feat, mom;
+    nb::list feat, mom, cross;
     for (Level &L : levels_)
     {
       feat.append(nb::ndarray<nb::numpy, float>(L.feat.data(), L.fshape.size(), L.fshape.data(),
                                                 nb::handle()));
       mom.append(nb::ndarray<nb::numpy, double>(L.mom.data(), L.mshape.size(), L.mshape.data(),
                                                 nb::handle()));
+      if (np_)
+        cross.append(nb::ndarray<nb::numpy, float>(L.xfeat.data(), L.xfshape.size(),
+                                                   L.xfshape.data(), nb::handle()));
     }
     feat.append(nb::ndarray<nb::numpy, float>(gfeat_.data(), gfeat_shape_.size(),
                                               gfeat_shape_.data(), nb::handle()));
     mom.append(nb::ndarray<nb::numpy, double>(gmom_.data(), gmom_shape_.size(),
                                               gmom_shape_.data(), nb::handle()));
-    nb::list both;
-    both.append(feat);
-    both.append(mom);
-    return both;
+    if (np_)
+      cross.append(nb::ndarray<nb::numpy, float>(gxfeat_.data(), gxfeat_shape_.size(),
+                                                 gxfeat_shape_.data(), nb::handle()));
+    nb::list all;
+    all.append(feat);
+    all.append(mom);
+    all.append(cross);
+    return all;
   }
 };
 
@@ -517,11 +705,14 @@ using Arr = nb::ndarray<nb::numpy, const uint8_t, nb::device::cpu>;
 NB_MODULE(imfeat_core, m)
 {
   m.doc() = "imfeat internal C++ module. Public API: imfeat.FeatureComputer.";
-  m.attr("HB") = HB; // HOG orientation-bin count; Python derives its bin labels from this
+  m.attr("HB") = HB;     // HOG orientation-bin count; Python derives its bin labels from this
+  m.attr("LBPB") = LBPB; // LBP^riu2 bin count (9 uniform + 1 non-uniform)
+  m.attr("XMAX") = XMAX; // cross-channel products are computed only for C <= XMAX
   nb::class_<FeatureComputer>(m, "_FeatureComputerImpl")
       .def(nb::init<>())
       .def("set_config", &FeatureComputer::set_config, nb::arg("dims"), nb::arg("channels"),
            nb::arg("grids"), nb::arg("stride"))
+      .def("pairs", &FeatureComputer::pairs)
       .def(
           "raw",
           [](FeatureComputer &self, Arr a) {

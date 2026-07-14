@@ -88,6 +88,16 @@ def quality(ref, out):
     cos = (h * hr).sum(-1)[ok] / (na[ok] * nb[ok])
     q["hog_cos"] = float(cos.mean()) if ok.any() else 1.0
     q["cnt_r"] = _corr(out["cnt_0"][..., 0], ref["cnt_0"][..., 0])
+    lb, lbr = out["lbp_0"], ref["lbp_0"]  # both L1-normalised, so no norm is ever 0
+    q["lbp_cos"] = float(
+        (lb * lbr).sum(-1).mean()
+        / (np.linalg.norm(lb, axis=-1) * np.linalg.norm(lbr, axis=-1)).mean()
+    )
+    q["xchan_r"] = (
+        _corr(out["xchan_0"][..., 1], ref["xchan_0"][..., 1])
+        if "xchan_0" in out
+        else 1.0
+    )
     return q
 
 
@@ -101,6 +111,8 @@ COLS = [
     ("ori_deg", 8, "{:8.2f}"),
     ("hog_cos", 8, "{:8.4f}"),
     ("cnt_r", 7, "{:7.4f}"),
+    ("lbp_cos", 8, "{:8.4f}"),
+    ("xchan_r", 8, "{:8.4f}"),
 ]
 
 
@@ -132,9 +144,9 @@ def sweep(n, c, strides=STRIDES):
 
 
 def head(title):
-    print("\n" + "=" * 104)
+    print("\n" + "=" * 120)
     print(title)
-    print("=" * 104)
+    print("=" * 120)
 
 
 def main():
@@ -144,7 +156,7 @@ def main():
     head(
         f"1. Stride: latency vs accuracy   ({T}x{T}x3)\n"
         "   Errors vs the exact stride=1 output. mean_err/std_err in grey levels;\n"
-        "   ori_deg is coherence-weighted; energy_r/cnt_r/hog_cos: 1.0 = exact."
+        "   ori_deg is coherence-weighted; energy_r/cnt_r/hog_cos/lbp_cos/xchan_r: 1.0 = exact."
     )
     table(sweep(T, 3))
 

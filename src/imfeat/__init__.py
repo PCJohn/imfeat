@@ -6,6 +6,11 @@ One traversal of the image produces, per pyramid cell per channel:
   * gradient structure-tensor features   [energy, coherence, ori_cos, ori_sin, cornerness]
   * an L1-normalised HOG                 (9 orientation bins over [0, pi))
   * extrema densities                    [local_max, local_min]
+  * an LBP^riu2_{8,1} histogram          (10 rotation-invariant uniform-LBP bins)
+
+and, once per cell (not per channel), for every pair of channels:
+
+  * cross-channel                        [cov, corr]
 
 Every accumulator is an additive integer sum, so coarser pyramid levels and the
 frame-wide "global" reduction are exact sums of the finest cells -- depth is free
@@ -41,7 +46,15 @@ import numpy as np
 
 from . import imfeat_core as _core  # type: ignore[attr-defined]
 
-__all__ = ["FeatureComputer", "MOMENTS", "FEATURES", "HOG_FEATURES", "COUNT_FEATURES"]
+__all__ = [
+    "FeatureComputer",
+    "MOMENTS",
+    "FEATURES",
+    "HOG_FEATURES",
+    "COUNT_FEATURES",
+    "LBP_FEATURES",
+    "CROSS_FEATURES",
+]
 __version__ = "0.1.0"
 
 # Grid spec accepted by FeatureComputer: k, (ky, kx), or a list of either.
@@ -57,12 +70,19 @@ FEATURES = ("energy", "coherence", "ori_cos", "ori_sin", "cornerness")
 HOG_FEATURES = tuple(f"hog_{b}" for b in range(_core.HB))
 # Extrema densities ("cnt_i"): fraction of pixels that are strict 8-nbhd max/min.
 COUNT_FEATURES = ("local_max", "local_min")
+# Rotation-invariant uniform LBP ("lbp_i"), L1-normalised. Bins 0..8 are the popcounts
+# of the uniform codes (<=2 circular 0/1 transitions); bin 9 collects everything else.
+LBP_FEATURES = tuple(f"lbp_{b}" for b in range(_core.LBPB - 1)) + ("lbp_nonuniform",)
+# Cross-channel maps ("xchan_i"), one row per channel pair (see .channel_pairs).
+CROSS_FEATURES = ("cov", "corr")
 
 _NS_RAW = 4  # raw structure-tensor width [Sxx, Syy, Sxy, count]
 _NS_FEAT = len(FEATURES)  # derived structure-tensor width = 5
 _NH = len(HOG_FEATURES)  # HOG bins
 _NC = len(COUNT_FEATURES)  # 2
 _NM = len(MOMENTS)  # 4
+_NL = len(LBP_FEATURES)  # 10
+_NX = len(CROSS_FEATURES)  # 2
 
 
 def _parse_grid(grid: GridSpec) -> list[list[int]]:
@@ -134,6 +154,10 @@ class FeatureComputer:
         self._keys = [str(i) for i in range(len(self._grid))] + ["global"]
         self._impl = _core._FeatureComputerImpl()
         self._impl.set_config([h, w, c], chan, self._grid, _parse_stride(stride))
+        p = self._impl.pairs()
+        #: pairs of *selected*-channel indices carried by the "xchan_*" maps, in order.
+        #: Empty for a single channel and for C > imfeat_core.XMAX (hyperspectral).
+        self.channel_pairs: list[tuple[int, int]] = list(zip(p[::2], p[1::2]))
 
     def _view(self, img: np.ndarray) -> np.ndarray:
         """Validate and return an (H, W[, C]) axis-order view (no copy)."""
@@ -161,13 +185,18 @@ class FeatureComputer:
             hog_i    (cells_y, cells_x[, C], 9)  gradient-energy orientation histogram
             cnt_i    (cells_y, cells_x[, C], 2)  [local_max, local_min]
             mom_i    (cells_y, cells_x[, C], 4)  power sums [S1, S2, S3, S4]
-        plus the "_global" variants. The C axis is present only for multi-channel input.
+            lbp_i    (cells_y, cells_x[, C], 10) LBP^riu2 bin counts (sum == pixel count)
+            xchan_i  (cells_y, cells_x, P)       Sum(v_i * v_j) per channel pair, P = len(channel_pairs)
+        plus the "_global" variants. The C axis is present only for multi-channel input;
+        "xchan_*" is absent when there are no channel pairs.
         """
-        widths = (("struct", _NS_RAW), ("hog", _NH), ("cnt", _NC), ("mom", _NM))
-        lv = self._impl.raw(self._view(img))
+        widths = (("struct", _NS_RAW), ("hog", _NH), ("cnt", _NC), ("mom", _NM), ("lbp", _NL))
+        lv, cross = self._impl.raw(self._view(img))
         out: dict[str, np.ndarray] = {}
         for i, a in zip(self._keys, lv):
             out.update(self._cut(a, widths, i))
+        for i, x in zip(self._keys, cross):
+            out[f"xchan_{i}"] = x.copy()
         return out
 
     def features(self, img: np.ndarray) -> dict[str, np.ndarray]:
@@ -175,12 +204,16 @@ class FeatureComputer:
         struct_i (..., 5) float32   FEATURES
         hog_i    (..., 9) float32   L1-normalised histogram
         cnt_i    (..., 2) float32   extrema densities
+        lbp_i    (..., 10) float32  L1-normalised LBP^riu2 histogram
         mom_i    (..., 4) float64   MOMENTS [mean, var, m3, m4]
+        xchan_i  (cy, cx, P, 2) float32   CROSS_FEATURES [cov, corr] per channel pair
         """
-        fw = (("struct", _NS_FEAT), ("hog", _NH), ("cnt", _NC))
-        feat, mom = self._impl.features(self._view(img))
+        fw = (("struct", _NS_FEAT), ("hog", _NH), ("cnt", _NC), ("lbp", _NL))
+        feat, mom, cross = self._impl.features(self._view(img))
         out: dict[str, np.ndarray] = {}
         for i, (a, m) in zip(self._keys, zip(feat, mom)):
             out.update(self._cut(a, fw, i))
             out.update(self._cut(m, (("mom", _NM),), i))
+        for i, x in zip(self._keys, cross):
+            out[f"xchan_{i}"] = x.copy()
         return out
