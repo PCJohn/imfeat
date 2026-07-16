@@ -51,10 +51,16 @@ constexpr int NMOM = 4;
 // LBP^riu2_{8,1} (Ojala 2002): 10 bins -- popcount 0..8 for the "uniform" codes
 // (<=2 circular 0/1 transitions), plus one catch-all bin for the rest.
 constexpr int LBPB = 10;
-constexpr int LBP0 = PS0 + NMOM;         // 19
-constexpr int NSUM = LBP0 + LBPB;        // 29 int64 sums per cell per channel
-constexpr int NF_S = 5;                  // tensor-derived float channels
-constexpr int NF = NF_S + HB + 2 + LBPB; // 26 derived float32 per cell per channel
+constexpr int LBP0 = PS0 + NMOM;  // 19
+constexpr int NSUM = LBP0 + LBPB; // 29 int64 sums per cell per channel
+constexpr int NF_S = 5;           // tensor-derived float channels
+// Model-ready nonlinear descriptors, all DERIVED from the sums above (no new
+// accumulators): standardized skew/kurtosis, two structure-tensor ratios, and two
+// HOG histogram-shape summaries. Nonlinear (ratios/products/argmax-free peakedness)
+// so a linear/shallow model cannot cheaply reconstruct them; dimensionless ones are
+// illumination-invariant, which helps few-shot on-the-fly training.
+constexpr int NDER = 6;
+constexpr int NF = NF_S + HB + 2 + LBPB + NDER; // 32 derived float32 per cell per channel
 // Cross-channel products Sum(v_i * v_j) over the C*(C-1)/2 unordered pairs. Off for
 // C=1 (no pairs) and for C > XMAX (hyperspectral: the pair count would explode).
 constexpr int XMAX = 8;
@@ -264,6 +270,7 @@ class FeatureComputer
   std::vector<Level> levels_;
   std::vector<int> row_cell_;
   int32_t hcx_[HB - 1] = {}, hcy_[HB - 1] = {};
+  int hog_card_[HB] = {};    // 1 for the axis-aligned (cardinal) orientation bins
   int np_ = 0;               // number of channel pairs (0 if C<2 or C>XMAX)
   std::vector<int> pi_, pj_; // the pairs, in (i<j) lexicographic order
 
@@ -278,7 +285,8 @@ class FeatureComputer
   std::vector<size_t> graw_shape_, gfeat_shape_, gmom_shape_, gxraw_shape_, gxfeat_shape_;
 
   // Structure-tensor + HOG + extrema features (float32).
-  void derive_cell(const int64_t *IF_RESTRICT s, float *IF_RESTRICT f) const
+  void derive_cell(const int64_t *IF_RESTRICT s, const double *IF_RESTRICT mom,
+                   float *IF_RESTRICT f) const
   {
     const double sxx = (double)s[SXX], syy = (double)s[SYY], sxy = (double)s[SXY];
     const double n = (double)s[CNT];
@@ -302,6 +310,31 @@ class FeatureComputer
     // the LBP bins partition the cell's pixels, so their sum is exactly the count
     for (int b = 0; b < LBPB; ++b)
       f[NF_S + HB + 2 + b] = (float)((double)s[LBP0 + b] * invn);
+
+    // --- derived nonlinear descriptors (see NDER) ---
+    float *IF_RESTRICT g = f + NF_S + HB + 2 + LBPB;
+    const double var = mom[1], m3 = mom[2], m4 = mom[3];
+    const double sd = std::sqrt(var > 0.0 ? var : 0.0),
+                 inv2 = var > 0.0 ? 1.0 / (var * var) : 0.0;
+    // A. standardized moments -- dimensionless, so invariant to any v -> a*v+b (a>0).
+    // std_skew is framegate's own text/bimodality cue (|m3|/var^1.5) as a first-class feature.
+    g[0] = (float)(var > 0.0 ? m3 * inv2 * sd : 0.0);  // std_skew = m3 / var^1.5
+    g[1] = (float)(var > 0.0 ? m4 * inv2 - 3.0 : 0.0); // excess kurtosis = m4/var^2 - 3
+    // B. structure-tensor ratios (energy = f[0], coherence = f[1]).
+    g[2] = (float)((double)f[0] / (var + 1.0));          // edge_sharpness = energy/(var+eps)
+    g[3] = (float)((double)f[0] * (1.0 - (double)f[1])); // detail = energy*(1-coherence)
+    // C. HOG histogram shape (log-free). Concentration (Herfindahl) is high for a single
+    // orientation (barcodes), low when spread (QR, foliage). Cardinality is the axis-aligned
+    // energy fraction (text, tables). Both need the multimodality the tensor averages away.
+    double sq = 0.0, card = 0.0;
+    for (int b = 0; b < HB; ++b)
+    {
+      const double hb = (double)s[HOG0 + b];
+      sq += hb * hb;
+      card += hog_card_[b] ? hb : 0.0;
+    }
+    g[4] = (float)(hs > 0 ? sq * invh * invh : 0.0); // concentration = sum p_i^2
+    g[5] = (float)(hs > 0 ? card * invh : 0.0);      // cardinality = cardinal energy fraction
   }
 
   // Cross-channel covariance and Pearson correlation per channel pair, from the raw
@@ -521,8 +554,9 @@ class FeatureComputer
         double *IF_RESTRICT m = L.mom.data() + cell * c_ * NMOM;
         for (int k = 0; k < c_; ++k)
         {
-          derive_cell(s + (size_t)k * NSUM, L.feat.data() + (cell * c_ + k) * NF);
           derive_moments(s + (size_t)k * NSUM, m + (size_t)k * NMOM);
+          derive_cell(s + (size_t)k * NSUM, m + (size_t)k * NMOM,
+                      L.feat.data() + (cell * c_ + k) * NF);
         }
         if (np_)
           derive_cross(m, s[CNT], L.xbuf.data() + cell * np_,
@@ -530,8 +564,9 @@ class FeatureComputer
       }
     for (int k = 0; k < c_; ++k)
     {
-      derive_cell(graw_.data() + (size_t)k * NSUM, gfeat_.data() + (size_t)k * NF);
       derive_moments(graw_.data() + (size_t)k * NSUM, gmom_.data() + (size_t)k * NMOM);
+      derive_cell(graw_.data() + (size_t)k * NSUM, gmom_.data() + (size_t)k * NMOM,
+                  gfeat_.data() + (size_t)k * NF);
     }
     if (np_)
       derive_cross(gmom_.data(), graw_[CNT], gxraw_.data(), gxfeat_.data());
@@ -567,6 +602,15 @@ public:
       const double a = PI * k / HB;
       hcx_[k - 1] = (int32_t)std::llround(RAYSCALE * std::cos(a));
       hcy_[k - 1] = (int32_t)std::llround(RAYSCALE * std::sin(a));
+    }
+    // A bin is "cardinal" if its centre orientation lies within 3/4 of a bin width of a
+    // horizontal or vertical edge (gradient at 0, pi/2, or pi). Text, tables, UI and the
+    // Devanagari head-line are strongly axis-aligned; natural scenes are not.
+    for (int b = 0; b < HB; ++b)
+    {
+      const double c = (b + 0.5) * PI / HB;
+      const double dist = std::min(std::min(c, PI - c), std::fabs(c - PI / 2));
+      hog_card_[b] = dist < 0.75 * PI / HB ? 1 : 0;
     }
 
     levels_.clear();

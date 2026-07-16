@@ -54,6 +54,7 @@ __all__ = [
     "COUNT_FEATURES",
     "LBP_FEATURES",
     "CROSS_FEATURES",
+    "DESCRIPTOR_FEATURES",
 ]
 __version__ = "0.1.0"
 
@@ -75,6 +76,20 @@ COUNT_FEATURES = ("local_max", "local_min")
 LBP_FEATURES = tuple(f"lbp_{b}" for b in range(_core.LBPB - 1)) + ("lbp_nonuniform",)
 # Cross-channel maps ("xchan_i"), one row per channel pair (see .channel_pairs).
 CROSS_FEATURES = ("cov", "corr")
+# Model-ready nonlinear descriptors ("desc_i"), all derived in the same pass from the sums
+# above (no extra accumulators). std_skew/excess_kurt are the dimensionless (illumination-
+# invariant) shape of the intensity distribution; edge_sharpness/detail are structure-tensor
+# ratios framegate hand-codes today; hog_concentration/hog_cardinality summarise the gradient
+# orientation histogram's peakedness and axis-alignment. Nonlinear (ratios/products/squares),
+# so a linear or shallow-tree model cannot cheaply reconstruct them.
+DESCRIPTOR_FEATURES = (
+    "std_skew",
+    "excess_kurt",
+    "edge_sharpness",
+    "detail",
+    "hog_concentration",
+    "hog_cardinality",
+)
 
 _NS_RAW = 4  # raw structure-tensor width [Sxx, Syy, Sxy, count]
 _NS_FEAT = len(FEATURES)  # derived structure-tensor width = 5
@@ -83,6 +98,7 @@ _NC = len(COUNT_FEATURES)  # 2
 _NM = len(MOMENTS)  # 4
 _NL = len(LBP_FEATURES)  # 10
 _NX = len(CROSS_FEATURES)  # 2
+_ND = len(DESCRIPTOR_FEATURES)  # 6
 
 
 def _parse_grid(grid: GridSpec) -> list[list[int]]:
@@ -206,9 +222,10 @@ class FeatureComputer:
         cnt_i    (..., 2) float32   extrema densities
         lbp_i    (..., 10) float32  L1-normalised LBP^riu2 histogram
         mom_i    (..., 4) float64   MOMENTS [mean, var, m3, m4]
+        desc_i   (..., 6) float32   DESCRIPTOR_FEATURES (derived nonlinear summaries)
         xchan_i  (cy, cx, P, 2) float32   CROSS_FEATURES [cov, corr] per channel pair
         """
-        fw = (("struct", _NS_FEAT), ("hog", _NH), ("cnt", _NC), ("lbp", _NL))
+        fw = (("struct", _NS_FEAT), ("hog", _NH), ("cnt", _NC), ("lbp", _NL), ("desc", _ND))
         feat, mom, cross = self._impl.features(self._view(img))
         out: dict[str, np.ndarray] = {}
         for i, (a, m) in zip(self._keys, zip(feat, mom)):

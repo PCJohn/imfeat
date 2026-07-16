@@ -59,7 +59,7 @@ allocated up front and reused, so steady-state extraction allocates nothing.
 ### `.features(img) -> dict[str, np.ndarray]`
 
 The derived, model-ready maps. Keys are `{group}_{level}`, for `group` in
-`mom | struct | hog | cnt | lbp | xchan` and `level` in `0 .. K-1` plus `global`:
+`mom | struct | hog | cnt | lbp | desc | xchan` and `level` in `0 .. K-1` plus `global`:
 
 | key | shape | dtype | contents |
 |---|---|---|---|
@@ -68,6 +68,7 @@ The derived, model-ready maps. Keys are `{group}_{level}`, for `group` in
 | `hog_i` | `(cy, cx, C, 9)` | float32 | `imfeat.HOG_FEATURES`, L1-normalised |
 | `cnt_i` | `(cy, cx, C, 2)` | float32 | `imfeat.COUNT_FEATURES` — local_max, local_min |
 | `lbp_i` | `(cy, cx, C, 10)` | float32 | `imfeat.LBP_FEATURES`, L1-normalised |
+| `desc_i` | `(cy, cx, C, 6)` | float32 | `imfeat.DESCRIPTOR_FEATURES` — derived nonlinear summaries |
 | `xchan_i` | `(cy, cx, P, 2)` | float32 | `imfeat.CROSS_FEATURES` — cov, corr, per channel pair |
 | `*_global` | `(C, …)` | | the same groups, reduced over the whole frame |
 
@@ -101,7 +102,7 @@ var  = ps[:, 1] / n - mean**2
 ### Constants
 
 `imfeat.MOMENTS`, `imfeat.FEATURES`, `imfeat.HOG_FEATURES`, `imfeat.COUNT_FEATURES`,
-`imfeat.LBP_FEATURES` and `imfeat.CROSS_FEATURES` name the last axis of each group, in
+`imfeat.LBP_FEATURES`, `imfeat.DESCRIPTOR_FEATURES` and `imfeat.CROSS_FEATURES` name the last axis of each group, in
 order, so nothing has to be indexed by magic number. `fc.channel_pairs` names the pair axis
 of `xchan_i`.
 
@@ -218,7 +219,30 @@ middle bins are edges and corners of varying sharpness, bin 9 is high-frequency 
 The comparison is `neighbour >= centre`, so a flat neighbourhood is all-ones — a flat image
 lands entirely in bin 8. The border is replicate-padded, consistently with `cnt_i`.
 
-### 6. Cross-channel covariance — `xchan_i`, 2 values per channel pair
+### 6. Derived descriptors — `desc_i`, 6 values
+
+Six *nonlinear* summaries of the sums above, computed in the same pass at no extra
+accumulator cost. They exist for downstream models: a fast linear or shallow-tree classifier
+can form weighted sums of features for free but cannot cheaply compute a ratio, a product, a
+standardized moment, or a histogram's peakedness — so those are precomputed here rather than
+left for the model to rediscover. Five of the six are dimensionless (invariant to any
+`v -> a*v+b`, `a>0`), which is what lets a model trained on a handful of pixels transfer
+across a contrast or brightness change.
+
+| name | definition | reads | what it separates |
+|---|---|---|---|
+| `std_skew` | `m3 / var^1.5` | moments | bimodal ink-on-paper text (strongly skewed) from symmetric scenes |
+| `excess_kurt` | `m4 / var^2 - 3` | moments | leptokurtic text, platykurtic binary/stripes, near-Gaussian photo |
+| `edge_sharpness` | `energy / (var + 1)` | struct+mom | in-focus detail per unit contrast (a focus/defocus map) |
+| `detail` | `energy * (1 - coherence)` | struct | isotropic edge clutter (QR, foliage) from a single clean edge |
+| `hog_concentration` | `sum p_i^2` over HOG bins | hog | one dominant orientation (barcode) from spread (QR) |
+| `hog_cardinality` | axis-aligned bin fraction | hog | horizontal/vertical structure (text, tables) from diagonal |
+
+`std_skew`, `edge_sharpness` and `detail` are exactly the hand-coded cues the `framegate`
+client computes today; promoting them to first-class features means the model reads them
+directly. `desc_i` is derived only, so it appears in `features()` but not `compute()`.
+
+### 7. Cross-channel covariance — `xchan_i`, 2 values per channel pair
 
 For each unordered pair of channels, `[cov, corr]`: the covariance and the Pearson
 correlation of the two channels' pixel values over the cell. Everything else in `imfeat`
