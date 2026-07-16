@@ -51,16 +51,17 @@ constexpr int NMOM = 4;
 // LBP^riu2_{8,1} (Ojala 2002): 10 bins -- popcount 0..8 for the "uniform" codes
 // (<=2 circular 0/1 transitions), plus one catch-all bin for the rest.
 constexpr int LBPB = 10;
-constexpr int LBP0 = PS0 + NMOM;  // 19
-constexpr int NSUM = LBP0 + LBPB; // 29 int64 sums per cell per channel
-constexpr int NF_S = 5;           // tensor-derived float channels
+constexpr int LBP0 = PS0 + NMOM; // 19
+constexpr int SG4 = LBP0 + LBPB; // 29: sum of |grad|^4 = (gx^2+gy^2)^2, for gradient sparsity
+constexpr int NSUM = SG4 + 1;    // 30 int64 sums per cell per channel
+constexpr int NF_S = 5;          // tensor-derived float channels
 // Model-ready nonlinear descriptors, all DERIVED from the sums above (no new
 // accumulators): standardized skew/kurtosis, two structure-tensor ratios, and two
 // HOG histogram-shape summaries. Nonlinear (ratios/products/argmax-free peakedness)
 // so a linear/shallow model cannot cheaply reconstruct them; dimensionless ones are
 // illumination-invariant, which helps few-shot on-the-fly training.
-constexpr int NDER = 6;
-constexpr int NF = NF_S + HB + 2 + LBPB + NDER; // 32 derived float32 per cell per channel
+constexpr int NDER = 7;
+constexpr int NF = NF_S + HB + 2 + LBPB + NDER; // 33 derived float32 per cell per channel
 // Cross-channel products Sum(v_i * v_j) over the C*(C-1)/2 unordered pairs. Off for
 // C=1 (no pairs) and for C > XMAX (hyperspectral: the pair count would explode).
 constexpr int XMAX = 8;
@@ -128,12 +129,13 @@ void accumulate_row(const int16_t *IF_RESTRICT gxb, const int16_t *IF_RESTRICT g
   }
   int64_t hog[HB * SIMD_CH], lbp[LBPB * SIMD_CH];
   int32_t blane[SIMD_CH], g2lane[SIMD_CH], nmxa[SIMD_CH], nmna[SIMD_CH];
+  int64_t se[SIMD_CH], so[SIMD_CH]; // |grad|^4 partial sums, even/odd channels
   int64_t xx[SIMD_CH], yy[SIMD_CH], xy[SIMD_CH], ps[NMOM][SIMD_CH];
 
   for (int e = 0; e < ncell; ++e)
   {
     auto axl = hn::Zero(d64), axh = hn::Zero(d64), ayl = hn::Zero(d64), ayh = hn::Zero(d64),
-         axyl = hn::Zero(d64), axyh = hn::Zero(d64);
+         axyl = hn::Zero(d64), axyh = hn::Zero(d64), sg4e = hn::Zero(d64), sg4o = hn::Zero(d64);
     hn::VFromD<decltype(d64)> pl[NMOM], ph[NMOM];
     for (int k = 0; k < NMOM; ++k)
       pl[k] = ph[k] = hn::Zero(d64);
@@ -166,10 +168,16 @@ void accumulate_row(const int16_t *IF_RESTRICT gxb, const int16_t *IF_RESTRICT g
         b = hn::Sub(b, hn::VecFromMask(d, hn::Ge(t, zero))); // b += (t >= 0)
       }
       hn::StoreU(b, d, blane);
-      hn::StoreU(hn::Add(gx2, gy2), d, g2lane);
+      const auto g2v = hn::Add(gx2, gy2);
+      hn::StoreU(g2v, d, g2lane);
       for (int l = 0; l < n; ++l)
         if (g2lane[l])
           hog[l * HB + blane[l]] += (int64_t)g2lane[l];
+      // |grad|^4 = (gx^2+gy^2)^2: widen-square in SIMD (32x32->64, one op each) rather than
+      // a scalar multiply per channel. MulEven/MulOdd give the even/odd channels separately
+      // (g2 <= 2.08e6 < 2^21, so g2^2 is exact); they are de-interleaved once at flush.
+      sg4e = hn::Add(sg4e, hn::MulEven(g2v, g2v));
+      sg4o = hn::Add(sg4o, hn::MulOdd(g2v, g2v));
       // power sums: v <= 255 so v*v fits int32, but v^4 (4.2e9) does not -- the
       // cubes and quartics accumulate in int64 lanes.
       const auto v = u8_at(vb, c);
@@ -207,6 +215,8 @@ void accumulate_row(const int16_t *IF_RESTRICT gxb, const int16_t *IF_RESTRICT g
     }
     hn::StoreU(nmaxv, d, nmxa);
     hn::StoreU(nminv, d, nmna);
+    hn::StoreU(sg4e, d64, se); // se = {ch0^4-sum, ch2^4-sum, ...}
+    hn::StoreU(sg4o, d64, so); // so = {ch1^4-sum, ch3^4-sum, ...}
     int64_t *IF_RESTRICT acc = rowbase + (size_t)e * cellstride;
     for (int l = 0; l < n; ++l)
     {
@@ -217,6 +227,7 @@ void accumulate_row(const int16_t *IF_RESTRICT gxb, const int16_t *IF_RESTRICT g
       a[CNT] += colcount;
       for (int j = 0; j < HB; ++j)
         a[HOG0 + j] += hog[l * HB + j];
+      a[SG4] += (l & 1) ? so[l >> 1] : se[l >> 1];
       a[NMAX] += nmxa[l];
       a[NMIN] += nmna[l];
       for (int k = 0; k < NMOM; ++k)
@@ -335,6 +346,11 @@ class FeatureComputer
     }
     g[4] = (float)(hs > 0 ? sq * invh * invh : 0.0); // concentration = sum p_i^2
     g[5] = (float)(hs > 0 ? card * invh : 0.0);      // cardinality = cardinal energy fraction
+    // D. gradient sparsity = kurtosis of |grad| = E[g^4]/E[g^2]^2 (>=1, dimensionless).
+    // Near 1 for a uniform gradient field; large where a few strong edges dominate a mostly
+    // flat cell (text strokes, line art, glyph and infographic borders) vs dense texture.
+    const double ge2 = (double)s[SXX] + (double)s[SYY]; // sum |grad|^2
+    g[6] = (float)(ge2 > 0.0 ? n * (double)s[SG4] / (ge2 * ge2) : 0.0);
   }
 
   // Cross-channel covariance and Pearson correlation per channel pair, from the raw

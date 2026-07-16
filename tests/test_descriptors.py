@@ -178,3 +178,82 @@ def test_detail_is_not_affine_invariant():
     a = fc.features(base)["desc_global"][D["detail"]]
     b = fc.features(warped)["desc_global"][D["detail"]]
     assert b > 3.0 * a  # ~4x
+
+
+# ==========================================================================
+# D -- gradient sparsity (kurtosis of gradient magnitude): its own tier since it
+# needs a Sobel oracle rather than the mom/struct/hog maps.
+# ==========================================================================
+def _sobel_int(img):
+    """imfeat's exact integer Sobel with a replicate border."""
+    p = np.pad(img.astype(np.int64), 1, mode="edge")
+    gx = (p[:-2, 2:] + 2 * p[1:-1, 2:] + p[2:, 2:]) - (
+        p[:-2, :-2] + 2 * p[1:-1, :-2] + p[2:, :-2]
+    )
+    gy = (p[2:, :-2] + 2 * p[2:, 1:-1] + p[2:, 2:]) - (
+        p[:-2, :-2] + 2 * p[:-2, 1:-1] + p[:-2, 2:]
+    )
+    return gx, gy
+
+
+def _ref_grad_sparsity(img):
+    gx, gy = _sobel_int(img)
+    g2 = (gx * gx + gy * gy).astype(np.float64)
+    n, e2 = g2.size, g2.sum()
+    return n * (g2 * g2).sum() / (e2 * e2) if e2 > 0 else 0.0
+
+
+def sparse_lines(n=96, step=16):
+    img = np.full((n, n), 20, np.uint8)
+    img[:, ::step] = 220
+    return img
+
+
+@pytest.mark.parametrize(
+    "img", [noise(96), ink_on_paper(96), sparse_lines(), ramp(), stripes()]
+)
+def test_grad_sparsity_matches_sobel_oracle(img):
+    got = imfeat.FeatureComputer(img.shape, grid=[(0, 0)]).features(img)["desc_global"]
+    assert np.isclose(got[D["grad_sparsity"]], _ref_grad_sparsity(img), rtol=1e-4, atol=1e-3)
+
+
+def test_uniform_gradient_has_sparsity_one():
+    """A linear ramp has the same gradient at every interior pixel -> kurtosis 1, the
+    minimum (only border pixels differ, so it sits just above 1)."""
+    d = imfeat.FeatureComputer((96, 96), grid=[(0, 0)]).features(ramp())["desc_global"]
+    assert 1.0 <= d[D["grad_sparsity"]] < 1.15
+
+
+def test_sparse_edges_have_high_sparsity():
+    """A few strong rules on a flat field: most pixels have zero gradient, a few are huge
+    -> heavy-tailed, high kurtosis, well above dense texture."""
+    g = [(0, 0)]
+    lines = imfeat.FeatureComputer((96, 96), grid=g).features(sparse_lines())["desc_global"]
+    dense = imfeat.FeatureComputer((96, 96), grid=g).features(noise(96))["desc_global"]
+    assert lines[D["grad_sparsity"]] > 4.0
+    assert lines[D["grad_sparsity"]] > 2.0 * dense[D["grad_sparsity"]]
+
+
+def test_grad_sparsity_is_at_least_one():
+    """Kurtosis of a non-negative quantity is >= 1 by Jensen, wherever there is gradient."""
+    for im in (noise(128), ink_on_paper(128), stripes(), diagonal_stripes(), ramp()):
+        d = imfeat.FeatureComputer(im.shape, grid=[(2, 2)]).features(im)["desc_0"]
+        gs = d[..., D["grad_sparsity"]]
+        assert np.all(gs[gs > 0] >= 1.0 - 1e-4)
+
+
+def test_grad_sparsity_flat_is_zero():
+    img = np.full((64, 64), 90, np.uint8)
+    d = imfeat.FeatureComputer(img.shape, grid=[(0, 0)]).features(img)["desc_global"]
+    assert d[D["grad_sparsity"]] == 0.0
+
+
+@pytest.mark.parametrize("img", [noise(96, 0, 120), sparse_lines(), ink_on_paper(96)])
+def test_grad_sparsity_is_affine_invariant(img):
+    """Dimensionless (g scales with contrast, cancels in E[g^4]/E[g^2]^2)."""
+    base = (img.astype(np.int16) % 120).astype(np.uint8)
+    warped = (2 * base + 15).astype(np.uint8)
+    fc = imfeat.FeatureComputer(base.shape, grid=[(2, 2)])
+    a = fc.features(base)["desc_0"][..., D["grad_sparsity"]]
+    b = fc.features(warped)["desc_0"][..., D["grad_sparsity"]]
+    assert np.allclose(a, b, rtol=1e-3, atol=1e-3)

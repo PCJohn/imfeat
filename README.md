@@ -219,7 +219,7 @@ middle bins are edges and corners of varying sharpness, bin 9 is high-frequency 
 The comparison is `neighbour >= centre`, so a flat neighbourhood is all-ones — a flat image
 lands entirely in bin 8. The border is replicate-padded, consistently with `cnt_i`.
 
-### 6. Derived descriptors — `desc_i`, 6 values
+### 6. Derived descriptors — `desc_i`, 7 values
 
 Six *nonlinear* summaries of the sums above, computed in the same pass at no extra
 accumulator cost. They exist for downstream models: a fast linear or shallow-tree classifier
@@ -237,10 +237,13 @@ across a contrast or brightness change.
 | `detail` | `energy * (1 - coherence)` | struct | isotropic edge clutter (QR, foliage) from a single clean edge |
 | `hog_concentration` | `sum p_i^2` over HOG bins | hog | one dominant orientation (barcode) from spread (QR) |
 | `hog_cardinality` | axis-aligned bin fraction | hog | horizontal/vertical structure (text, tables) from diagonal |
+| `grad_sparsity` | `n*sum(g^4) / (sum g^2)^2` | gradient | sparse strong edges (rules, glyph/infographic borders) from dense texture |
 
 `std_skew`, `edge_sharpness` and `detail` are exactly the hand-coded cues the `framegate`
 client computes today; promoting them to first-class features means the model reads them
-directly. `desc_i` is derived only, so it appears in `features()` but not `compute()`.
+directly. All but `detail` are dimensionless. `desc_i` is derived only, so it appears in
+`features()` but not `compute()`; `grad_sparsity` is the one that adds an accumulator
+(`sum |grad|^4`) rather than being computed purely from existing sums.
 
 ### 7. Cross-channel covariance — `xchan_i`, 2 values per channel pair
 
