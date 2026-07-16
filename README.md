@@ -237,7 +237,7 @@ across a contrast or brightness change.
 | `detail` | `energy * (1 - coherence)` | struct | isotropic edge clutter (QR, foliage) from a single clean edge |
 | `hog_concentration` | `sum p_i^2` over HOG bins | hog | one dominant orientation (barcode) from spread (QR) |
 | `hog_cardinality` | axis-aligned bin fraction | hog | horizontal/vertical structure (text, tables) from diagonal |
-| `grad_sparsity` | `n*sum(g^4) / (sum g^2)^2` | gradient | sparse strong edges (rules, glyph/infographic borders) from dense texture |
+| `grad_sparsity` | `n*sum(g^4)/(sum g^2)^2` = 1+CV^2(grad energy) | gradient | sparse strong edges (rules, glyph/infographic borders) from dense texture |
 | `rms_contrast` | `sqrt(var) / (mean + 1)` | moments | coefficient of variation (Peli 1990); brightness-relative contrast |
 
 `std_skew`, `edge_sharpness` and `detail` are exactly the hand-coded cues the `framegate`

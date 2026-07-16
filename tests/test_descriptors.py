@@ -296,3 +296,41 @@ def test_rms_contrast_invariant_to_gain_not_offset():
     r_off = off["desc_global"][D["rms_contrast"]]
     assert abs(r_gain - r0) < 0.06 * r0  # gain: ~invariant
     assert r_off < 0.85 * r0  # offset: clearly lower
+
+
+# ==========================================================================
+# Hardening: validate the standardized moments end-to-end against an INDEPENDENT numpy
+# computation on the raw pixels. The formula test above reuses imfeat's own mom_i, so it
+# cannot catch a regression in derive_moments or in how the moments are wired into
+# derive_cell; this can.
+# ==========================================================================
+@pytest.mark.parametrize(
+    "img", [noise(96), ink_on_paper(96), ramp(), stripes(), diagonal_stripes(), sparse_lines()]
+)
+def test_std_skew_excess_kurt_end_to_end_vs_numpy(img):
+    x = img.astype(np.float64).ravel()
+    mu, var = x.mean(), x.var()  # population variance (ddof=0), matching imfeat
+    d = imfeat.FeatureComputer(img.shape, grid=[(0, 0)]).features(img)["desc_global"]
+    if var > 0:
+        skew_ref = ((x - mu) ** 3).mean() / var**1.5
+        kurt_ref = ((x - mu) ** 4).mean() / var**2 - 3.0
+        assert np.isclose(d[D["std_skew"]], skew_ref, rtol=1e-4, atol=1e-4)
+        assert np.isclose(d[D["excess_kurt"]], kurt_ref, rtol=1e-4, atol=1e-4)
+
+
+def test_concentration_pure_single_orientation_is_near_one():
+    """All gradient energy in one orientation bin -> Herfindahl ~ 1 (tight bound, catches a
+    missing normalisation which would instead scale with total gradient magnitude)."""
+    d = imfeat.FeatureComputer((96, 96), grid=[(0, 0)]).features(stripes(axis=1))["desc_global"]
+    assert d[D["hog_concentration"]] > 0.95
+
+
+def test_grad_sparsity_equals_one_plus_cv2_identity():
+    """grad_sparsity == 1 + Var(G)/E[G]^2 for G = per-pixel gradient energy (its definition),
+    checked against an independent Sobel computation."""
+    for img in (noise(96), sparse_lines(), ink_on_paper(96)):
+        gx, gy = _sobel_int(img)
+        G = (gx * gx + gy * gy).astype(np.float64).ravel()
+        ref = 1.0 + G.var() / (G.mean() ** 2)
+        got = imfeat.FeatureComputer(img.shape, grid=[(0, 0)]).features(img)["desc_global"]
+        assert np.isclose(got[D["grad_sparsity"]], ref, rtol=1e-4, atol=1e-3)

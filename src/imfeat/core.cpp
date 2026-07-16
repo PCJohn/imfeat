@@ -346,9 +346,11 @@ class FeatureComputer
     }
     g[4] = (float)(hs > 0 ? sq * invh * invh : 0.0); // concentration = sum p_i^2
     g[5] = (float)(hs > 0 ? card * invh : 0.0);      // cardinality = cardinal energy fraction
-    // D. gradient sparsity = kurtosis of |grad| = E[g^4]/E[g^2]^2 (>=1, dimensionless).
+    // D. gradient sparsity: normalized 4th moment of gradient magnitude E[|g|^4]/E[|g|^2]^2,
+    // = 1 + CV^2 of per-pixel gradient energy (>=1 by Cauchy-Schwarz, dimensionless). This is
+    // the non-central moment ratio, not the central kurtosis (which needs a per-pixel sqrt).
     // Near 1 for a uniform gradient field; large where a few strong edges dominate a mostly
-    // flat cell (text strokes, line art, glyph and infographic borders) vs dense texture.
+    // flat cell (text strokes, line art, glyph/infographic borders).
     const double ge2 = (double)s[SXX] + (double)s[SYY]; // sum |grad|^2
     g[6] = (float)(ge2 > 0.0 ? n * (double)s[SG4] / (ge2 * ge2) : 0.0);
     // E. RMS contrast = coefficient of variation sd/mean (Peli 1990): invariant to intensity
