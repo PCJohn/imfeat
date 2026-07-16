@@ -257,3 +257,42 @@ def test_grad_sparsity_is_affine_invariant(img):
     a = fc.features(base)["desc_0"][..., D["grad_sparsity"]]
     b = fc.features(warped)["desc_0"][..., D["grad_sparsity"]]
     assert np.allclose(a, b, rtol=1e-3, atol=1e-3)
+
+
+# ==========================================================================
+# E -- RMS contrast (coefficient of variation sd/mean): brightness-relative, so unlike the
+# other dimensionless descriptors it responds to an intensity offset, not just gain.
+# ==========================================================================
+def test_rms_contrast_matches_formula():
+    for img in [noise(96), ink_on_paper(96), stripes(), ramp()]:
+        f = imfeat.FeatureComputer(img.shape, grid=[(3, 3)]).features(img)
+        mean, var = f["mom_0"][..., 0], f["mom_0"][..., 1]
+        ref = np.sqrt(np.maximum(var, 0.0)) / (mean + 1.0)
+        assert np.allclose(f["desc_0"][..., D["rms_contrast"]], ref, atol=1e-4, rtol=1e-3)
+
+
+def test_rms_contrast_flat_is_zero():
+    img = np.full((64, 64), 130, np.uint8)
+    d = imfeat.FeatureComputer(img.shape, grid=[(0, 0)]).features(img)["desc_global"]
+    assert d[D["rms_contrast"]] == 0.0
+
+
+def test_rms_contrast_nonnegative():
+    for im in (noise(128), ink_on_paper(128), stripes(), diagonal_stripes(), ramp()):
+        d = imfeat.FeatureComputer(im.shape, grid=[(2, 2)]).features(im)["desc_0"]
+        assert np.all(d[..., D["rms_contrast"]] >= 0.0)
+
+
+def test_rms_contrast_invariant_to_gain_not_offset():
+    """sd/mean is unchanged by a pure intensity gain v->a*v (both scale), but a brightness
+    offset v->v+b raises the mean and lowers it -- the property that makes it complementary
+    to the affine-invariant descriptors."""
+    base = (noise(96, 40, 120)).astype(np.uint8)  # high mean so the +1 floor is negligible
+    fc = imfeat.FeatureComputer(base.shape, grid=[(0, 0)])
+    r0 = fc.features(base)["desc_global"][D["rms_contrast"]]
+    gain = fc.features((base.astype(np.float32) * 1.8).clip(0, 255).astype(np.uint8))
+    r_gain = gain["desc_global"][D["rms_contrast"]]
+    off = fc.features((base.astype(np.int16) + 60).clip(0, 255).astype(np.uint8))
+    r_off = off["desc_global"][D["rms_contrast"]]
+    assert abs(r_gain - r0) < 0.06 * r0  # gain: ~invariant
+    assert r_off < 0.85 * r0  # offset: clearly lower

@@ -219,7 +219,7 @@ middle bins are edges and corners of varying sharpness, bin 9 is high-frequency 
 The comparison is `neighbour >= centre`, so a flat neighbourhood is all-ones — a flat image
 lands entirely in bin 8. The border is replicate-padded, consistently with `cnt_i`.
 
-### 6. Derived descriptors — `desc_i`, 7 values
+### 6. Derived descriptors — `desc_i`, 8 values
 
 Six *nonlinear* summaries of the sums above, computed in the same pass at no extra
 accumulator cost. They exist for downstream models: a fast linear or shallow-tree classifier
@@ -238,6 +238,7 @@ across a contrast or brightness change.
 | `hog_concentration` | `sum p_i^2` over HOG bins | hog | one dominant orientation (barcode) from spread (QR) |
 | `hog_cardinality` | axis-aligned bin fraction | hog | horizontal/vertical structure (text, tables) from diagonal |
 | `grad_sparsity` | `n*sum(g^4) / (sum g^2)^2` | gradient | sparse strong edges (rules, glyph/infographic borders) from dense texture |
+| `rms_contrast` | `sqrt(var) / (mean + 1)` | moments | coefficient of variation (Peli 1990); brightness-relative contrast |
 
 `std_skew`, `edge_sharpness` and `detail` are exactly the hand-coded cues the `framegate`
 client computes today; promoting them to first-class features means the model reads them

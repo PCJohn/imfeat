@@ -90,6 +90,7 @@ DESCRIPTOR_FEATURES = (
     "hog_concentration",
     "hog_cardinality",
     "grad_sparsity",
+    "rms_contrast",
 )
 
 _NS_RAW = 4  # raw structure-tensor width [Sxx, Syy, Sxy, count]

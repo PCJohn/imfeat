@@ -60,7 +60,7 @@ constexpr int NF_S = 5;          // tensor-derived float channels
 // HOG histogram-shape summaries. Nonlinear (ratios/products/argmax-free peakedness)
 // so a linear/shallow model cannot cheaply reconstruct them; dimensionless ones are
 // illumination-invariant, which helps few-shot on-the-fly training.
-constexpr int NDER = 7;
+constexpr int NDER = 8;
 constexpr int NF = NF_S + HB + 2 + LBPB + NDER; // 33 derived float32 per cell per channel
 // Cross-channel products Sum(v_i * v_j) over the C*(C-1)/2 unordered pairs. Off for
 // C=1 (no pairs) and for C > XMAX (hyperspectral: the pair count would explode).
@@ -351,6 +351,10 @@ class FeatureComputer
     // flat cell (text strokes, line art, glyph and infographic borders) vs dense texture.
     const double ge2 = (double)s[SXX] + (double)s[SYY]; // sum |grad|^2
     g[6] = (float)(ge2 > 0.0 ? n * (double)s[SG4] / (ge2 * ge2) : 0.0);
+    // E. RMS contrast = coefficient of variation sd/mean (Peli 1990): invariant to intensity
+    // gain, relative to brightness (dark textured cells read as high contrast). The +1 grey
+    // level floors the denominator on near-black cells.
+    g[7] = (float)(sd / (mom[0] + 1.0));
   }
 
   // Cross-channel covariance and Pearson correlation per channel pair, from the raw
