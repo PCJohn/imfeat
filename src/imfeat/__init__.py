@@ -55,6 +55,7 @@ __all__ = [
     "LBP_FEATURES",
     "CROSS_FEATURES",
     "DESCRIPTOR_FEATURES",
+    "SUMMARY_STATS",
 ]
 __version__ = "0.1.0"
 
@@ -93,6 +94,11 @@ DESCRIPTOR_FEATURES = (
     "rms_contrast",
 )
 
+# Cross-cell summary stats carried on the last axis of every "*_summary_i" array,
+# in this fixed order. For each channel and feature, the feature's value is reduced
+# over that pyramid level's cells (min/max exact; mean/std population, cell-weighted).
+SUMMARY_STATS = ("min", "max", "mean", "std")
+
 _NS_RAW = 4  # raw structure-tensor width [Sxx, Syy, Sxy, count]
 _NS_FEAT = len(FEATURES)  # derived structure-tensor width = 5
 _NH = len(HOG_FEATURES)  # HOG bins
@@ -100,7 +106,8 @@ _NC = len(COUNT_FEATURES)  # 2
 _NM = len(MOMENTS)  # 4
 _NL = len(LBP_FEATURES)  # 10
 _NX = len(CROSS_FEATURES)  # 2
-_ND = len(DESCRIPTOR_FEATURES)  # 6
+_ND = len(DESCRIPTOR_FEATURES)  # 8
+_NST = len(SUMMARY_STATS)  # 4
 
 
 def _parse_grid(grid: GridSpec) -> list[list[int]]:
@@ -197,6 +204,19 @@ class FeatureComputer:
             o += n
         return out
 
+    def _cut_summary(self, a: np.ndarray, widths: Sequence[tuple[str, int]], i: str) -> dict:
+        """Slice one (C, F, NST) cross-cell summary into per-group "<name>_summary_i"
+        arrays (last axis = SUMMARY_STATS), dropping the size-1 channel axis for
+        single-channel (2-D) input."""
+        out, o = {}, 0
+        for name, n in widths:
+            # core buffer is (C, F, NST); expose as (F, C, NST) so the channel axis is
+            # second-to-last (as in every other map), then drop it for 2-D input.
+            v = np.ascontiguousarray(a[:, o : o + n, :].transpose(1, 0, 2))
+            out[f"{name}_summary_{i}"] = v[:, 0, :] if self._chan_axis is None else v
+            o += n
+        return out
+
     def compute(self, img: np.ndarray) -> dict[str, np.ndarray]:
         """Raw int64 accumulators per cell (additive; sum them freely):
             struct_i (cells_y, cells_x[, C], 4)  [Sxx, Syy, Sxy, count]
@@ -224,15 +244,27 @@ class FeatureComputer:
         cnt_i    (..., 2) float32   extrema densities
         lbp_i    (..., 10) float32  L1-normalised LBP^riu2 histogram
         mom_i    (..., 4) float64   MOMENTS [mean, var, m3, m4]
-        desc_i   (..., 6) float32   DESCRIPTOR_FEATURES (derived nonlinear summaries)
+        desc_i   (..., 8) float32   DESCRIPTOR_FEATURES (derived nonlinear summaries)
         xchan_i  (cy, cx, P, 2) float32   CROSS_FEATURES [cov, corr] per channel pair
+
+        Plus, per grid level i (not "global"), each derived feature reduced across
+        that level's cells into SUMMARY_STATS [min, max, mean, std] on the last axis.
+        Shape (n_feat, C, 4); the C axis is dropped for 2-D input:
+        struct_summary_i (5, C, 4)  hog_summary_i (9, C, 4)  cnt_summary_i (2, C, 4)
+        lbp_summary_i (10, C, 4)  desc_summary_i (8, C, 4)  mom_summary_i (4, C, 4)
+        So e.g. the max V cell-variance a caller would otherwise reduce by hand is
+        mom_summary_0[1, V, 1] (feature 1 = var, channel V, stat 1 = max).
         """
         fw = (("struct", _NS_FEAT), ("hog", _NH), ("cnt", _NC), ("lbp", _NL), ("desc", _ND))
-        feat, mom, cross = self._impl.features(self._view(img))
+        feat, mom, cross, fsum, msum = self._impl.features(self._view(img))
         out: dict[str, np.ndarray] = {}
         for i, (a, m) in zip(self._keys, zip(feat, mom)):
             out.update(self._cut(a, fw, i))
             out.update(self._cut(m, (("mom", _NM),), i))
         for i, x in zip(self._keys, cross):
             out[f"xchan_{i}"] = x.copy()
+        # Cross-cell summaries: per grid level only (the 1-cell "global" is trivial).
+        for i, (fs, ms) in zip(self._keys[:-1], zip(fsum, msum)):
+            out.update(self._cut_summary(fs, fw, i))
+            out.update(self._cut_summary(ms, (("mom", _NM),), i))
         return out

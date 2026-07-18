@@ -26,6 +26,7 @@ f["struct_0"]     # (32, 32, 3, 5)  float32  [energy, coherence, ori_cos, ori_si
 f["hog_0"]        # (32, 32, 3, 9)  float32  L1-normalised orientation histogram
 f["cnt_0"]        # (32, 32, 3, 2)  float32  [local_max, local_min] densities
 f["mom_global"]   # (3, 4)                   whole-frame, per channel
+f["mom_summary_0"] # (4, 3, 4)               [feat, channel, [min,max,mean,std]] across cells
 ```
 
 ---
@@ -68,11 +69,19 @@ The derived, model-ready maps. Keys are `{group}_{level}`, for `group` in
 | `hog_i` | `(cy, cx, C, 9)` | float32 | `imfeat.HOG_FEATURES`, L1-normalised |
 | `cnt_i` | `(cy, cx, C, 2)` | float32 | `imfeat.COUNT_FEATURES` — local_max, local_min |
 | `lbp_i` | `(cy, cx, C, 10)` | float32 | `imfeat.LBP_FEATURES`, L1-normalised |
-| `desc_i` | `(cy, cx, C, 6)` | float32 | `imfeat.DESCRIPTOR_FEATURES` — derived nonlinear summaries |
+| `desc_i` | `(cy, cx, C, 8)` | float32 | `imfeat.DESCRIPTOR_FEATURES` — derived nonlinear summaries |
 | `xchan_i` | `(cy, cx, P, 2)` | float32 | `imfeat.CROSS_FEATURES` — cov, corr, per channel pair |
 | `*_global` | `(C, …)` | | the same groups, reduced over the whole frame |
+| `{mom,struct,hog,cnt,lbp,desc}_summary_i` | `(F, C, 4)` | matches the group | each map reduced **across that level's cells** into `imfeat.SUMMARY_STATS` |
 
 The `C` axis is dropped entirely for 2-D `(H, W)` input.
+
+`*_summary_i` is a per-level cross-cell reduction: for each channel and feature `F`, the
+feature's value over the level's `cy·cx` cells is summarised into `[min, max, mean, std]`
+(`imfeat.SUMMARY_STATS`; min/max exact, mean/std population). So the peak V cell-variance a
+caller would otherwise reduce by hand is just `f["mom_summary_0"][1, V, 1]`. It is folded
+into the same derive pass for free (no extra traversal) and exists **per grid level only** —
+the `global` reduction is a single cell, so its cross-cell summary would be degenerate.
 
 `xchan_i` is the one group that is **not** per channel: it carries one row per *pair* of
 channels, `P = C*(C-1)/2`, listed in `fc.channel_pairs` as index pairs into the selected
@@ -103,7 +112,8 @@ var  = ps[:, 1] / n - mean**2
 
 `imfeat.MOMENTS`, `imfeat.FEATURES`, `imfeat.HOG_FEATURES`, `imfeat.COUNT_FEATURES`,
 `imfeat.LBP_FEATURES`, `imfeat.DESCRIPTOR_FEATURES` and `imfeat.CROSS_FEATURES` name the last axis of each group, in
-order, so nothing has to be indexed by magic number. `fc.channel_pairs` names the pair axis
+order, so nothing has to be indexed by magic number. `imfeat.SUMMARY_STATS` names the last
+axis of the `*_summary_i` maps (`min, max, mean, std`). `fc.channel_pairs` names the pair axis
 of `xchan_i`.
 
 ---

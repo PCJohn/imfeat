@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <stdexcept>
 #include <vector>
 
@@ -66,6 +67,12 @@ constexpr int NF = NF_S + HB + 2 + LBPB + NDER; // 33 derived float32 per cell p
 // C=1 (no pairs) and for C > XMAX (hyperspectral: the pair count would explode).
 constexpr int XMAX = 8;
 constexpr int NXF = 2; // derived per pair: [cov, corr]
+// Per-level cross-cell summary of every derived feature, folded into the derive
+// loop for free (same traversal, no extra pass). For each (channel, feature) we
+// reduce that feature's value over the level's cells into NST stats, in this
+// fixed order: [0]=min [1]=max [2]=mean [3]=std. Computed for the float feature
+// block (NF) and the moments (NMOM), per pyramid level (not the 1-cell global).
+constexpr int NST = 4;
 constexpr int64_t RAYSCALE = 1 << 14;
 constexpr double PI = 3.14159265358979323846;
 
@@ -269,7 +276,9 @@ struct Level
   std::vector<int64_t> buf, xbuf;
   std::vector<float> feat, xfeat;
   std::vector<double> mom;
-  std::vector<size_t> rshape, fshape, mshape, xrshape, xfshape;
+  std::vector<float> fsum;  // (c, NF, NST)  cross-cell summary of feat
+  std::vector<double> msum; // (c, NMOM, NST) cross-cell summary of mom
+  std::vector<size_t> rshape, fshape, mshape, xrshape, xfshape, fsumshape, msumshape;
 };
 
 class FeatureComputer
@@ -293,6 +302,9 @@ class FeatureComputer
   std::vector<int64_t> graw_, gxraw_;
   std::vector<float> gfeat_, gxfeat_;
   std::vector<double> gmom_;
+  // reusable cross-cell summary accumulators (sized c_*NF / c_*NMOM), refilled per level
+  std::vector<float> sfmn_, sfmx_;
+  std::vector<double> sfsm_, sfsq_, smmn_, smmx_, smsm_, smsq_;
   std::vector<size_t> graw_shape_, gfeat_shape_, gmom_shape_, gxraw_shape_, gxfeat_shape_;
 
   // Structure-tensor + HOG + extrema features (float32).
@@ -567,23 +579,85 @@ class FeatureComputer
     }
   }
 
+  // Reduce one just-derived per-cell vector (v[0..n)) into running summary
+  // accumulators for its channel: min, max, sum, sum of squares (float64 sums
+  // for precision; finalized to mean/std after the level's cells are all seen).
+  template <typename T>
+  static void fold_summary(const T *IF_RESTRICT v, int n, T *IF_RESTRICT mn,
+                           T *IF_RESTRICT mx, double *IF_RESTRICT sm, double *IF_RESTRICT sq)
+  {
+    for (int j = 0; j < n; ++j)
+    {
+      const T x = v[j];
+      mn[j] = std::min(mn[j], x);
+      mx[j] = std::max(mx[j], x);
+      sm[j] += (double)x;
+      sq[j] += (double)x * (double)x;
+    }
+  }
+
+  // Finalize (min,max,sum,sumsq) -> (c, n, NST)=[min,max,mean,std] for one channel.
+  template <typename T>
+  static void write_summary(int n, size_t nc, const T *IF_RESTRICT mn, const T *IF_RESTRICT mx,
+                            const double *IF_RESTRICT sm, const double *IF_RESTRICT sq,
+                            T *IF_RESTRICT out)
+  {
+    const double invn = nc > 0 ? 1.0 / (double)nc : 0.0;
+    for (int j = 0; j < n; ++j)
+    {
+      const double mean = sm[j] * invn, var = sq[j] * invn - mean * mean;
+      out[j * NST + 0] = mn[j];
+      out[j * NST + 1] = mx[j];
+      out[j * NST + 2] = (T)mean;
+      out[j * NST + 3] = (T)std::sqrt(var > 0.0 ? var : 0.0);
+    }
+  }
+
   void derive()
   {
+    const float FINF = std::numeric_limits<float>::infinity();
+    const double DINF = std::numeric_limits<double>::infinity();
+    float *const fmn = sfmn_.data(), *const fmx = sfmx_.data();
+    double *const fsm = sfsm_.data(), *const fsq = sfsq_.data();
+    double *const mmn = smmn_.data(), *const mmx = smmx_.data();
+    double *const msm = smsm_.data(), *const msq = smsq_.data();
     for (Level &L : levels_)
-      for (size_t cell = 0, nc = (size_t)L.ny * L.nx; cell < nc; ++cell)
+    {
+      // per-(channel,feature) cross-cell accumulators, reset per level
+      std::fill_n(fmn, c_ * NF, FINF);
+      std::fill_n(fmx, c_ * NF, -FINF);
+      std::fill_n(fsm, c_ * NF, 0.0);
+      std::fill_n(fsq, c_ * NF, 0.0);
+      std::fill_n(mmn, c_ * NMOM, DINF);
+      std::fill_n(mmx, c_ * NMOM, -DINF);
+      std::fill_n(msm, c_ * NMOM, 0.0);
+      std::fill_n(msq, c_ * NMOM, 0.0);
+      const size_t nc = (size_t)L.ny * L.nx;
+      for (size_t cell = 0; cell < nc; ++cell)
       {
         const int64_t *IF_RESTRICT s = L.buf.data() + cell * c_ * NSUM;
         double *IF_RESTRICT m = L.mom.data() + cell * c_ * NMOM;
         for (int k = 0; k < c_; ++k)
         {
-          derive_moments(s + (size_t)k * NSUM, m + (size_t)k * NMOM);
-          derive_cell(s + (size_t)k * NSUM, m + (size_t)k * NMOM,
-                      L.feat.data() + (cell * c_ + k) * NF);
+          double *IF_RESTRICT mk = m + (size_t)k * NMOM;
+          float *IF_RESTRICT fk = L.feat.data() + (cell * c_ + k) * NF;
+          derive_moments(s + (size_t)k * NSUM, mk);
+          derive_cell(s + (size_t)k * NSUM, mk, fk);
+          fold_summary(fk, NF, &fmn[k * NF], &fmx[k * NF], &fsm[k * NF], &fsq[k * NF]);
+          fold_summary(mk, NMOM, &mmn[k * NMOM], &mmx[k * NMOM], &msm[k * NMOM], &msq[k * NMOM]);
         }
         if (np_)
           derive_cross(m, s[CNT], L.xbuf.data() + cell * np_,
                        L.xfeat.data() + cell * np_ * NXF);
       }
+      for (int k = 0; k < c_; ++k)
+      {
+        write_summary(NF, nc, &fmn[k * NF], &fmx[k * NF], &fsm[k * NF], &fsq[k * NF],
+                      L.fsum.data() + (size_t)k * NF * NST);
+        write_summary(NMOM, nc, &mmn[k * NMOM], &mmx[k * NMOM], &msm[k * NMOM], &msq[k * NMOM],
+                      L.msum.data() + (size_t)k * NMOM * NST);
+      }
+    }
     for (int k = 0; k < c_; ++k)
     {
       derive_moments(graw_.data() + (size_t)k * NSUM, gmom_.data() + (size_t)k * NMOM);
@@ -657,6 +731,8 @@ public:
       L.buf.assign((size_t)L.ny * L.nx * c_ * NSUM, 0);
       L.feat.assign((size_t)L.ny * L.nx * c_ * NF, 0.0f);
       L.mom.assign((size_t)L.ny * L.nx * c_ * NMOM, 0.0);
+      L.fsum.assign((size_t)c_ * NF * NST, 0.0f);
+      L.msum.assign((size_t)c_ * NMOM * NST, 0.0);
       L.xbuf.assign((size_t)L.ny * L.nx * np_, 0);
       L.xfeat.assign((size_t)L.ny * L.nx * np_ * NXF, 0.0f);
       L.rshape = {(size_t)L.ny, (size_t)L.nx, (size_t)c_, (size_t)NSUM};
@@ -664,6 +740,8 @@ public:
       L.mshape = {(size_t)L.ny, (size_t)L.nx, (size_t)c_, (size_t)NMOM};
       L.xrshape = {(size_t)L.ny, (size_t)L.nx, (size_t)np_};
       L.xfshape = {(size_t)L.ny, (size_t)L.nx, (size_t)np_, (size_t)NXF};
+      L.fsumshape = {(size_t)c_, (size_t)NF, (size_t)NST};
+      L.msumshape = {(size_t)c_, (size_t)NMOM, (size_t)NST};
       levels_.push_back(std::move(L));
     }
 
@@ -689,6 +767,14 @@ public:
     graw_.assign((size_t)c_ * NSUM, 0);
     gfeat_.assign((size_t)c_ * NF, 0.0f);
     gmom_.assign((size_t)c_ * NMOM, 0.0);
+    sfmn_.resize((size_t)c_ * NF);
+    sfmx_.resize((size_t)c_ * NF);
+    sfsm_.resize((size_t)c_ * NF);
+    sfsq_.resize((size_t)c_ * NF);
+    smmn_.resize((size_t)c_ * NMOM);
+    smmx_.resize((size_t)c_ * NMOM);
+    smsm_.resize((size_t)c_ * NMOM);
+    smsq_.resize((size_t)c_ * NMOM);
     gxraw_.assign((size_t)np_, 0);
     gxfeat_.assign((size_t)np_ * NXF, 0.0f);
     graw_shape_ = {(size_t)c_, (size_t)NSUM};
@@ -739,7 +825,7 @@ public:
   {
     accumulate(img, rs, cs, chs);
     derive();
-    nb::list feat, mom, cross;
+    nb::list feat, mom, cross, fsum, msum;
     for (Level &L : levels_)
     {
       feat.append(nb::ndarray<nb::numpy, float>(L.feat.data(), L.fshape.size(), L.fshape.data(),
@@ -749,6 +835,10 @@ public:
       if (np_)
         cross.append(nb::ndarray<nb::numpy, float>(L.xfeat.data(), L.xfshape.size(),
                                                    L.xfshape.data(), nb::handle()));
+      fsum.append(nb::ndarray<nb::numpy, float>(L.fsum.data(), L.fsumshape.size(),
+                                                L.fsumshape.data(), nb::handle()));
+      msum.append(nb::ndarray<nb::numpy, double>(L.msum.data(), L.msumshape.size(),
+                                                 L.msumshape.data(), nb::handle()));
     }
     feat.append(nb::ndarray<nb::numpy, float>(gfeat_.data(), gfeat_shape_.size(),
                                               gfeat_shape_.data(), nb::handle()));
@@ -761,6 +851,8 @@ public:
     all.append(feat);
     all.append(mom);
     all.append(cross);
+    all.append(fsum);
+    all.append(msum);
     return all;
   }
 };
