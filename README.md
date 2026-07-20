@@ -5,8 +5,10 @@ Fast, exact, single-pass image feature extraction on CPU.
 `imfeat` walks an image **once** and returns, for every channel and every cell of a dyadic
 pyramid: intensity **moments**, gradient **structure-tensor** features, an **orientation
 histogram**, **extrema densities** and a rotation-invariant **LBP** histogram — plus
-**cross-channel** covariance between every pair of channels. It is a C++/[Highway](https://github.com/google/highway)
-SIMD core behind a small [nanobind](https://github.com/wjakob/nanobind) Python API.
+**cross-channel** covariance between every pair of channels, and three whole-frame
+**perceptual hashes** (`imagehash`-compatible aHash / wHash / pHash). It is a
+C++/[Highway](https://github.com/google/highway) SIMD core behind a small
+[nanobind](https://github.com/wjakob/nanobind) Python API.
 
 It is built for the front of a real-time vision pipeline: hand-crafted, well-understood,
 weakly-correlated features, cheap enough to run on every frame, that a downstream model (a
@@ -71,6 +73,7 @@ The derived, model-ready maps. Keys are `{group}_{level}`, for `group` in
 | `lbp_i` | `(cy, cx, C, 10)` | float32 | `imfeat.LBP_FEATURES`, L1-normalised |
 | `desc_i` | `(cy, cx, C, 8)` | float32 | `imfeat.DESCRIPTOR_FEATURES` — derived nonlinear summaries |
 | `xchan_i` | `(cy, cx, P, 2)` | float32 | `imfeat.CROSS_FEATURES` — cov, corr, per channel pair |
+| `ahash`, `whash`, `phash` | `(C,)` | uint64 | `imfeat.HASHES` — one 64-bit perceptual hash per channel, whole-frame |
 | `*_global` | `(C, …)` | | the same groups, reduced over the whole frame |
 | `{mom,struct,hog,cnt,lbp,desc}_summary_i` | `(F, C, 4)` | matches the group | each map reduced **across that level's cells** into `imfeat.SUMMARY_STATS` |
 
@@ -87,6 +90,10 @@ the `global` reduction is a single cell, so its cross-cell summary would be dege
 channels, `P = C*(C-1)/2`, listed in `fc.channel_pairs` as index pairs into the selected
 channels. It is absent when there are no pairs — a single channel, or `C > 8`, where the
 quadratic pair count is not worth paying silently.
+
+`ahash`, `whash`, `phash` are whole-frame perceptual hashes (no pyramid): one `uint64` per
+channel, packed row-major MSB-first. See [§8](#8-perceptual-hashes--ahash-whash-phash) for
+what they encode and how they relate to the `imagehash` package.
 
 ### `.compute(img) -> dict[str, np.ndarray]`
 
@@ -114,7 +121,7 @@ var  = ps[:, 1] / n - mean**2
 `imfeat.LBP_FEATURES`, `imfeat.DESCRIPTOR_FEATURES` and `imfeat.CROSS_FEATURES` name the last axis of each group, in
 order, so nothing has to be indexed by magic number. `imfeat.SUMMARY_STATS` names the last
 axis of the `*_summary_i` maps (`min, max, mean, std`). `fc.channel_pairs` names the pair axis
-of `xchan_i`.
+of `xchan_i`. `imfeat.HASHES` lists the perceptual-hash keys (`ahash, whash, phash`).
 
 ---
 
@@ -267,6 +274,39 @@ on HSV or opponent spaces it picks up chromatic structure a per-channel statisti
 Only one new accumulator per pair is needed — the raw product `sum(v_i * v_j)` — because the
 means and variances are already in `mom_i`.
 
+### 8. Perceptual hashes — `ahash`, `whash`, `phash`
+
+Three `imagehash`-compatible perceptual hashes, one `uint64` per channel, computed once for
+the whole frame (no pyramid, no per-cell variants). Bits are packed row-major, MSB first, so
+each is a fixed-width 64-bit key — the layout a multi-index-hashing store wants.
+
+All three are readouts of a mean grid, which is just `S1 = sum(v)` box-pooled to a fixed
+resolution:
+
+| hash | grid | bit rule |
+|---|---|---|
+| `ahash` (average) | 8×8 | cell mean `>` mean of the 64 cells |
+| `whash` (wavelet, Haar) | 8×8 | cell mean `>` median of the 64 cells |
+| `phash` (perceptual) | 32×32 | low-freq 8×8 of a 2-D DCT-II `>` its median |
+
+Because they need only `S1`, they add **no traversal**: when the finest pyramid grid already
+tiles 32×32 (e.g. a `(5,5)` finest level), the hash grid is a block-sum of the finest cells'
+`S1` and the hashes cost nothing beyond a tiny end-of-pass DCT and threshold. Only a finest
+grid coarser than 32×32 — which doesn't retain enough spatial detail for `phash` — falls back
+to a second lightweight sum over the row buffer already in cache (still one image traversal).
+
+The wavelet hash reduces to the same 8×8 mean grid as `ahash` under a median threshold: for
+Haar, `imagehash`'s `remove_max_haar_ll` subtracts a constant from every cell, which the
+median absorbs, so the bits are exactly a median-thresholded block-mean grid.
+
+**Match to `imagehash`.** `imfeat` box-pools (area averaging); `imagehash` resizes with
+Lanczos, so results are **bit-exact where no resize occurs** (an 8×8 input for a/w, 32×32 for
+p — the unit tests assert this) and differ only by that resampling on full-size frames. On
+natural 256×256 frames the relative Hamming distance to stock `imagehash` is ~0.00 for
+`whash`, ~0.01 for `phash` and ~0.12 for `ahash` (the mean threshold is the most
+resize-sensitive). Hashes are per channel like everything else, so `imagehash`'s single
+grayscale hash corresponds to running `imfeat` on a luma channel.
+
 ---
 
 ## The one-pass design
@@ -296,6 +336,12 @@ one.
 same pixel while it is in register. The nonlinear parts — eigenvalues, central moments,
 histogram normalisation — are *not* additive, so they are deferred and derived once per cell
 at the end. That derivation is negligible: `features()` costs the same as `compute()`.
+
+**Perceptual hashes ride along.** `ahash`/`whash`/`phash` need only `S1` at a fixed 32×32
+grid, which the same additivity provides: when the finest level tiles 32×32 they are a
+block-sum of its cells' `S1` and add nothing to the pass; only a coarser finest grid needs a
+second lightweight sum over the cached row buffer (never a second image traversal). Measured
+overhead is ~1–3% in the tiling case and ~3–7% in the fallback, on top of one frame.
 
 **Channels are the SIMD lane.** All channels are walked in the same spatial pass, packed
 four per vector, so every channel after the first is markedly cheaper.

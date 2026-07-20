@@ -56,6 +56,7 @@ __all__ = [
     "CROSS_FEATURES",
     "DESCRIPTOR_FEATURES",
     "SUMMARY_STATS",
+    "HASHES",
 ]
 __version__ = "0.1.0"
 
@@ -93,6 +94,13 @@ DESCRIPTOR_FEATURES = (
     "grad_sparsity",
     "rms_contrast",
 )
+
+# Perceptual hashes ("ahash"/"whash"/"phash"), one uint64 (64 bits, row-major MSB-first)
+# per channel, computed whole-frame in the same pass (no pyramid). imagehash-compatible:
+# aHash/wHash threshold an 8x8 mean grid by its mean/median; pHash the low-freq 8x8 of a
+# 2D DCT of a 32x32 mean grid. Box-binned means differ from imagehash's Lanczos resize,
+# so expect a small Hamming drift on full-size images (bit-exact at native 8x8 / 32x32).
+HASHES = ("ahash", "whash", "phash")
 
 # Cross-cell summary stats carried on the last axis of every "*_summary_i" array,
 # in this fixed order. For each channel and feature, the feature's value is reduced
@@ -254,9 +262,13 @@ class FeatureComputer:
         lbp_summary_i (10, C, 4)  desc_summary_i (8, C, 4)  mom_summary_i (4, C, 4)
         So e.g. the max V cell-variance a caller would otherwise reduce by hand is
         mom_summary_0[1, V, 1] (feature 1 = var, channel V, stat 1 = max).
+
+        Also three whole-frame perceptual hashes (imfeat.HASHES), one uint64 per channel,
+        computed in the same pass (no pyramid): ahash, whash, phash. The C axis is dropped
+        for 2-D input (a scalar uint64).
         """
         fw = (("struct", _NS_FEAT), ("hog", _NH), ("cnt", _NC), ("lbp", _NL), ("desc", _ND))
-        feat, mom, cross, fsum, msum = self._impl.features(self._view(img))
+        feat, mom, cross, fsum, msum, hashes = self._impl.features(self._view(img))
         out: dict[str, np.ndarray] = {}
         for i, (a, m) in zip(self._keys, zip(feat, mom)):
             out.update(self._cut(a, fw, i))
@@ -267,4 +279,8 @@ class FeatureComputer:
         for i, (fs, ms) in zip(self._keys[:-1], zip(fsum, msum)):
             out.update(self._cut_summary(fs, fw, i))
             out.update(self._cut_summary(ms, (("mom", _NM),), i))
+        # Perceptual hashes: one uint64 per channel, whole-frame only (no pyramid).
+        # Drop the channel axis for 2-D input, as the other maps do.
+        for name, h in zip(HASHES, hashes):
+            out[name] = h.copy() if self._chan_axis is not None else h[0].copy()
         return out

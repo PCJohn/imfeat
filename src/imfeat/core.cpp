@@ -73,6 +73,14 @@ constexpr int NXF = 2; // derived per pair: [cov, corr]
 // fixed order: [0]=min [1]=max [2]=mean [3]=std. Computed for the float feature
 // block (NF) and the moments (NMOM), per pyramid level (not the 1-cell global).
 constexpr int NST = 4;
+// Perceptual hashes (imagehash-compatible), one 64-bit hash per channel. Read from a
+// dedicated HN x HN grid of per-channel value sums accumulated in the SAME pass (one
+// add/pixel/channel, no extra traversal): aHash/wHash threshold an 8x8 mean grid
+// (HBLK x HBLK block-pool of it) by its mean/median; pHash takes the low-freq 8x8 of a
+// 2D DCT-II of the full 32x32 mean grid. Independent of the feature pyramid grid.
+constexpr int HN = 32;        // hash mean-grid resolution (== pHash DCT input side)
+constexpr int HS = 8;         // hash side: HS*HS = 64 bits
+constexpr int HBLK = HN / HS; // 4: aHash/wHash pool HBLK x HBLK cells of the HN grid
 constexpr int64_t RAYSCALE = 1 << 14;
 constexpr double PI = 3.14159265358979323846;
 
@@ -270,6 +278,28 @@ void accumulate_cross_row(const uint8_t *IF_RESTRICT vb, int strideC, int cw, in
   }
 }
 
+// Sum(v) per channel into the hash row for the current image row. Sampled columns are
+// grouped (once, in set_config) into runs that share a hash column and lie in one finest
+// cell, so each run is a contiguous column range [beg,end) stepped by sx with a constant
+// target cell: the sx==1 case reduces to a plain contiguous accumulation that vectorizes.
+void accumulate_hash_row(const uint8_t *IF_RESTRICT vb, int C, int sx,
+                         const int *IF_RESTRICT beg, const int *IF_RESTRICT end,
+                         const int *IF_RESTRICT rhc, int nrun, int64_t *IF_RESTRICT hrowbase)
+{
+  for (int r = 0; r < nrun; ++r)
+  {
+    int64_t *IF_RESTRICT cell = hrowbase + (size_t)rhc[r] * C;
+    const int b = beg[r], e = end[r];
+    for (int k = 0; k < C; ++k)
+    {
+      int64_t s = 0;
+      for (int c = b; c < e; c += sx)
+        s += vb[(size_t)c * C + k];
+      cell[k] += s;
+    }
+  }
+}
+
 struct Level
 {
   int ny = 0, nx = 0, fy = 0, fx = 0;
@@ -298,6 +328,16 @@ class FeatureComputer
   // is a few KB, so it stays hot in L1 across the whole cell sweep.
   std::vector<uint8_t> r0_, r1_, r2_, cmx_, cmn_, mx_, mn_, lb_;
   std::vector<int16_t> vs_, vd_, gx_, gy_;
+
+  // Perceptual-hash state (see HN/HS). Filled in the accumulate pass, derived at the end.
+  std::vector<int64_t> hsum_;             // HN*HN*c_ : Sum(v) per hash cell per channel
+  std::vector<int64_t> hcnt_;             // HN*HN : sampled-pixel count per cell (fixed per config)
+  std::vector<int> hrow_, hcol_;          // row -> hash row (h_), col -> hash col (w_)
+  std::vector<int> hrbeg_, hrend_, hrhc_; // per-run column range [beg,end) and its hash col
+  std::vector<double> dctb_;              // HS*HN : DCT-II basis rows (scipy type-2, norm=None)
+  std::vector<uint64_t> ahash_, whash_, phash_; // c_ each, one 64-bit hash per channel
+  std::vector<size_t> hshape_;                  // {c_}
+  bool hfast_ = false;                          // finest grid tiles HN -> hashes reuse its S1
 
   std::vector<int64_t> graw_, gxraw_;
   std::vector<float> gfeat_, gxfeat_;
@@ -522,6 +562,8 @@ class FeatureComputer
     int64_t *IF_RESTRICT fb = fine.buf.data();
     std::fill(fine.buf.begin(), fine.buf.end(), (int64_t)0);
     std::fill(fine.xbuf.begin(), fine.xbuf.end(), (int64_t)0);
+    if (!hfast_)
+      std::fill(hsum_.begin(), hsum_.end(), (int64_t)0);
 
     for (int k = 0; k < c_; ++k)
       coff_[k] = (int64_t)chan_[k] * chs;
@@ -540,6 +582,9 @@ class FeatureComputer
       if (np_)
         accumulate_cross_row(r1_.data(), c_, cw, nfx, sx_, np_, pi_.data(), pj_.data(),
                              fine.xbuf.data() + (size_t)(row_cell_[r] * nfx) * np_);
+      if (!hfast_)
+        accumulate_hash_row(r1_.data(), c_, sx_, hrbeg_.data(), hrend_.data(), hrhc_.data(),
+                            (int)hrhc_.size(), hsum_.data() + (size_t)hrow_[r] * HN * c_);
     }
 
     const int stripe = c_ * NSUM;
@@ -613,10 +658,109 @@ class FeatureComputer
     }
   }
 
+  // aHash/wHash/pHash from the accumulated HN x HN value-sum grid, one hash per channel.
+  // A pure readout of hsum_: no image traversal. Bits are packed row-major, MSB first.
+  void derive_hashes()
+  {
+    // Fast path: build the HN value-sum grid from the finest level's S1 (block-sum when
+    // the finest grid is finer than HN), instead of a dedicated per-pixel accumulation.
+    if (hfast_)
+    {
+      const Level &F = levels_[0];
+      const int by = F.ny / HN, bx = F.nx / HN;
+      std::fill(hsum_.begin(), hsum_.end(), (int64_t)0);
+      for (int i = 0; i < HN; ++i)
+        for (int j = 0; j < HN; ++j)
+        {
+          int64_t *IF_RESTRICT dst = hsum_.data() + (size_t)(i * HN + j) * c_;
+          for (int dy = 0; dy < by; ++dy)
+            for (int dx = 0; dx < bx; ++dx)
+            {
+              const int64_t *IF_RESTRICT src =
+                  F.buf.data() + (size_t)((i * by + dy) * F.nx + (j * bx + dx)) * c_ * NSUM;
+              for (int k = 0; k < c_; ++k)
+                dst[k] += src[(size_t)k * NSUM + PS0];
+            }
+        }
+    }
+
+    const int NHC = HN * HN;
+    std::vector<double> mean(NHC), d0((size_t)HS * HN);
+    for (int k = 0; k < c_; ++k)
+    {
+      for (int i = 0; i < NHC; ++i)
+        mean[i] = hcnt_[i] > 0 ? (double)hsum_[(size_t)i * c_ + k] / (double)hcnt_[i] : 0.0;
+
+      // aHash/wHash: pool the HN grid to 8x8, threshold by the mean / median of the 64.
+      double m8[HS * HS];
+      for (int bi = 0; bi < HS; ++bi)
+        for (int bj = 0; bj < HS; ++bj)
+        {
+          int64_t s = 0, n = 0;
+          for (int di = 0; di < HBLK; ++di)
+            for (int dj = 0; dj < HBLK; ++dj)
+            {
+              const int idx = (bi * HBLK + di) * HN + (bj * HBLK + dj);
+              s += hsum_[(size_t)idx * c_ + k];
+              n += hcnt_[idx];
+            }
+          m8[bi * HS + bj] = n > 0 ? (double)s / (double)n : 0.0;
+        }
+      double avg = 0.0;
+      for (int i = 0; i < HS * HS; ++i)
+        avg += m8[i];
+      avg /= HS * HS;
+      double srt[HS * HS];
+      std::copy(m8, m8 + HS * HS, srt);
+      std::sort(srt, srt + HS * HS);
+      const double med = 0.5 * (srt[HS * HS / 2 - 1] + srt[HS * HS / 2]);
+      uint64_t a = 0, w = 0;
+      for (int i = 0; i < HS * HS; ++i)
+      {
+        a |= (uint64_t)(m8[i] > avg) << (63 - i);
+        w |= (uint64_t)(m8[i] > med) << (63 - i);
+      }
+      ahash_[k] = a;
+      whash_[k] = w;
+
+      // pHash: separable 2D DCT-II of the 32x32 means (rows 8x32, then cols 8x8), take
+      // the low-freq 8x8, threshold by its median. Basis matches scipy.fftpack.dct.
+      for (int u = 0; u < HS; ++u)
+        for (int j = 0; j < HN; ++j)
+        {
+          double acc = 0.0;
+          for (int n = 0; n < HN; ++n)
+            acc += dctb_[(size_t)u * HN + n] * mean[(size_t)n * HN + j];
+          d0[(size_t)u * HN + j] = acc;
+        }
+      double dl[HS * HS];
+      for (int u = 0; u < HS; ++u)
+        for (int vv = 0; vv < HS; ++vv)
+        {
+          double acc = 0.0;
+          for (int n = 0; n < HN; ++n)
+            acc += dctb_[(size_t)vv * HN + n] * d0[(size_t)u * HN + n];
+          dl[u * HS + vv] = acc;
+        }
+      double psrt[HS * HS];
+      std::copy(dl, dl + HS * HS, psrt);
+      std::sort(psrt, psrt + HS * HS);
+      const double pmed = 0.5 * (psrt[HS * HS / 2 - 1] + psrt[HS * HS / 2]);
+      uint64_t p = 0;
+      for (int i = 0; i < HS * HS; ++i)
+        p |= (uint64_t)(dl[i] > pmed) << (63 - i);
+      phash_[k] = p;
+    }
+  }
+
   void derive()
   {
-    const float FINF = std::numeric_limits<float>::infinity();
-    const double DINF = std::numeric_limits<double>::infinity();
+    // Largest finite values, NOT +/-inf: -ffast-math implies -ffinite-math-only, under
+    // which some compilers (e.g. Apple clang) miscompile a min/max reduction seeded with
+    // infinity and leave the accumulator at its init. FLT_MAX/-FLT_MAX are equivalent for
+    // any finite feature and safe. (-FBIG == lowest(), the correct max seed.)
+    const float FBIG = std::numeric_limits<float>::max();
+    const double DBIG = std::numeric_limits<double>::max();
     float *const fmn = sfmn_.data(), *const fmx = sfmx_.data();
     double *const fsm = sfsm_.data(), *const fsq = sfsq_.data();
     double *const mmn = smmn_.data(), *const mmx = smmx_.data();
@@ -624,12 +768,12 @@ class FeatureComputer
     for (Level &L : levels_)
     {
       // per-(channel,feature) cross-cell accumulators, reset per level
-      std::fill_n(fmn, c_ * NF, FINF);
-      std::fill_n(fmx, c_ * NF, -FINF);
+      std::fill_n(fmn, c_ * NF, FBIG);
+      std::fill_n(fmx, c_ * NF, -FBIG);
       std::fill_n(fsm, c_ * NF, 0.0);
       std::fill_n(fsq, c_ * NF, 0.0);
-      std::fill_n(mmn, c_ * NMOM, DINF);
-      std::fill_n(mmx, c_ * NMOM, -DINF);
+      std::fill_n(mmn, c_ * NMOM, DBIG);
+      std::fill_n(mmx, c_ * NMOM, -DBIG);
       std::fill_n(msm, c_ * NMOM, 0.0);
       std::fill_n(msq, c_ * NMOM, 0.0);
       const size_t nc = (size_t)L.ny * L.nx;
@@ -782,6 +926,56 @@ public:
     gmom_shape_ = {(size_t)c_, (size_t)NMOM};
     gxraw_shape_ = {(size_t)np_};
     gxfeat_shape_ = {(size_t)np_, (size_t)NXF};
+
+    // --- perceptual hashes: HN x HN value-sum grid, filled in the same pass ---
+    hrow_.resize(h_);
+    for (int r = 0; r < h_; ++r)
+      hrow_[r] = (int)((int64_t)r * HN / h_);
+    hcol_.resize(w_);
+    for (int c = 0; c < w_; ++c)
+      hcol_[c] = (int)((int64_t)c * HN / w_);
+    // Per-cell sampled-pixel counts + the hash-column run structure. Columns are
+    // sampled at sx_ (restarted per finest cell) and visited in increasing order.
+    std::vector<int64_t> rcnt(HN, 0), ccnt(HN, 0);
+    for (int r = 0; r < h_; r += sy_)
+      rcnt[hrow_[r]]++;
+    // Group sampled columns into runs of one hash column within one finest cell.
+    hrbeg_.clear();
+    hrend_.clear();
+    hrhc_.clear();
+    {
+      const int nfx = levels_[0].nx, cw = w_ / nfx;
+      for (int e = 0; e < nfx; ++e)
+      {
+        const int e1 = e * cw + cw;
+        for (int c = e * cw; c < e1;)
+        {
+          const int hc = hcol_[c], b = c;
+          while (c < e1 && hcol_[c] == hc)
+            ccnt[hc]++, c += sx_;
+          hrbeg_.push_back(b);
+          hrend_.push_back(c);
+          hrhc_.push_back(hc);
+        }
+      }
+    }
+    hcnt_.assign((size_t)HN * HN, 0);
+    for (int i = 0; i < HN; ++i)
+      for (int j = 0; j < HN; ++j)
+        hcnt_[(size_t)i * HN + j] = rcnt[i] * ccnt[j];
+    // When the finest feature grid tiles the HN hash grid, its per-cell S1 (== Sum(v)
+    // over the same sampled pixels) already is the hash grid: reuse it in derive_hashes
+    // and skip the per-pixel pass entirely. Otherwise fall back to accumulate_hash_row.
+    hfast_ = levels_[0].ny % HN == 0 && levels_[0].nx % HN == 0;
+    dctb_.assign((size_t)HS * HN, 0.0);
+    for (int u = 0; u < HS; ++u)
+      for (int n = 0; n < HN; ++n)
+        dctb_[(size_t)u * HN + n] = 2.0 * std::cos(PI * u * (2 * n + 1) / (2.0 * HN));
+    hsum_.assign((size_t)HN * HN * c_, 0);
+    ahash_.assign((size_t)c_, 0);
+    whash_.assign((size_t)c_, 0);
+    phash_.assign((size_t)c_, 0);
+    hshape_ = {(size_t)c_};
   }
 
   // The channel pairs, as flat [i0, j0, i1, j1, ...]; empty when cross-channel is off.
@@ -825,6 +1019,7 @@ public:
   {
     accumulate(img, rs, cs, chs);
     derive();
+    derive_hashes();
     nb::list feat, mom, cross, fsum, msum;
     for (Level &L : levels_)
     {
@@ -847,12 +1042,20 @@ public:
     if (np_)
       cross.append(nb::ndarray<nb::numpy, float>(gxfeat_.data(), gxfeat_shape_.size(),
                                                  gxfeat_shape_.data(), nb::handle()));
+    nb::list hashes;
+    hashes.append(nb::ndarray<nb::numpy, uint64_t>(ahash_.data(), hshape_.size(),
+                                                   hshape_.data(), nb::handle()));
+    hashes.append(nb::ndarray<nb::numpy, uint64_t>(whash_.data(), hshape_.size(),
+                                                   hshape_.data(), nb::handle()));
+    hashes.append(nb::ndarray<nb::numpy, uint64_t>(phash_.data(), hshape_.size(),
+                                                   hshape_.data(), nb::handle()));
     nb::list all;
     all.append(feat);
     all.append(mom);
     all.append(cross);
     all.append(fsum);
     all.append(msum);
+    all.append(hashes);
     return all;
   }
 };

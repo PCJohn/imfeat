@@ -922,7 +922,9 @@ def test_multichannel_equals_single_channel(c):
         for k in r1:
             assert np.array_equal(rmc[k][..., ch, :], r1[k]), f"raw {k} ch{ch}"
         for k in f1:
-            assert np.array_equal(fmc[k][..., ch, :], f1[k]), f"feat {k} ch{ch}"
+            # perceptual hashes are one uint64 per channel: (C,) here, scalar for 2-D.
+            got = fmc[k][ch] if fmc[k].ndim == 1 else fmc[k][..., ch, :]
+            assert np.array_equal(got, f1[k]), f"feat {k} ch{ch}"
 
 
 def test_multichannel_output_shapes():

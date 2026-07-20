@@ -122,7 +122,8 @@ def test_simd_group_boundaries(nch):
         plane = np.ascontiguousarray(img[:, :, c])
         solo = imfeat.FeatureComputer(plane.shape, grid=[(3, 3)]).features(plane)
         for k in solo:
-            assert np.array_equal(r[k][..., c, :], solo[k]), f"{k} ch{c}"
+            got = r[k][c] if r[k].ndim == 1 else r[k][..., c, :]
+            assert np.array_equal(got, solo[k]), f"{k} ch{c}"
 
 
 # ---------------- numeric headroom -------------------------------------------

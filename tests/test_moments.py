@@ -199,7 +199,8 @@ def test_multichannel_matches_per_channel():
             plane
         )
         for k in solo:
-            assert np.array_equal(multi[k][..., c, :], solo[k]), f"{k} ch{c}"
+            got = multi[k][c] if multi[k].ndim == 1 else multi[k][..., c, :]
+            assert np.array_equal(got, solo[k]), f"{k} ch{c}"
 
 
 @pytest.mark.parametrize("nch", [1, 2, 3, 5, 8])
@@ -220,6 +221,9 @@ def test_channel_subset():
     )
     for k in full:
         if k.startswith("xchan"):  # cross-channel maps have no per-channel axis
+            continue
+        if full[k].ndim == 1:  # per-channel scalar hashes: (C,)
+            assert sub[k][0] == full[k][2] and sub[k][1] == full[k][0], k
             continue
         assert np.array_equal(sub[k][..., 0, :], full[k][..., 2, :]), k
         assert np.array_equal(sub[k][..., 1, :], full[k][..., 0, :]), k
