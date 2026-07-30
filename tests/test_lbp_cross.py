@@ -17,6 +17,8 @@ import pytest
 
 import imfeat
 
+from conftest import groups
+
 rng = np.random.default_rng(7)
 
 NB = 10  # LBP^riu2 bins
@@ -129,7 +131,7 @@ def test_bins_partition_the_pixels():
     img = np.stack([textured(), noise()], -1)
     r = imfeat.FeatureComputer(img.shape, grid=[(3, 3)], stride=2).compute(img)
     assert np.array_equal(r["lbp_0"].sum(-1), r["struct_0"][..., 3])
-    f = imfeat.FeatureComputer(img.shape, grid=[(3, 3)], stride=2).features(img)
+    f = groups(imfeat.FeatureComputer(img.shape, grid=[(3, 3)], stride=2), img)
     assert np.allclose(f["lbp_0"].sum(-1), 1.0)
 
 
@@ -206,7 +208,7 @@ def test_monotonic_greyscale_invariance():
     fc = imfeat.FeatureComputer(img.shape, grid=[(3, 3)])
     assert np.array_equal(fc.compute(img)["lbp_0"], fc.compute(warped)["lbp_0"])
     # the moments, by contrast, must move
-    assert not np.allclose(fc.features(img)["mom_0"], fc.features(warped)["mom_0"])
+    assert not np.allclose(groups(fc, img)["mom_0"], groups(fc, warped)["mom_0"])
 
 
 def test_rotation_invariance():
@@ -227,7 +229,7 @@ def test_cross_identical_and_negated_channels():
     v = textured()
     img = np.stack([v, v, 255 - v], -1)
     fc = imfeat.FeatureComputer(img.shape, grid=[(2, 2)])
-    f = fc.features(img)
+    f = groups(fc, img)
     assert fc.channel_pairs == [(0, 1), (0, 2), (1, 2)]
     cov, corr = f["xchan_0"][..., 0], f["xchan_0"][..., 1]
     assert np.allclose(corr[..., 0], 1.0, atol=1e-5)  # v vs v
@@ -237,14 +239,14 @@ def test_cross_identical_and_negated_channels():
 
 def test_cross_independent_channels_decorrelate():
     img = np.stack([noise(256), noise(256)], -1)
-    f = imfeat.FeatureComputer(img.shape, grid=[(0, 0)]).features(img)
+    f = groups(imfeat.FeatureComputer(img.shape, grid=[(0, 0)]), img)
     assert abs(f["xchan_global"][0, 1]) < 0.02
 
 
 def test_cross_matches_numpy_corrcoef():
     v = textured()
     img = np.stack([v, noise(), np.clip(v // 2 + 40, 0, 255).astype(np.uint8)], -1)
-    f = imfeat.FeatureComputer(img.shape, grid=[(1, 1)]).features(img)
+    f = groups(imfeat.FeatureComputer(img.shape, grid=[(1, 1)]), img)
     for cy in range(2):
         for cx in range(2):
             blk = img[cy * 32 : cy * 32 + 32, cx * 32 : cx * 32 + 32].astype(float)
@@ -255,7 +257,7 @@ def test_cross_matches_numpy_corrcoef():
 
 def test_cross_constant_channel_is_zero_not_nan():
     img = np.stack([textured(), np.full((64, 64), 9, np.uint8)], -1)
-    f = imfeat.FeatureComputer(img.shape, grid=[(2, 2)]).features(img)
+    f = groups(imfeat.FeatureComputer(img.shape, grid=[(2, 2)]), img)
     assert np.all(np.isfinite(f["xchan_0"]))
     assert np.allclose(f["xchan_0"][..., 1], 0.0)
 
@@ -268,7 +270,7 @@ def test_cross_absent_without_pairs(c):
     img = rng.integers(0, 256, shape, dtype=np.uint8)
     fc = imfeat.FeatureComputer(img.shape, grid=[(2, 2)])
     assert fc.channel_pairs == []
-    assert not any(k.startswith("xchan") for k in fc.features(img))
+    assert not any(k.startswith("xchan") for k in groups(fc, img))
 
 
 # ==========================================================================
@@ -283,11 +285,11 @@ def test_latency_regression(capsys):
     pyr = [(5, 5), (4, 4), (3, 3), (2, 2)]
     fc = imfeat.FeatureComputer(img.shape, grid=pyr, stride=2)
     for _ in range(30):
-        fc.features(img)
+        groups(fc, img)
     ts = []
     for _ in range(100):
         t0 = time.perf_counter()
-        fc.features(img)
+        groups(fc, img)
         ts.append(time.perf_counter() - t0)
     ts.sort()
     p50, p95 = ts[50] * 1e3, ts[95] * 1e3

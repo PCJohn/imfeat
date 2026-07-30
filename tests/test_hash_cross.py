@@ -23,6 +23,8 @@ import imagehash
 
 import imfeat
 
+from conftest import groups
+
 rng = np.random.default_rng(11)
 
 NBITS = 64
@@ -91,7 +93,7 @@ def _nfx(grid):
 def test_matches_oracle(size, stride, grid):
     h, w = size
     img = rng.integers(0, 256, (h, w), np.uint8)
-    got = imfeat.FeatureComputer((h, w), grid=grid, stride=stride).features(img)
+    got = groups(imfeat.FeatureComputer((h, w), grid=grid, stride=stride), img)
     ref = ref_hashes(img, _nfx(grid), stride)
     for k, v in ref.items():
         assert got[k] == v, k
@@ -102,7 +104,7 @@ def test_matches_oracle_deep_grid(stride):
     # a 32x32 finest grid (requires 32 | shape) shares the pass's finest cells.
     img = rng.integers(0, 256, (96, 128), np.uint8)
     grid = [(5, 5), (2, 2)]
-    got = imfeat.FeatureComputer(img.shape, grid=grid, stride=stride).features(img)
+    got = groups(imfeat.FeatureComputer(img.shape, grid=grid, stride=stride), img)
     ref = ref_hashes(img, _nfx(grid), stride)
     for k, v in ref.items():
         assert got[k] == v, k
@@ -110,7 +112,7 @@ def test_matches_oracle_deep_grid(stride):
 
 def test_oracle_multichannel_is_per_channel():
     img = rng.integers(0, 256, (96, 96, 3), np.uint8)
-    got = imfeat.FeatureComputer(img.shape, grid=[(3, 3)]).features(img)
+    got = groups(imfeat.FeatureComputer(img.shape, grid=[(3, 3)]), img)
     for c in range(3):
         ref = ref_hashes(np.ascontiguousarray(img[:, :, c]), 8, (1, 1))
         for k, v in ref.items():
@@ -126,7 +128,7 @@ def _distinct(n):
 def test_ahash_whash_vs_imagehash_native():
     for _ in range(300):
         g = _distinct(8)  # 8x8 input: imagehash's resize to 8x8 is identity
-        f = imfeat.FeatureComputer((8, 8), grid=[(3, 3)]).features(g)
+        f = groups(imfeat.FeatureComputer((8, 8), grid=[(3, 3)]), g)
         im = Image.fromarray(g, "L")
         assert np.array_equal(_unpack(f["ahash"]), imagehash.average_hash(im).hash)
         assert np.array_equal(_unpack(f["whash"]), imagehash.whash(im).hash)
@@ -135,7 +137,7 @@ def test_ahash_whash_vs_imagehash_native():
 def test_phash_vs_imagehash_native():
     for _ in range(300):
         g = rng.integers(0, 256, (32, 32), np.uint8)  # 32x32: resize is identity
-        f = imfeat.FeatureComputer((32, 32), grid=[(5, 5)]).features(g)
+        f = groups(imfeat.FeatureComputer((32, 32), grid=[(5, 5)]), g)
         im = Image.fromarray(g, "L")
         assert np.array_equal(_unpack(f["phash"]), imagehash.phash(im).hash)
 
@@ -143,7 +145,7 @@ def test_phash_vs_imagehash_native():
 def test_vs_imagehash_per_channel_native():
     imgs = [_distinct(8) for _ in range(3)]
     hwc = np.ascontiguousarray(np.stack(imgs, -1))
-    f = imfeat.FeatureComputer(hwc.shape, grid=[(3, 3)]).features(hwc)
+    f = groups(imfeat.FeatureComputer(hwc.shape, grid=[(3, 3)]), hwc)
     for c, g in enumerate(imgs):
         im = Image.fromarray(g, "L")
         assert np.array_equal(_unpack(f["ahash"][c]), imagehash.average_hash(im).hash)
@@ -155,7 +157,7 @@ def test_flat_image():
     # a constant image: every 8x8 cell equals the mean/median, so strict > is all-False
     # for aHash/wHash. pHash's off-DC coefficients are ~0 (float noise either side), but
     # the DC term is reliably positive and above the median -> bit (0,0) is set.
-    f = imfeat.FeatureComputer((64, 64), grid=[(0, 0)]).features(np.full((64, 64), 137, np.uint8))
+    f = groups(imfeat.FeatureComputer((64, 64), grid=[(0, 0)]), np.full((64, 64), 137, np.uint8))
     assert f["ahash"] == 0 and f["whash"] == 0
     assert (int(f["phash"]) >> 63) & 1 == 1
 
@@ -164,7 +166,7 @@ def test_bright_quadrant():
     # top-left quadrant bright, rest dark: aHash sets exactly the 4x4 top-left block.
     img = np.zeros((64, 64), np.uint8)
     img[:32, :32] = 255
-    f = imfeat.FeatureComputer((64, 64), grid=[(0, 0)]).features(img)
+    f = groups(imfeat.FeatureComputer((64, 64), grid=[(0, 0)]), img)
     exp = np.zeros((8, 8), bool)
     exp[:4, :4] = True
     assert f["ahash"] == _pack(exp)
@@ -190,7 +192,7 @@ def test_accuracy_report_vs_imagehash():
     dist = {k: [] for k in ref}
     for _ in range(60):
         g = _natural(256, 256)
-        f = imfeat.FeatureComputer((256, 256), grid=[(5, 5)]).features(g)
+        f = groups(imfeat.FeatureComputer((256, 256), grid=[(5, 5)]), g)
         im = Image.fromarray(g, "L")
         for k, fn in ref.items():
             hd = bin(int(f[k]) ^ int(_pack(fn(im).hash))).count("1")
@@ -209,11 +211,11 @@ def test_latency_reasonable():
     img = rng.integers(0, 256, (256, 256, 3), np.uint8)
     fc = imfeat.FeatureComputer(img.shape, grid=[(5, 5), (4, 4), (3, 3), (2, 2)])
     for _ in range(5):
-        fc.features(img)
+        groups(fc, img)
     ts = []
     for _ in range(50):
         t = time.perf_counter()
-        fc.features(img)
+        groups(fc, img)
         ts.append((time.perf_counter() - t) * 1e3)
     print(
         f"\nfeatures()+hashes 256x256x3 4-level: p50={np.median(ts):.3f} ms, min={min(ts):.3f} ms"

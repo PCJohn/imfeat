@@ -19,6 +19,8 @@ import pytest
 
 import imfeat
 
+from conftest import groups
+
 rng = np.random.default_rng(0)
 
 GRIDS = [[(5, 5)], [(5, 5), (3, 3)], [(4, 4), (2, 2)], [(0, 0)]]
@@ -48,7 +50,7 @@ def norm(sm: np.ndarray) -> np.ndarray:
 def test_summary_matches_cell_reduction(grid, stride, nch):
     shape = (64, 64) if nch == 1 else (64, 64, nch)
     img = rng.integers(0, 256, shape, np.uint8)
-    f = imfeat.FeatureComputer(shape, grid=grid, stride=stride).features(img)
+    f = groups(imfeat.FeatureComputer(shape, grid=grid, stride=stride), img)
     for i in range(len(grid)):
         for g in GROUPS:
             ref = ref_summary(f[f"{g}_{i}"])
@@ -62,7 +64,7 @@ def test_summary_matches_cell_reduction(grid, stride, nch):
 
 
 def test_only_grid_levels_have_summaries():
-    f = imfeat.FeatureComputer((32, 32, 3), grid=[(5, 5), (3, 3)]).features(
+    f = groups(imfeat.FeatureComputer((32, 32, 3), grid=[(5, 5), (3, 3)]),
         rng.integers(0, 256, (32, 32, 3), np.uint8)
     )
     assert "mom_summary_0" in f and "mom_summary_1" in f
@@ -73,7 +75,7 @@ def test_only_grid_levels_have_summaries():
 def test_flat_image_summary():
     """A constant image: every cell identical, so min==max==mean and std==0."""
     img = np.full((32, 32, 3), 7, np.uint8)
-    f = imfeat.FeatureComputer(img.shape, grid=[(4, 4)]).features(img)
+    f = groups(imfeat.FeatureComputer(img.shape, grid=[(4, 4)]), img)
     s = f["mom_summary_0"]  # (4, 3, 4)
     mean_stat = s[imfeat.MOMENTS.index("mean")]  # (C, 4): [min,max,mean,std] of cell means
     assert np.allclose(mean_stat[:, 0], 7.0) and np.allclose(mean_stat[:, 1], 7.0)
@@ -87,7 +89,7 @@ def test_single_hot_cell_max():
     while the min stays at the flat floor -- exactly the blank discriminator."""
     img = np.zeros((32, 32), np.uint8)
     img[:8, :8] = rng.integers(0, 256, (8, 8), np.uint8)  # top-left cell only
-    f = imfeat.FeatureComputer(img.shape, grid=[(2, 2)]).features(img)  # 4x4 cells
+    f = groups(imfeat.FeatureComputer(img.shape, grid=[(2, 2)]), img)  # 4x4 cells
     vmax = f["mom_summary_0"][imfeat.MOMENTS.index("var")]  # (4,) [min,max,mean,std]
     assert vmax[1] > 1.0 and vmax[0] == 0.0  # some cell varies; some cell is flat
 
@@ -97,7 +99,7 @@ def test_blank_relevant_reductions():
     reduction over the finest maps: max V cell-variance and max V edge-energy."""
     img = rng.integers(0, 256, (64, 64, 3), np.uint8)
     fc = imfeat.FeatureComputer(img.shape, grid=[(5, 5)])
-    f = fc.features(img)
+    f = groups(fc, img)
     V = 2  # HSV V channel
     max_var = f["mom_summary_0"][imfeat.MOMENTS.index("var"), V, 1]
     max_energy = f["struct_summary_0"][imfeat.FEATURES.index("energy"), V, 1]

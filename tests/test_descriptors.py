@@ -18,6 +18,8 @@ import pytest
 
 import imfeat
 
+from conftest import groups
+
 rng = np.random.default_rng(3)
 
 D = {name: k for k, name in enumerate(imfeat.DESCRIPTOR_FEATURES)}
@@ -57,7 +59,7 @@ def ink_on_paper(n=96, ink_frac=0.12):
 @pytest.mark.parametrize("img", [noise(), ramp(), stripes(), ink_on_paper()])
 @pytest.mark.parametrize("grid", [[(0, 0)], [(3, 3)], [(4, 4), (2, 2)]])
 def test_descriptors_match_their_formula(img, grid):
-    f = imfeat.FeatureComputer(img.shape, grid=grid).features(img)
+    f = groups(imfeat.FeatureComputer(img.shape, grid=grid), img)
     for lv in [str(i) for i in range(len(grid))] + ["global"]:
         d = f[f"desc_{lv}"]
         var = f[f"mom_{lv}"][..., 1]
@@ -81,7 +83,7 @@ def test_descriptors_match_their_formula(img, grid):
 
 def test_flat_cell_is_finite_and_zero():
     img = np.full((64, 64), 128, np.uint8)
-    d = imfeat.FeatureComputer(img.shape, grid=[(0, 0)]).features(img)["desc_global"]
+    d = groups(imfeat.FeatureComputer(img.shape, grid=[(0, 0)]), img)["desc_global"]
     assert np.all(np.isfinite(d)) and np.allclose(d, 0.0)
 
 
@@ -91,7 +93,7 @@ def test_flat_cell_is_finite_and_zero():
 def test_uniform_ramp_is_platykurtic():
     """A linear ramp visits every level equally -> uniform distribution, whose excess
     kurtosis is -1.2 and whose skew is 0."""
-    f = imfeat.FeatureComputer((96, 96), grid=[(0, 0)]).features(ramp())
+    f = groups(imfeat.FeatureComputer((96, 96), grid=[(0, 0)]), ramp())
     d = f["desc_global"]
     assert abs(d[D["excess_kurt"]] - (-1.2)) < 0.05
     assert abs(d[D["std_skew"]]) < 0.02
@@ -99,7 +101,7 @@ def test_uniform_ramp_is_platykurtic():
 
 def test_symmetric_noise_has_zero_skew():
     img = noise(160)
-    d = imfeat.FeatureComputer(img.shape, grid=[(0, 0)]).features(img)["desc_global"]
+    d = groups(imfeat.FeatureComputer(img.shape, grid=[(0, 0)]), img)["desc_global"]
     assert abs(d[D["std_skew"]]) < 0.05
     assert abs(d[D["excess_kurt"]] - (-1.2)) < 0.05  # uniform noise is also platykurtic
 
@@ -108,7 +110,7 @@ def test_ink_on_paper_is_left_skewed():
     """Sparse dark ink on bright paper: the long tail points to dark -> negative skew,
     and the distribution is far from Gaussian (positive excess kurtosis)."""
     img = ink_on_paper(160, 0.1)
-    d = imfeat.FeatureComputer(img.shape, grid=[(0, 0)]).features(img)["desc_global"]
+    d = groups(imfeat.FeatureComputer(img.shape, grid=[(0, 0)]), img)["desc_global"]
     assert d[D["std_skew"]] < -1.0
     assert d[D["excess_kurt"]] > 1.0
 
@@ -116,8 +118,8 @@ def test_ink_on_paper_is_left_skewed():
 def test_single_orientation_has_high_concentration():
     """Vertical stripes -> every gradient is horizontal -> one HOG bin -> concentration
     near 1 (vs ~1/9 for isotropic noise)."""
-    fv = imfeat.FeatureComputer((96, 96), grid=[(0, 0)]).features(stripes(axis=1))
-    fn = imfeat.FeatureComputer((96, 96), grid=[(0, 0)]).features(noise(96))
+    fv = groups(imfeat.FeatureComputer((96, 96), grid=[(0, 0)]), stripes(axis=1))
+    fn = groups(imfeat.FeatureComputer((96, 96), grid=[(0, 0)]), noise(96))
     assert fv["desc_global"][D["hog_concentration"]] > 0.8
     assert fn["desc_global"][D["hog_concentration"]] < 0.2
 
@@ -127,9 +129,9 @@ def test_cardinality_separates_axis_aligned_from_diagonal():
     stripes put all their energy in a diagonal bin (low cardinality). Concentration is
     high for all three -- only cardinality tells them apart."""
     g = [(0, 0)]
-    vert = imfeat.FeatureComputer((96, 96), grid=g).features(stripes(axis=1))["desc_global"]
-    horz = imfeat.FeatureComputer((96, 96), grid=g).features(stripes(axis=0))["desc_global"]
-    diag = imfeat.FeatureComputer((96, 96), grid=g).features(diagonal_stripes())["desc_global"]
+    vert = groups(imfeat.FeatureComputer((96, 96), grid=g), stripes(axis=1))["desc_global"]
+    horz = groups(imfeat.FeatureComputer((96, 96), grid=g), stripes(axis=0))["desc_global"]
+    diag = groups(imfeat.FeatureComputer((96, 96), grid=g), diagonal_stripes())["desc_global"]
     assert vert[D["hog_cardinality"]] > 0.8 and horz[D["hog_cardinality"]] > 0.8
     assert diag[D["hog_cardinality"]] < 0.2
     assert min(vert[D["hog_concentration"]], diag[D["hog_concentration"]]) > 0.7  # all peaked
@@ -139,9 +141,9 @@ def test_detail_high_for_isotropic_low_for_coherent():
     """detail = energy*(1-coherence): ~0 for a single coherent orientation (stripes),
     large for isotropic edge clutter (noise), 0 for a flat field."""
     g = [(0, 0)]
-    strp = imfeat.FeatureComputer((96, 96), grid=g).features(stripes())["desc_global"]
-    nois = imfeat.FeatureComputer((96, 96), grid=g).features(noise(96))["desc_global"]
-    flat = imfeat.FeatureComputer((96, 96), grid=g).features(np.full((96, 96), 90, np.uint8))
+    strp = groups(imfeat.FeatureComputer((96, 96), grid=g), stripes())["desc_global"]
+    nois = groups(imfeat.FeatureComputer((96, 96), grid=g), noise(96))["desc_global"]
+    flat = groups(imfeat.FeatureComputer((96, 96), grid=g), np.full((96, 96), 90, np.uint8))
     assert nois[D["detail"]] > 5 * strp[D["detail"]] + 1.0
     assert flat["desc_global"][D["detail"]] == 0.0
 
@@ -159,8 +161,8 @@ def test_dimensionless_descriptors_are_affine_invariant(img):
     base = (img.astype(np.int16) % 120).astype(np.uint8)  # headroom so 2v+15 <= 255
     warped = (2 * base + 15).astype(np.uint8)
     fc = imfeat.FeatureComputer(base.shape, grid=[(2, 2)])
-    a = fc.features(base)["desc_0"]
-    b = fc.features(warped)["desc_0"]
+    a = groups(fc, base)["desc_0"]
+    b = groups(fc, warped)["desc_0"]
     for name in ("std_skew", "excess_kurt", "hog_concentration", "hog_cardinality"):
         assert np.allclose(a[..., D[name]], b[..., D[name]], atol=1e-4), name
     # edge_sharpness is dimensionless too, up to the +1 epsilon in the denominator
@@ -175,8 +177,8 @@ def test_detail_is_not_affine_invariant():
     base = (noise(96) % 120).astype(np.uint8)
     warped = (2 * base + 15).astype(np.uint8)
     fc = imfeat.FeatureComputer(base.shape, grid=[(0, 0)])
-    a = fc.features(base)["desc_global"][D["detail"]]
-    b = fc.features(warped)["desc_global"][D["detail"]]
+    a = groups(fc, base)["desc_global"][D["detail"]]
+    b = groups(fc, warped)["desc_global"][D["detail"]]
     assert b > 3.0 * a  # ~4x
 
 
@@ -213,14 +215,14 @@ def sparse_lines(n=96, step=16):
     "img", [noise(96), ink_on_paper(96), sparse_lines(), ramp(), stripes()]
 )
 def test_grad_sparsity_matches_sobel_oracle(img):
-    got = imfeat.FeatureComputer(img.shape, grid=[(0, 0)]).features(img)["desc_global"]
+    got = groups(imfeat.FeatureComputer(img.shape, grid=[(0, 0)]), img)["desc_global"]
     assert np.isclose(got[D["grad_sparsity"]], _ref_grad_sparsity(img), rtol=1e-4, atol=1e-3)
 
 
 def test_uniform_gradient_has_sparsity_one():
     """A linear ramp has the same gradient at every interior pixel -> kurtosis 1, the
     minimum (only border pixels differ, so it sits just above 1)."""
-    d = imfeat.FeatureComputer((96, 96), grid=[(0, 0)]).features(ramp())["desc_global"]
+    d = groups(imfeat.FeatureComputer((96, 96), grid=[(0, 0)]), ramp())["desc_global"]
     assert 1.0 <= d[D["grad_sparsity"]] < 1.15
 
 
@@ -228,8 +230,8 @@ def test_sparse_edges_have_high_sparsity():
     """A few strong rules on a flat field: most pixels have zero gradient, a few are huge
     -> heavy-tailed, high kurtosis, well above dense texture."""
     g = [(0, 0)]
-    lines = imfeat.FeatureComputer((96, 96), grid=g).features(sparse_lines())["desc_global"]
-    dense = imfeat.FeatureComputer((96, 96), grid=g).features(noise(96))["desc_global"]
+    lines = groups(imfeat.FeatureComputer((96, 96), grid=g), sparse_lines())["desc_global"]
+    dense = groups(imfeat.FeatureComputer((96, 96), grid=g), noise(96))["desc_global"]
     assert lines[D["grad_sparsity"]] > 4.0
     assert lines[D["grad_sparsity"]] > 2.0 * dense[D["grad_sparsity"]]
 
@@ -237,14 +239,14 @@ def test_sparse_edges_have_high_sparsity():
 def test_grad_sparsity_is_at_least_one():
     """Kurtosis of a non-negative quantity is >= 1 by Jensen, wherever there is gradient."""
     for im in (noise(128), ink_on_paper(128), stripes(), diagonal_stripes(), ramp()):
-        d = imfeat.FeatureComputer(im.shape, grid=[(2, 2)]).features(im)["desc_0"]
+        d = groups(imfeat.FeatureComputer(im.shape, grid=[(2, 2)]), im)["desc_0"]
         gs = d[..., D["grad_sparsity"]]
         assert np.all(gs[gs > 0] >= 1.0 - 1e-4)
 
 
 def test_grad_sparsity_flat_is_zero():
     img = np.full((64, 64), 90, np.uint8)
-    d = imfeat.FeatureComputer(img.shape, grid=[(0, 0)]).features(img)["desc_global"]
+    d = groups(imfeat.FeatureComputer(img.shape, grid=[(0, 0)]), img)["desc_global"]
     assert d[D["grad_sparsity"]] == 0.0
 
 
@@ -254,8 +256,8 @@ def test_grad_sparsity_is_affine_invariant(img):
     base = (img.astype(np.int16) % 120).astype(np.uint8)
     warped = (2 * base + 15).astype(np.uint8)
     fc = imfeat.FeatureComputer(base.shape, grid=[(2, 2)])
-    a = fc.features(base)["desc_0"][..., D["grad_sparsity"]]
-    b = fc.features(warped)["desc_0"][..., D["grad_sparsity"]]
+    a = groups(fc, base)["desc_0"][..., D["grad_sparsity"]]
+    b = groups(fc, warped)["desc_0"][..., D["grad_sparsity"]]
     assert np.allclose(a, b, rtol=1e-3, atol=1e-3)
 
 
@@ -265,7 +267,7 @@ def test_grad_sparsity_is_affine_invariant(img):
 # ==========================================================================
 def test_rms_contrast_matches_formula():
     for img in [noise(96), ink_on_paper(96), stripes(), ramp()]:
-        f = imfeat.FeatureComputer(img.shape, grid=[(3, 3)]).features(img)
+        f = groups(imfeat.FeatureComputer(img.shape, grid=[(3, 3)]), img)
         mean, var = f["mom_0"][..., 0], f["mom_0"][..., 1]
         ref = np.sqrt(np.maximum(var, 0.0)) / (mean + 1.0)
         assert np.allclose(f["desc_0"][..., D["rms_contrast"]], ref, atol=1e-4, rtol=1e-3)
@@ -273,13 +275,13 @@ def test_rms_contrast_matches_formula():
 
 def test_rms_contrast_flat_is_zero():
     img = np.full((64, 64), 130, np.uint8)
-    d = imfeat.FeatureComputer(img.shape, grid=[(0, 0)]).features(img)["desc_global"]
+    d = groups(imfeat.FeatureComputer(img.shape, grid=[(0, 0)]), img)["desc_global"]
     assert d[D["rms_contrast"]] == 0.0
 
 
 def test_rms_contrast_nonnegative():
     for im in (noise(128), ink_on_paper(128), stripes(), diagonal_stripes(), ramp()):
-        d = imfeat.FeatureComputer(im.shape, grid=[(2, 2)]).features(im)["desc_0"]
+        d = groups(imfeat.FeatureComputer(im.shape, grid=[(2, 2)]), im)["desc_0"]
         assert np.all(d[..., D["rms_contrast"]] >= 0.0)
 
 
@@ -289,10 +291,10 @@ def test_rms_contrast_invariant_to_gain_not_offset():
     to the affine-invariant descriptors."""
     base = (noise(96, 40, 120)).astype(np.uint8)  # high mean so the +1 floor is negligible
     fc = imfeat.FeatureComputer(base.shape, grid=[(0, 0)])
-    r0 = fc.features(base)["desc_global"][D["rms_contrast"]]
-    gain = fc.features((base.astype(np.float32) * 1.8).clip(0, 255).astype(np.uint8))
+    r0 = groups(fc, base)["desc_global"][D["rms_contrast"]]
+    gain = groups(fc, (base.astype(np.float32) * 1.8).clip(0, 255).astype(np.uint8))
     r_gain = gain["desc_global"][D["rms_contrast"]]
-    off = fc.features((base.astype(np.int16) + 60).clip(0, 255).astype(np.uint8))
+    off = groups(fc, (base.astype(np.int16) + 60).clip(0, 255).astype(np.uint8))
     r_off = off["desc_global"][D["rms_contrast"]]
     assert abs(r_gain - r0) < 0.06 * r0  # gain: ~invariant
     assert r_off < 0.85 * r0  # offset: clearly lower
@@ -310,7 +312,7 @@ def test_rms_contrast_invariant_to_gain_not_offset():
 def test_std_skew_excess_kurt_end_to_end_vs_numpy(img):
     x = img.astype(np.float64).ravel()
     mu, var = x.mean(), x.var()  # population variance (ddof=0), matching imfeat
-    d = imfeat.FeatureComputer(img.shape, grid=[(0, 0)]).features(img)["desc_global"]
+    d = groups(imfeat.FeatureComputer(img.shape, grid=[(0, 0)]), img)["desc_global"]
     if var > 0:
         skew_ref = ((x - mu) ** 3).mean() / var**1.5
         kurt_ref = ((x - mu) ** 4).mean() / var**2 - 3.0
@@ -321,7 +323,7 @@ def test_std_skew_excess_kurt_end_to_end_vs_numpy(img):
 def test_concentration_pure_single_orientation_is_near_one():
     """All gradient energy in one orientation bin -> Herfindahl ~ 1 (tight bound, catches a
     missing normalisation which would instead scale with total gradient magnitude)."""
-    d = imfeat.FeatureComputer((96, 96), grid=[(0, 0)]).features(stripes(axis=1))["desc_global"]
+    d = groups(imfeat.FeatureComputer((96, 96), grid=[(0, 0)]), stripes(axis=1))["desc_global"]
     assert d[D["hog_concentration"]] > 0.95
 
 
@@ -332,5 +334,5 @@ def test_grad_sparsity_equals_one_plus_cv2_identity():
         gx, gy = _sobel_int(img)
         G = (gx * gx + gy * gy).astype(np.float64).ravel()
         ref = 1.0 + G.var() / (G.mean() ** 2)
-        got = imfeat.FeatureComputer(img.shape, grid=[(0, 0)]).features(img)["desc_global"]
+        got = groups(imfeat.FeatureComputer(img.shape, grid=[(0, 0)]), img)["desc_global"]
         assert np.isclose(got[D["grad_sparsity"]], ref, rtol=1e-4, atol=1e-3)

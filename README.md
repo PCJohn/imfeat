@@ -391,6 +391,32 @@ then use stride as the final trim.
 **Take all the pyramid levels** — they are nearly free, and give multi-scale context for one
 cell reduction.
 
+**`features()` returns one format.** A `Pyramid` namedtuple, not a dict of named groups:
+
+| field | shape | dtype |
+|---|---|---|
+| `maps` | per level, `(H, W, C*38)`, finest first, 1-cell global last | float32 |
+| `moments` | per level, `(H, W, C, 4)` over `MOMENTS` | float64 |
+| `summary` | per level except global, `(38, C, 4)` over `SUMMARY_STATS` | float64 |
+| `cross` | per level, `(H, W, P, 2)` over `CROSS_FEATURES` | float32 |
+| `hashes` | `(3, C)` over `HASHES`, whole-frame | uint64 |
+
+`maps` is NHWC with the channel axis C-major over `FEATURE_NAMES`, so on a 256² thumbnail
+with a 4-level grid it is `(32,32,114) (16,16,114) (8,8,114) (4,4,114)` — an FPN P3–P6 shape
+family that feeds a detector neck or a per-cell tree model directly. `moments` repeats the
+trailing four channels of `maps` at full precision: m3 and m4 span a range float32 cannot hold
+to the accuracy the oracle tests require, so use `moments` when precision matters and `maps`
+when feeding a model.
+
+Every feature is per-pixel normalised, so no level carries a cell-area factor and one
+shared-weight head can read every level. The channels do span a very wide dynamic range
+(histogram bins near 1e-2, fourth moments near 1e6), so standardise per channel against
+statistics fixed over a dataset before training — not per frame, which would throw away
+absolute brightness and contrast. `summary` is the cheap way to collect them.
+
+`compute()` still returns the raw int64 accumulator sums as a dict; it is the low-level
+validation surface, not the modelling one, and its keys mirror the C++ slot layout.
+
 **Threading is opt-in and bit-exact.** `threads=N` splits the accumulate pass into disjoint
 bands of finest cell rows. Two bands never touch the same accumulator, so there are no atomics
 on the hot path, and because every accumulator is an int64 sum that cannot overflow the output

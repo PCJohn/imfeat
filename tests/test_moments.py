@@ -20,6 +20,8 @@ import pytest
 
 import imfeat
 
+from conftest import groups
+
 rng = np.random.default_rng(0)
 
 GRIDS = [[(5, 5)], [(5, 5), (4, 4), (3, 3), (2, 2)], [(0, 0)], [(6, 6)]]
@@ -86,7 +88,7 @@ def textured(n=256):
 @pytest.mark.parametrize("stride", STRIDES)
 def test_moments_vs_reference(grid, stride):
     img = textured()
-    r = imfeat.FeatureComputer(img.shape, grid=grid, stride=stride).features(img)
+    r = groups(imfeat.FeatureComputer(img.shape, grid=grid, stride=stride), img)
     for i, ref in enumerate(ref_levels(img, grid, stride)):
         np.testing.assert_allclose(r[f"mom_{i}"], ref, rtol=1e-9, atol=1e-9)
 
@@ -95,7 +97,7 @@ def test_moments_vs_reference(grid, stride):
 def test_global_moments_vs_reference(stride):
     img = textured()
     grid = [(5, 5)]
-    r = imfeat.FeatureComputer(img.shape, grid=grid, stride=stride).features(img)
+    r = groups(imfeat.FeatureComputer(img.shape, grid=grid, stride=stride), img)
     rows, cols = sampled(256, 256, 32, stride)
     ref = ref_moments(img[np.ix_(rows, cols)].astype(np.float64).ravel())
     np.testing.assert_allclose(r["mom_global"], ref, rtol=1e-9, atol=1e-9)
@@ -126,7 +128,7 @@ def test_raw_power_sums_exact():
 def test_derived_matches_raw():
     img = textured()
     fc = imfeat.FeatureComputer(img.shape, grid=[(5, 5)])
-    raw, fe = fc.compute(img)["mom_0"].astype(float), fc.features(img)["mom_0"]
+    raw, fe = fc.compute(img)["mom_0"].astype(float), groups(fc, img)["mom_0"]
     n = fc.compute(img)["struct_0"][..., 3].astype(float)
     mu = raw[..., 0] / n
     np.testing.assert_allclose(fe[..., 0], mu, rtol=1e-12)
@@ -135,7 +137,7 @@ def test_derived_matches_raw():
 
 # ============================== Tier 2: semantics =========================
 def test_constant_image():
-    r = imfeat.FeatureComputer((256, 256), grid=[(5, 5)]).features(flat(200))
+    r = groups(imfeat.FeatureComputer((256, 256), grid=[(5, 5)]), flat(200))
     m = r["mom_0"]
     assert np.all(m[..., 0] == 200.0)
     assert np.all(m[..., 1:] == 0.0)
@@ -145,7 +147,7 @@ def test_bimodal_variance_and_symmetry():
     """Half black, half white: mean 127.5, var 127.5^2, zero skew, kurtosis 1."""
     img = flat(0)
     img[128:] = 255
-    m = imfeat.FeatureComputer(img.shape, grid=[(0, 0)]).features(img)["mom_0"][0, 0]
+    m = groups(imfeat.FeatureComputer(img.shape, grid=[(0, 0)]), img)["mom_0"][0, 0]
     np.testing.assert_allclose(m[0], 127.5, rtol=1e-12)
     np.testing.assert_allclose(m[1], 127.5**2, rtol=1e-12)
     assert abs(m[2]) < 1e-6  # symmetric -> no skew
@@ -156,7 +158,7 @@ def test_skew_sign():
     """A few bright pixels on a dark field -> positive third moment."""
     img = flat(10)
     img[::32, ::32] = 250
-    m = imfeat.FeatureComputer(img.shape, grid=[(0, 0)]).features(img)["mom_0"][0, 0]
+    m = groups(imfeat.FeatureComputer(img.shape, grid=[(0, 0)]), img)["mom_0"][0, 0]
     assert m[2] > 0
 
 
@@ -164,13 +166,13 @@ def test_low_variance_high_mean_precision():
     """Where S2/n - mean^2 cancels: values in {250, 251} have variance ~0.25 against
     a mean^2 of ~62750. The shifted power sums keep full precision."""
     img = (250 + rng.integers(0, 2, (256, 256))).astype(np.uint8)
-    m = imfeat.FeatureComputer(img.shape, grid=[(5, 5)]).features(img)["mom_0"]
+    m = groups(imfeat.FeatureComputer(img.shape, grid=[(5, 5)]), img)["mom_0"]
     ref = ref_levels(img, [(5, 5)], (1, 1))[0]
     np.testing.assert_allclose(m, ref, rtol=1e-12, atol=1e-12)
 
 
 def test_ramp_cell_means_increase():
-    m = imfeat.FeatureComputer((256, 256), grid=[(5, 5)]).features(ramp())["mom_0"]
+    m = groups(imfeat.FeatureComputer((256, 256), grid=[(5, 5)]), ramp())["mom_0"]
     row = m[0, :, 0]
     assert np.all(np.diff(row) > 0)  # horizontal ramp -> means rise left to right
     assert np.allclose(m[:, :, 0], m[0, :, 0], atol=1e-9)  # rows identical
@@ -180,8 +182,8 @@ def test_stride_preserves_moments():
     """Stride is a quality/latency knob: the moment maps should barely move."""
     img = textured()
     g = [(5, 5)]
-    a = imfeat.FeatureComputer(img.shape, grid=g).features(img)["mom_0"]
-    b = imfeat.FeatureComputer(img.shape, grid=g, stride=(4, 4)).features(img)["mom_0"]
+    a = groups(imfeat.FeatureComputer(img.shape, grid=g), img)["mom_0"]
+    b = groups(imfeat.FeatureComputer(img.shape, grid=g, stride=(4, 4)), img)["mom_0"]
     for k, lo in ((0, 0.99), (1, 0.95)):  # mean, variance
         x, y = a[..., k].ravel(), b[..., k].ravel()
         assert np.corrcoef(x, y)[0, 1] > lo, f"moment {k}"
@@ -192,10 +194,10 @@ def test_stride_preserves_moments():
 def test_multichannel_matches_per_channel():
     """Channels-in-lanes SIMD (C>=2) must agree bit-for-bit with the scalar path."""
     img = np.stack([textured(), noise(), ramp()], -1)
-    multi = imfeat.FeatureComputer(img.shape, grid=[(5, 5), (3, 3)]).features(img)
+    multi = groups(imfeat.FeatureComputer(img.shape, grid=[(5, 5), (3, 3)]), img)
     for c in range(3):
         plane = np.ascontiguousarray(img[:, :, c])
-        solo = imfeat.FeatureComputer(plane.shape, grid=[(5, 5), (3, 3)]).features(
+        solo = groups(imfeat.FeatureComputer(plane.shape, grid=[(5, 5), (3, 3)]),
             plane
         )
         for k in solo:
@@ -206,7 +208,7 @@ def test_multichannel_matches_per_channel():
 @pytest.mark.parametrize("nch", [1, 2, 3, 5, 8])
 def test_arbitrary_channel_count(nch):
     img = rng.integers(0, 256, (128, 128, nch), dtype=np.uint8)
-    r = imfeat.FeatureComputer(img.shape, grid=[(4, 4)]).features(img)
+    r = groups(imfeat.FeatureComputer(img.shape, grid=[(4, 4)]), img)
     assert r["mom_0"].shape == (16, 16, nch, 4)
     for c in range(nch):
         ref = ref_moments(img[:, :, c].astype(np.float64).ravel())
@@ -215,8 +217,8 @@ def test_arbitrary_channel_count(nch):
 
 def test_channel_subset():
     img = np.stack([textured(), noise(), ramp()], -1)
-    full = imfeat.FeatureComputer(img.shape, grid=[(5, 5)]).features(img)
-    sub = imfeat.FeatureComputer(img.shape, grid=[(5, 5)], channels=[2, 0]).features(
+    full = groups(imfeat.FeatureComputer(img.shape, grid=[(5, 5)]), img)
+    sub = groups(imfeat.FeatureComputer(img.shape, grid=[(5, 5)], channels=[2, 0]),
         img
     )
     for k in full:
@@ -237,8 +239,8 @@ def test_channel_subset():
 def test_channel_axis_first():
     img = np.stack([textured(), noise(), ramp()], -1)
     chw = np.ascontiguousarray(np.moveaxis(img, -1, 0))
-    a = imfeat.FeatureComputer(img.shape, grid=[(5, 5)]).features(img)
-    b = imfeat.FeatureComputer(chw.shape, grid=[(5, 5)], channel_axis=0).features(chw)
+    a = groups(imfeat.FeatureComputer(img.shape, grid=[(5, 5)]), img)
+    b = groups(imfeat.FeatureComputer(chw.shape, grid=[(5, 5)], channel_axis=0), chw)
     for k in a:
         assert np.array_equal(a[k], b[k]), k
 
@@ -246,10 +248,10 @@ def test_channel_axis_first():
 def test_latency():
     img = np.stack([textured(), noise(), ramp()], -1)
     fc = imfeat.FeatureComputer(img.shape, grid=[(5, 5), (4, 4), (3, 3), (2, 2)])
-    fc.features(img)
+    groups(fc, img)
     t0 = time.perf_counter()
     for _ in range(50):
-        fc.features(img)
+        groups(fc, img)
     ms = (time.perf_counter() - t0) / 50 * 1e3
     print(f"\n256x256x3, 4 levels, all features: {ms:.3f} ms/frame")
     assert ms < 20.0

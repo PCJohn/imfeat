@@ -19,7 +19,11 @@ import time
 import numpy as np
 import pytest
 
+import imfeat
+
 import imfeat as ss
+
+from conftest import groups
 
 rng = np.random.default_rng(0)
 
@@ -238,8 +242,8 @@ def test_rotation_equivariance():
     b = sc.compute(np.ascontiguousarray(np.rot90(img)))["struct_global"]
     assert b[0] == a[1] and b[1] == a[0] and b[2] == -a[2] and b[3] == a[3]
 
-    fa = sc.features(img)["struct_global"]
-    fb = sc.features(np.ascontiguousarray(np.rot90(img)))["struct_global"]
+    fa = groups(sc, img)["struct_global"]
+    fb = groups(sc, np.ascontiguousarray(np.rot90(img)))["struct_global"]
     assert fa[1] > 0.5  # strongly anisotropic, so the checks below are meaningful
     assert np.allclose(fa[0], fb[0])  # energy invariant
     assert np.allclose(fa[1], fb[1])  # coherence invariant
@@ -320,7 +324,7 @@ def test_cpp_features_match_python():
     img = textured()
     sc = ss.FeatureComputer((256, 256), grid=[(5, 5)])
     raw = sc.compute(img)["struct_0"]
-    fe = sc.features(img)["struct_0"]
+    fe = groups(sc, img)["struct_0"]
     n = np.maximum(raw[..., 3].astype(float), 1.0)
     coh, ori = ref_coherence(raw), ref_orientation(raw)
     assert ss.FEATURES == ("energy", "coherence", "ori_cos", "ori_sin", "cornerness")
@@ -341,7 +345,7 @@ def test_latency_end_to_end(capsys):
     sc = ss.FeatureComputer(img.shape, grid=pyr)
 
     def feats():
-        return sc.features(v)
+        return groups(sc, v)
 
     for _ in range(20):
         feats()
@@ -562,7 +566,7 @@ def test_hog_extrema_features_match():
     img = textured()
     sc = ss.FeatureComputer((256, 256), grid=[(5, 5)])
     raw = sc.compute(img)
-    fe = sc.features(img)
+    fe = groups(sc, img)
     hraw = raw["hog_0"].astype(float)
     hsum = np.maximum(hraw.sum(-1, keepdims=True), 1.0)
     assert np.allclose(fe["hog_0"], hraw / hsum, atol=1e-5)
@@ -775,7 +779,7 @@ def test_empty_cells_are_finite_zero():
     img = noise(64)
     sc = ss.FeatureComputer((64, 64), grid=[(5, 5)], stride=(4, 4))
     raw = sc.compute(img)
-    fe = sc.features(img)
+    fe = groups(sc, img)
     empty = raw["struct_0"][..., 3] == 0
     assert empty.any()  # this config really does starve some cells
     for k in ("struct_0", "hog_0", "cnt_0"):
@@ -788,7 +792,7 @@ def test_empty_cells_are_finite_zero():
 def test_property_bounds(img):
     r = ss.FeatureComputer(img.shape, grid=[(5, 5)])
     raw = r.compute(img)["struct_0"]
-    fe = r.features(img)
+    fe = groups(r, img)
     # extrema can't exceed pixel count
     cnt = r.compute(img)["cnt_0"]
     assert (cnt[..., 0] + cnt[..., 1] <= raw[..., 3]).all()
@@ -819,7 +823,7 @@ def test_global_matches_reference_derive():
     # features()["*_global"] must equal deriving from compute()["*_global"]
     img = textured()
     sc = ss.FeatureComputer((256, 256), grid=[(5, 5)])
-    raw, fe = sc.compute(img), sc.features(img)
+    raw, fe = sc.compute(img), groups(sc, img)
     g = raw["struct_global"].astype(float)
     n = max(g[3], 1.0)
     assert np.allclose(fe["struct_global"][0], (g[0] + g[1]) / n, rtol=1e-5)
@@ -915,10 +919,10 @@ def test_multichannel_equals_single_channel(c):
     imgs = chan_imgs(n, c)
     hwc = stack_hwc(imgs)
     mc = ss.FeatureComputer((n, n, c), grid=grid, stride=stride)
-    rmc, fmc = mc.compute(hwc), mc.features(hwc)
+    rmc, fmc = mc.compute(hwc), groups(mc, hwc)
     for ch, img in enumerate(imgs):
         sc = ss.FeatureComputer((n, n), grid=grid, stride=stride)
-        r1, f1 = sc.compute(img), sc.features(img)
+        r1, f1 = sc.compute(img), groups(sc, img)
         for k in r1:
             assert np.array_equal(rmc[k][..., ch, :], r1[k]), f"raw {k} ch{ch}"
         for k in f1:
@@ -931,7 +935,7 @@ def test_multichannel_output_shapes():
     n, c = 64, 3
     hwc = stack_hwc(chan_imgs(n, c))
     sc = ss.FeatureComputer((n, n, c), grid=[(4, 4), (2, 2)])
-    f = sc.features(hwc)
+    f = groups(sc, hwc)
     assert f["struct_0"].shape == (16, 16, c, len(ss.FEATURES))
     assert f["hog_0"].shape == (16, 16, c, len(ss.HOG_FEATURES))
     assert f["cnt_1"].shape == (4, 4, c, len(ss.COUNT_FEATURES))
@@ -947,12 +951,12 @@ def test_2d_input_has_no_channel_axis():
     n = 64
     img = textured(n)  # capture once (builder is randomised per call)
     sc2 = ss.FeatureComputer((n, n), grid=[(4, 4)])
-    f2 = sc2.features(img)
+    f2 = groups(sc2, img)
     assert f2["struct_0"].shape == (16, 16, len(ss.FEATURES))
     assert f2["struct_global"].shape == (len(ss.FEATURES),)
     # a 3-D single-channel input, by contrast, keeps an explicit size-1 channel axis
     sc3 = ss.FeatureComputer((n, n, 1), grid=[(4, 4)])
-    f3 = sc3.features(_c(img[:, :, None]))
+    f3 = groups(sc3, _c(img[:, :, None]))
     assert f3["struct_0"].shape == (16, 16, 1, len(ss.FEATURES))
     assert np.array_equal(f3["struct_0"][..., 0, :], f2["struct_0"])
 
@@ -963,10 +967,10 @@ def test_channel_axis_variants(axis):
     n, c = 64, 3
     hwc = stack_hwc(chan_imgs(n, c))
     moved = _c(np.moveaxis(hwc, -1, axis))  # place channels on `axis`
-    ref = ss.FeatureComputer((n, n, c), grid=[(4, 4), (2, 2)]).features(hwc)
-    got = ss.FeatureComputer(
-        moved.shape, grid=[(4, 4), (2, 2)], channel_axis=axis
-    ).features(moved)
+    ref = groups(ss.FeatureComputer((n, n, c), grid=[(4, 4), (2, 2)]), hwc)
+    got = groups(
+        ss.FeatureComputer(moved.shape, grid=[(4, 4), (2, 2)], channel_axis=axis), moved
+    )
     for k in ref:
         assert np.array_equal(ref[k], got[k]), k
 

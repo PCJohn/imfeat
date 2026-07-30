@@ -40,7 +40,7 @@ shifted right -- a pixel's feature vector at every scale is an O(1) lookup.
 from __future__ import annotations
 
 from collections.abc import Sequence
-from typing import Union, cast
+from typing import NamedTuple, Union, cast
 
 import numpy as np
 
@@ -51,12 +51,14 @@ __all__ = [
     "CROSS_FEATURES",
     "DESCRIPTOR_FEATURES",
     "FEATURES",
+    "FEATURE_NAMES",
     "HASHES",
     "HOG_FEATURES",
     "LBP_FEATURES",
     "MOMENTS",
     "SUMMARY_STATS",
     "FeatureComputer",
+    "Pyramid",
     "cpu_count",
 ]
 __version__ = "0.1.0"
@@ -108,6 +110,28 @@ HASHES = ("ahash", "whash", "phash")
 # over that pyramid level's cells (min/max exact; mean/std population, cell-weighted).
 SUMMARY_STATS = ("min", "max", "mean", "std")
 
+#: One channel's slice of the features() channel axis, in order (F = 38).
+FEATURE_NAMES = (
+    FEATURES + HOG_FEATURES + COUNT_FEATURES + LBP_FEATURES + DESCRIPTOR_FEATURES + MOMENTS
+)
+
+
+class Pyramid(NamedTuple):
+    """maps    : per level, (H, W, C*F) float32, finest first, 1-cell global last
+    moments : per level, (H, W, C, 4) float64 over MOMENTS -- the same numbers as the
+              trailing 4 channels of `maps`, kept at full precision because m3 and m4
+              span a range float32 cannot hold to the accuracy the oracle tests demand
+    summary : per level except global, (F, C, 4) float64 over SUMMARY_STATS
+    cross   : per level, (H, W, P, 2) float32 over CROSS_FEATURES; empty when C > XMAX
+    hashes  : (3, C) uint64 over HASHES, whole-frame"""
+
+    maps: list[np.ndarray]
+    moments: list[np.ndarray]
+    summary: list[np.ndarray]
+    cross: list[np.ndarray]
+    hashes: np.ndarray
+
+
 _NS_RAW = 4  # raw structure-tensor width [Sxx, Syy, Sxy, count]
 _NS_FEAT = len(FEATURES)  # derived structure-tensor width = 5
 _NH = len(HOG_FEATURES)  # HOG bins
@@ -134,6 +158,27 @@ def _parse_stride(stride: int | Sequence[int] | None) -> list[int]:
     if isinstance(stride, int):
         return [stride, stride]
     return [int(stride[0]), int(stride[1])]
+
+
+def _join_map(f: np.ndarray, m: np.ndarray) -> np.ndarray:
+    """(.., C, 34) float32 + (.., C, 4) float64 -> (.., C*38) float32, channel-major."""
+    nf = f.shape[-1]
+    out = np.empty((*f.shape[:-1], nf + m.shape[-1]), np.float32)
+    out[..., :nf] = f
+    out[..., nf:] = m
+    return out.reshape(*f.shape[:-2], -1)
+
+
+def _join_summary(f: np.ndarray, m: np.ndarray) -> np.ndarray:
+    """(C, 34, 4) + (C, 4, 4) -> (38, C, 4) float64, feature axis first to match
+    FEATURE_NAMES. float64 because the min and max entries have to compare equal to the
+    cell values they reduce, and the moment cells are float64; widening the float32
+    half is exact, so both stay so."""
+    nf = f.shape[1]
+    out = np.empty((f.shape[0], nf + m.shape[1], f.shape[2]), np.float64)
+    out[:, :nf] = f
+    out[:, nf:] = m
+    return np.ascontiguousarray(out.transpose(1, 0, 2))
 
 
 class FeatureComputer:
@@ -232,20 +277,27 @@ class FeatureComputer:
             o += n
         return out
 
-    def _cut_summary(self, a: np.ndarray, widths: Sequence[tuple[str, int]], i: str) -> dict:
-        """Slice one (C, F, NST) cross-cell summary into per-group "<name>_summary_i"
-        arrays (last axis = SUMMARY_STATS), dropping the size-1 channel axis for
-        single-channel (2-D) input."""
-        # core buffer is (C, F, NST); expose as (F, C, NST) so the channel axis is
-        # second-to-last (as in every other map), then drop it for 2-D input. Transpose
-        # once for the whole array rather than per group -- and since the groups then
-        # split along the leading axis, each one comes out contiguous.
-        b, out, o = np.ascontiguousarray(a.transpose(1, 0, 2)), {}, 0
-        for name, n in widths:
-            v = b[o : o + n]
-            out[f"{name}_summary_{i}"] = v[:, 0, :] if self._chan_axis is None else v
-            o += n
-        return out
+    def features(self, img: np.ndarray) -> Pyramid:
+        """The whole pyramid in one shot. `maps` is one `(H, W, C*F)` float32 array per
+        level, finest first and the 1-cell global level last, so `(H, W, channels)` is
+        NHWC and feeds an FPN-style neck or a per-cell tree model directly. The channel
+        axis is C-major over `FEATURE_NAMES` (F = 38).
+
+        Every feature is per-pixel normalised, so no level carries a cell-area factor and
+        one shared-weight head can read all of them. The channels do span a very wide
+        dynamic range (histogram bins near 1e-2, fourth moments near 1e6), so standardise
+        per channel against statistics fixed over a dataset before training -- not per
+        frame, which would discard absolute brightness and contrast. `summary` is the
+        cheap way to collect them.
+        """
+        feat, mom, cross, fsum, msum, hashes = self._impl.features(self._view(img))
+        return Pyramid(
+            maps=[_join_map(f, m) for f, m in zip(feat, mom)],
+            moments=[np.asarray(m).copy() for m in mom],
+            summary=[_join_summary(a, b) for a, b in zip(fsum, msum)],
+            cross=[x.copy() for x in cross],
+            hashes=np.stack([np.asarray(h) for h in hashes]),
+        )
 
     def compute(self, img: np.ndarray) -> dict[str, np.ndarray]:
         """Raw int64 accumulators per cell (additive; sum them freely):
@@ -265,46 +317,6 @@ class FeatureComputer:
             out.update(self._cut(a, widths, i))
         for i, x in zip(self._keys, cross):
             out[f"xchan_{i}"] = x.copy()
-        return out
-
-    def features(self, img: np.ndarray) -> dict[str, np.ndarray]:
-        """Derived maps, computed in the same pass. Same keys as compute():
-        struct_i (..., 5) float32   FEATURES
-        hog_i    (..., 9) float32   L1-normalised histogram
-        cnt_i    (..., 2) float32   extrema densities
-        lbp_i    (..., 10) float32  L1-normalised LBP^riu2 histogram
-        mom_i    (..., 4) float64   MOMENTS [mean, var, m3, m4]
-        desc_i   (..., 8) float32   DESCRIPTOR_FEATURES (derived nonlinear summaries)
-        xchan_i  (cy, cx, P, 2) float32   CROSS_FEATURES [cov, corr] per channel pair
-
-        Plus, per grid level i (not "global"), each derived feature reduced across
-        that level's cells into SUMMARY_STATS [min, max, mean, std] on the last axis.
-        Shape (n_feat, C, 4); the C axis is dropped for 2-D input:
-        struct_summary_i (5, C, 4)  hog_summary_i (9, C, 4)  cnt_summary_i (2, C, 4)
-        lbp_summary_i (10, C, 4)  desc_summary_i (8, C, 4)  mom_summary_i (4, C, 4)
-        So e.g. the max V cell-variance a caller would otherwise reduce by hand is
-        mom_summary_0[1, V, 1] (feature 1 = var, channel V, stat 1 = max).
-
-        Also three whole-frame perceptual hashes (imfeat.HASHES), one uint64 per channel,
-        computed in the same pass (no pyramid): ahash, whash, phash. The C axis is dropped
-        for 2-D input (a scalar uint64).
-        """
-        fw = (("struct", _NS_FEAT), ("hog", _NH), ("cnt", _NC), ("lbp", _NL), ("desc", _ND))
-        feat, mom, cross, fsum, msum, hashes = self._impl.features(self._view(img))
-        out: dict[str, np.ndarray] = {}
-        for i, (a, m) in zip(self._keys, zip(feat, mom)):
-            out.update(self._cut(a, fw, i))
-            out.update(self._cut(m, (("mom", _NM),), i))
-        for i, x in zip(self._keys, cross):
-            out[f"xchan_{i}"] = x.copy()
-        # Cross-cell summaries: per grid level only (the 1-cell "global" is trivial).
-        for i, (fs, ms) in zip(self._keys[:-1], zip(fsum, msum)):
-            out.update(self._cut_summary(fs, fw, i))
-            out.update(self._cut_summary(ms, (("mom", _NM),), i))
-        # Perceptual hashes: one uint64 per channel, whole-frame only (no pyramid).
-        # Drop the channel axis for 2-D input, as the other maps do.
-        for name, h in zip(HASHES, hashes):
-            out[name] = h.copy() if self._chan_axis is not None else h[0].copy()
         return out
 
 

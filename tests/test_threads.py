@@ -14,6 +14,8 @@ import pytest
 
 import imfeat
 
+from conftest import groups
+
 CONFIGS = [
     ((128, 128, 3), [(5, 5), (4, 4), (3, 3), (2, 2)], 2),
     ((128, 128, 3), [(5, 5), (4, 4), (3, 3), (2, 2)], 3),
@@ -38,7 +40,7 @@ def _img(shape: tuple[int, ...], seed: int) -> np.ndarray:
 def _outputs(shape, grid, stride, threads):
     fc = imfeat.FeatureComputer(shape, grid=grid, stride=stride, threads=threads)
     img = _img(shape, 7)
-    return fc, {**fc.compute(img), **fc.features(img)}
+    return fc, {**fc.compute(img), **groups(fc, img)}
 
 
 @pytest.mark.parametrize("shape,grid,stride", CONFIGS)
@@ -59,10 +61,10 @@ def test_repeated_frames_do_not_drift():
     difference on the second or third call, not the first."""
     fc = imfeat.FeatureComputer((128, 128, 3), grid=[(4, 4), (3, 3)], stride=2, threads=4)
     imgs = [_img((128, 128, 3), s) for s in range(3)]
-    first = [{k: np.array(v) for k, v in fc.features(im).items()} for im in imgs]
+    first = [{k: np.array(v) for k, v in groups(fc, im).items()} for im in imgs]
     for _ in range(3):
         for im, ref in zip(imgs, first):
-            out = fc.features(im)
+            out = groups(fc, im)
             for k in ref:
                 assert np.array_equal(ref[k], np.asarray(out[k])), k
 
