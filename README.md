@@ -312,7 +312,7 @@ grayscale hash corresponds to running `imfeat` on a luma channel.
 ## The one-pass design
 
 Every per-pixel quantity is accumulated as an **additive int64 sum** into the finest cell of
-its channel — 29 sums per cell per channel:
+its channel — 30 sums per cell per channel:
 
 | slots | contents |
 |---|---|
@@ -321,6 +321,7 @@ its channel — 29 sums per cell per channel:
 | 13,14 | strict local max / min counts |
 | 15..18 | `S1 S2 S3 S4` — power sums of the pixel value |
 | 19..28 | LBP^riu2 bin counts |
+| 29 | `Σ|grad|⁴` — gradient sparsity |
 
 plus, per cell, one further int64 per channel *pair* — `sum(v_i * v_j)` — the only sum that
 is not per channel.
@@ -389,6 +390,30 @@ then use stride as the final trim.
 
 **Take all the pyramid levels** — they are nearly free, and give multi-scale context for one
 cell reduction.
+
+**Threading is opt-in and bit-exact.** `threads=N` splits the accumulate pass into disjoint
+bands of finest cell rows. Two bands never touch the same accumulator, so there are no atomics
+on the hot path, and because every accumulator is an int64 sum that cannot overflow the output
+is *identical* at any thread count — derived floats included, since the coarse-level rollup,
+the summary fold and the hash readout still run serially after the join. The calling thread
+takes one band, so `threads=2` creates one worker. `N` is capped at the finest grid's row count
+(`grid=0` has one cell row and cannot split); `.threads` reports what was used, and
+`imfeat.cpu_count()` the logical cores available.
+
+Measured on an M-series laptop, `features()` end to end, min of 200 frames:
+
+| frame | grid, stride | 1 thread | 2 | 3 | 4 |
+|---|---|---|---|---|---|
+| 256×256×3 | finest-32, s2 | 0.62 ms | 0.41 (1.5×) | 0.36 (1.7×) | 0.30 (2.1×) |
+| 512×512×3 | finest-32, s2 | 1.73 ms | 0.95 (1.8×) | 0.76 (2.3×) | 0.61 (2.8×) |
+| 1024×1024×3 | finest-64, s2 | 7.11 ms | 3.69 (1.9×) | 2.90 (2.5×) | 2.31 (3.1×) |
+| 1024×1024×3 | finest-32, s4 | 2.42 ms | 1.29 (1.9×) | 1.01 (2.4×) | 0.80 (3.0×) |
+
+The accumulate pass itself scales at 3.4× on four threads; the gap to that is the serial tail,
+which is a fixed cost and so hurts small frames most. Workers park on a condition variable
+between frames rather than spinning, so idle bands cost no CPU — the intent is to leave the
+other cores to other real-time work. Thread *placement* is left to the OS: there is no
+portable core-pinning API (macOS has none), so pin from the caller if your platform can.
 
 **Channels after the first are cheap:** 0.34 ms at C=1, 0.65 ms at C=3, then a flat ~0.21 ms
 per additional channel. The full feature set on all of H, S and V costs ~1.9× one channel,

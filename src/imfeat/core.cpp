@@ -8,8 +8,11 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <condition_variable>
 #include <limits>
+#include <mutex>
 #include <stdexcept>
+#include <thread>
 #include <vector>
 
 #if defined(_MSC_VER)
@@ -110,6 +113,36 @@ inline uint8_t lbp_riu2(const uint8_t *IF_RESTRICT a, const uint8_t *IF_RESTRICT
   const uint8_t u = (uint8_t)((s0 ^ s1) + (s1 ^ s2) + (s2 ^ s3) + (s3 ^ s4) + (s4 ^ s5) +
                               (s5 ^ s6) + (s6 ^ s7) + (s7 ^ s0));
   return u <= 2 ? pc : (uint8_t)(LBPB - 1);
+}
+
+// Sobel separables and the vertical min/max envelope, flat over W*C. CT is the channel
+// count as a compile-time constant (0 = take it from `cdyn`): with a runtime C the
+// +/-C offsets in the gradient loop leave gcc over its alias-versioning budget --
+// "number of versioning for alias run-time tests exceeds 10" -- and it silently emits
+// scalar code for what is ~40% of a frame. Sources are read-only, so they may alias
+// each other at a clamped border row.
+template <int CT>
+void stencil(int cdyn, const uint8_t *IF_RESTRICT a, const uint8_t *IF_RESTRICT b,
+             const uint8_t *IF_RESTRICT e, int WC, int16_t *IF_RESTRICT vs,
+             int16_t *IF_RESTRICT vd, uint8_t *IF_RESTRICT cmx, uint8_t *IF_RESTRICT cmn,
+             int16_t *IF_RESTRICT gx, int16_t *IF_RESTRICT gy)
+{
+  const int C = CT ? CT : cdyn;
+  for (int o = 0; o < WC; ++o)
+  {
+    vs[o] = (int16_t)(a[o] + 2 * b[o] + e[o]); // vertical Sobel: smooth, difference
+    vd[o] = (int16_t)(e[o] - a[o]);
+  }
+  for (int o = 0; o < WC; ++o) // uint8-wide, kept apart: one width per loop vectorizes
+  {
+    cmx[o] = a[o] > e[o] ? a[o] : e[o]; // the column's two off-centre rows; the
+    cmn[o] = a[o] < e[o] ? a[o] : e[o]; //   horizontal 3-window below completes it
+  }
+  for (int o = C; o < WC - C; ++o)
+  {
+    gx[o] = (int16_t)(vs[o + C] - vs[o - C]);
+    gy[o] = (int16_t)(vd[o - C] + 2 * vd[o] + vd[o + C]);
+  }
 }
 
 // Sweeps one row of `ncell` finest cells (each `cw` px wide) for one group of `n`
@@ -325,9 +358,43 @@ class FeatureComputer
   std::vector<int> pi_, pj_; // the pairs, in (i<j) lexicographic order
 
   // Per-row scratch, all interleaved (c * c_ + k) and padded by SIMD_PAD. One row
-  // is a few KB, so it stays hot in L1 across the whole cell sweep.
-  std::vector<uint8_t> r0_, r1_, r2_, cmx_, cmn_, mx_, mn_, lb_;
-  std::vector<int16_t> vs_, vd_, gx_, gy_;
+  // is a few KB, so it stays hot in L1 across the whole cell sweep. prepare_row
+  // overwrites all of it every row, so each band needs its own copy.
+  struct Scratch
+  {
+    std::vector<uint8_t> r0, r1, r2, cmx, cmn, mx, mn, lb;
+    std::vector<int16_t> vs, vd, gx, gy;
+    std::vector<int64_t> hsum;   // private hash partial; bands >0 only, and only if !hfast_
+    const uint8_t *vrow = nullptr; // centre row prepare_row settled on (image or scratch)
+  };
+  std::vector<Scratch> scr_;
+
+  // A band is a contiguous run of finest cell rows. Two bands therefore never touch
+  // the same accumulator, so the hot path needs no atomics and no locks -- and since
+  // every accumulator is an int64 sum that cannot overflow, the totals are identical
+  // to the serial order however the rows are split. Only the coarse-level rollup,
+  // derive() and the hash readout run after the join, all still serial.
+  struct Band
+  {
+    int r0, r1;   // image rows [r0, r1); the visited ones are those on the sy_ grid
+    int cy0, cy1; // the finest cell rows they land in, [cy0, cy1)
+  };
+  enum Job
+  {
+    JOB_ACC,
+    JOB_DERIVE
+  };
+  Job job_ = JOB_ACC;
+  std::vector<Band> bands_;
+
+  std::vector<std::thread> workers_;
+  std::mutex mu_;
+  std::condition_variable cv_go_, cv_done_;
+  const uint8_t *task_img_ = nullptr;
+  int64_t task_rs_ = 0, task_cs_ = 0;
+  uint64_t epoch_ = 0;
+  int pending_ = 0;
+  bool quit_ = false;
 
   // Perceptual-hash state (see HN/HS). Filled in the accumulate pass, derived at the end.
   std::vector<int64_t> hsum_;             // HN*HN*c_ : Sum(v) per hash cell per channel
@@ -459,44 +526,65 @@ class FeatureComputer
   // over columns -- the Sobel gradients and the 8-neighbour max/min envelopes. All
   // border clamping is confined here (two fix-up columns), so the SIMD cell loop
   // that follows is a straight walk with no bounds logic.
-  void prepare_row(const uint8_t *IF_RESTRICT img, int r, int64_t rs, int64_t cs)
+  void prepare_row(Scratch &s, const uint8_t *IF_RESTRICT img, int r, int64_t rs, int64_t cs)
   {
     const int hi_r = h_ - 1, WC = w_ * c_;
     const uint8_t *rows[3] = {img + (int64_t)clampi(r - 1, hi_r) * rs, img + (int64_t)r * rs,
                               img + (int64_t)clampi(r + 1, hi_r) * rs};
-    uint8_t *dst[3] = {r0_.data(), r1_.data(), r2_.data()};
-    for (int i = 0; i < 3; ++i)
+    const uint8_t *IF_RESTRICT a, *IF_RESTRICT b, *IF_RESTRICT e;
+    if (interleaved_)
     {
-      if (interleaved_)
-        std::memcpy(dst[i], rows[i], (size_t)WC);
-      else
+      // The source already has the layout we want, so read it in place: the copy was
+      // pure traffic, and with threading it was three copies per row per band. Only
+      // the centre row reaches accumulate_row, whose 4-lane LoadU may overrun a row by
+      // up to SIMD_CH-1 bytes -- harmless mid-image, so copy just the final row.
+      a = rows[0];
+      e = rows[2];
+      b = rows[1];
+      if (r == hi_r)
+      {
+        std::memcpy(s.r1.data(), rows[1], (size_t)WC);
+        b = s.r1.data();
+      }
+    }
+    else
+    {
+      uint8_t *dst[3] = {s.r0.data(), s.r1.data(), s.r2.data()};
+      for (int i = 0; i < 3; ++i)
         for (int c = 0; c < w_; ++c)
           for (int k = 0; k < c_; ++k)
             dst[i][(size_t)c * c_ + k] = rows[i][(int64_t)c * cs + coff_[k]];
+      a = s.r0.data();
+      b = s.r1.data();
+      e = s.r2.data();
     }
+    s.vrow = b;
     // Alias every scratch buffer through a restrict pointer: via the std::vector
     // members the compiler cannot prove the reads and writes are disjoint, and it
     // silently drops the flat loops below back to scalar.
-    const uint8_t *IF_RESTRICT a = r0_.data(), *IF_RESTRICT b = r1_.data(),
-                               *IF_RESTRICT e = r2_.data();
-    const uint8_t *IF_RESTRICT cmx = cmx_.data(), *IF_RESTRICT cmn = cmn_.data();
-    uint8_t *IF_RESTRICT mx = mx_.data(), *IF_RESTRICT mn = mn_.data(),
-                         *IF_RESTRICT lb = lb_.data();
-    // Three flat, branch-free loops over W*C, each auto-vectorized (the uint8 min/max
-    // ones 16 lanes wide). Kept separate so no loop carries a mixed-width dependency
-    // the vectorizer would refuse.
-    for (int o = 0; o < WC; ++o)
-    {
-      vs_[o] = (int16_t)(a[o] + 2 * b[o] + e[o]); // vertical Sobel: smooth, difference
-      vd_[o] = (int16_t)(e[o] - a[o]);
-      cmx_[o] = a[o] > e[o] ? a[o] : e[o]; // the column's two off-centre rows; the
-      cmn_[o] = a[o] < e[o] ? a[o] : e[o]; //   horizontal 3-window below completes it
-    }
+    // Alias every scratch buffer through a restrict pointer: reached via the vectors
+    // the compiler cannot prove the reads and writes are disjoint, and it silently
+    // drops the flat loops below back to scalar.
+    uint8_t *IF_RESTRICT cmx = s.cmx.data(), *IF_RESTRICT cmn = s.cmn.data();
+    uint8_t *IF_RESTRICT mx = s.mx.data(), *IF_RESTRICT mn = s.mn.data(),
+                         *IF_RESTRICT lb = s.lb.data();
+    int16_t *IF_RESTRICT vs = s.vs.data(), *IF_RESTRICT vd = s.vd.data();
+    int16_t *IF_RESTRICT gx = s.gx.data(), *IF_RESTRICT gy = s.gy.data();
     const int C = c_;
-    for (int o = C; o < WC - C; ++o)
+    switch (C) // specialise the common channel counts; see stencil()
     {
-      gx_[o] = (int16_t)(vs_[o + C] - vs_[o - C]);
-      gy_[o] = (int16_t)(vd_[o - C] + 2 * vd_[o] + vd_[o + C]);
+    case 1:
+      stencil<1>(C, a, b, e, WC, vs, vd, cmx, cmn, gx, gy);
+      break;
+    case 3:
+      stencil<3>(C, a, b, e, WC, vs, vd, cmx, cmn, gx, gy);
+      break;
+    case 4:
+      stencil<4>(C, a, b, e, WC, vs, vd, cmx, cmn, gx, gy);
+      break;
+    default:
+      stencil<0>(C, a, b, e, WC, vs, vd, cmx, cmn, gx, gy);
+      break;
     }
     // 8-neighbour envelopes. The centre is excluded from its own: the middle row
     // contributes only b[o-C] and b[o+C] -- which collapse onto the centre at a border
@@ -547,45 +635,135 @@ class FeatureComputer
       for (int o : {k, last + k})
       {
         const int om = o == k ? k : last - step + k, op = o == k ? k + step : last + k;
-        gx_[o] = (int16_t)(vs_[op] - vs_[om]);
-        gy_[o] = (int16_t)(vd_[om] + 2 * vd_[o] + vd_[op]);
+        gx[o] = (int16_t)(vs[op] - vs[om]);
+        gy[o] = (int16_t)(vd[om] + 2 * vd[o] + vd[op]);
         mx[o] = std::max({cmx[om], cmx[o], cmx[op], b[om], b[op]});
         mn[o] = std::min({cmn[om], cmn[o], cmn[op], b[om], b[op]});
         lb[o] = lbp_riu2(a, b, e, om, o, op);
       }
   }
 
-  void accumulate(const uint8_t *IF_RESTRICT img, int64_t rs, int64_t cs, int64_t chs)
+  // One band's rows. Reads only its own Scratch and writes only its own cell rows.
+  void accumulate_band(const uint8_t *IF_RESTRICT img, int64_t rs, int64_t cs, int bi)
   {
     Level &fine = levels_[0];
     const int nfx = fine.nx, cw = w_ / nfx;
     int64_t *IF_RESTRICT fb = fine.buf.data();
-    std::fill(fine.buf.begin(), fine.buf.end(), (int64_t)0);
-    std::fill(fine.xbuf.begin(), fine.xbuf.end(), (int64_t)0);
+    Scratch &s = scr_[bi];
+    // Clear this band's own slice rather than the whole buffer up front: it takes the
+    // zeroing off the serial path and warms the lines the band is about to write.
+    const size_t cs0 = (size_t)bands_[bi].cy0 * nfx, cs1 = (size_t)bands_[bi].cy1 * nfx;
+    std::fill(fine.buf.begin() + cs0 * c_ * NSUM, fine.buf.begin() + cs1 * c_ * NSUM, (int64_t)0);
+    if (np_)
+      std::fill(fine.xbuf.begin() + cs0 * np_, fine.xbuf.begin() + cs1 * np_, (int64_t)0);
+    int64_t *IF_RESTRICT hs = hfast_ ? nullptr : (bi ? s.hsum.data() : hsum_.data());
+    namespace hn = hwy::HWY_NAMESPACE;
+    const int L = (int)hn::Lanes(hn::CappedTag<int32_t, SIMD_CH>());
+    for (int r = bands_[bi].r0; r < bands_[bi].r1; r += sy_)
+    {
+      prepare_row(s, img, r, rs, cs);
+      int64_t *IF_RESTRICT rb = fb + (size_t)(row_cell_[r] * nfx) * c_ * NSUM;
+      for (int ch0 = 0; ch0 < c_; ch0 += L)
+        accumulate_row(s.gx.data(), s.gy.data(), s.vrow, s.mx.data(), s.mn.data(), s.lb.data(),
+                       c_, ch0, cw, nfx, std::min(L, c_ - ch0), sx_, hcx_, hcy_, c_ * NSUM,
+                       rb + (size_t)ch0 * NSUM);
+      if (np_)
+        accumulate_cross_row(s.vrow, c_, cw, nfx, sx_, np_, pi_.data(), pj_.data(),
+                             fine.xbuf.data() + (size_t)(row_cell_[r] * nfx) * np_);
+      if (!hfast_)
+        accumulate_hash_row(s.vrow, c_, sx_, hrbeg_.data(), hrend_.data(), hrhc_.data(),
+                            (int)hrhc_.size(), hs + (size_t)hrow_[r] * HN * c_);
+    }
+  }
+
+  void worker(int bi)
+  {
+    uint64_t seen = 0;
+    for (;;)
+    {
+      std::unique_lock<std::mutex> lk(mu_);
+      cv_go_.wait(lk, [&] { return quit_ || epoch_ != seen; });
+      if (quit_)
+        return;
+      seen = epoch_;
+      const Job j = job_;
+      lk.unlock();
+      if (j == JOB_ACC)
+        accumulate_band(task_img_, task_rs_, task_cs_, bi);
+      else
+        derive_cells(bi);
+      lk.lock();
+      if (--pending_ == 0)
+        cv_done_.notify_one();
+    }
+  }
+
+  // Workers park on a condvar between frames, so a frame costs one broadcast and one
+  // barrier rather than thread creation. Parking (not spinning) is deliberate: the
+  // cores are expected to be shared with other real-time work between frames.
+  void run_job(Job j)
+  {
+    const int nb = (int)bands_.size();
+    auto one = [&](int bi) {
+      if (j == JOB_ACC)
+        accumulate_band(task_img_, task_rs_, task_cs_, bi);
+      else
+        derive_cells(bi);
+    };
+    if (workers_.empty())
+    {
+      for (int bi = 0; bi < nb; ++bi)
+        one(bi);
+      return;
+    }
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      job_ = j;
+      pending_ = nb - 1;
+      ++epoch_;
+    }
+    cv_go_.notify_all();
+    one(0); // the calling thread takes the first band
+    std::unique_lock<std::mutex> lk(mu_);
+    cv_done_.wait(lk, [&] { return pending_ == 0; });
+  }
+
+  void pool_stop()
+  {
+    if (workers_.empty())
+      return;
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      quit_ = true;
+    }
+    cv_go_.notify_all();
+    for (std::thread &t : workers_)
+      t.join();
+    workers_.clear();
+    quit_ = false;
+  }
+
+  void accumulate(const uint8_t *IF_RESTRICT img, int64_t rs, int64_t cs, int64_t chs)
+  {
     if (!hfast_)
+    {
       std::fill(hsum_.begin(), hsum_.end(), (int64_t)0);
+      for (size_t b = 1; b < scr_.size(); ++b)
+        std::fill(scr_[b].hsum.begin(), scr_[b].hsum.end(), (int64_t)0);
+    }
 
     for (int k = 0; k < c_; ++k)
       coff_[k] = (int64_t)chan_[k] * chs;
     interleaved_ = chs == 1 && cs == c_ && chan_[0] == 0 && chan_.back() == c_ - 1;
+    task_img_ = img;
+    task_rs_ = rs;
+    task_cs_ = cs;
+    run_job(JOB_ACC);
 
-    namespace hn = hwy::HWY_NAMESPACE;
-    const int L = (int)hn::Lanes(hn::CappedTag<int32_t, SIMD_CH>());
-    for (int r = 0; r < h_; r += sy_)
-    {
-      prepare_row(img, r, rs, cs);
-      int64_t *IF_RESTRICT rb = fb + (size_t)(row_cell_[r] * nfx) * c_ * NSUM;
-      for (int ch0 = 0; ch0 < c_; ch0 += L)
-        accumulate_row(gx_.data(), gy_.data(), r1_.data(), mx_.data(), mn_.data(), lb_.data(),
-                       c_, ch0, cw, nfx, std::min(L, c_ - ch0), sx_, hcx_, hcy_, c_ * NSUM,
-                       rb + (size_t)ch0 * NSUM);
-      if (np_)
-        accumulate_cross_row(r1_.data(), c_, cw, nfx, sx_, np_, pi_.data(), pj_.data(),
-                             fine.xbuf.data() + (size_t)(row_cell_[r] * nfx) * np_);
-      if (!hfast_)
-        accumulate_hash_row(r1_.data(), c_, sx_, hrbeg_.data(), hrend_.data(), hrhc_.data(),
-                            (int)hrhc_.size(), hsum_.data() + (size_t)hrow_[r] * HN * c_);
-    }
+    if (!hfast_) // fold the bands' private hash partials; int64 sums, so still exact
+      for (size_t b = 1; b < scr_.size(); ++b)
+        for (size_t t = 0; t < hsum_.size(); ++t)
+          hsum_[t] += scr_[b].hsum[t];
 
     const int stripe = c_ * NSUM;
     for (size_t lvl = 1; lvl < levels_.size(); ++lvl)
@@ -631,13 +809,16 @@ class FeatureComputer
   static void fold_summary(const T *IF_RESTRICT v, int n, T *IF_RESTRICT mn,
                            T *IF_RESTRICT mx, double *IF_RESTRICT sm, double *IF_RESTRICT sq)
   {
+    for (int j = 0; j < n; ++j) // split by width: a mixed T/double body will not vectorize
+    {
+      mn[j] = std::min(mn[j], v[j]);
+      mx[j] = std::max(mx[j], v[j]);
+    }
     for (int j = 0; j < n; ++j)
     {
-      const T x = v[j];
-      mn[j] = std::min(mn[j], x);
-      mx[j] = std::max(mx[j], x);
-      sm[j] += (double)x;
-      sq[j] += (double)x * (double)x;
+      const double x = (double)v[j];
+      sm[j] += x;
+      sq[j] += x * x;
     }
   }
 
@@ -753,8 +934,36 @@ class FeatureComputer
     }
   }
 
+  // Per-cell derivation. Every cell writes only its own feat/mom/xfeat slice, so this
+  // splits over bands. The cross-cell summary fold is deliberately NOT here: its sum
+  // and sum-of-squares are float64 reductions over cells, and splitting them would
+  // reassociate the additions and make the output depend on the thread count. It stays
+  // serial in derive(), below.
+  void derive_cells(int bi)
+  {
+    const size_t nb = bands_.size();
+    for (Level &L : levels_)
+    {
+      const size_t nc = (size_t)L.ny * L.nx;
+      for (size_t cell = nc * (size_t)bi / nb; cell < nc * (size_t)(bi + 1) / nb; ++cell)
+      {
+        const int64_t *IF_RESTRICT s = L.buf.data() + cell * c_ * NSUM;
+        double *IF_RESTRICT m = L.mom.data() + cell * c_ * NMOM;
+        for (int k = 0; k < c_; ++k)
+        {
+          derive_moments(s + (size_t)k * NSUM, m + (size_t)k * NMOM);
+          derive_cell(s + (size_t)k * NSUM, m + (size_t)k * NMOM,
+                      L.feat.data() + (cell * c_ + k) * NF);
+        }
+        if (np_)
+          derive_cross(m, s[CNT], L.xbuf.data() + cell * np_, L.xfeat.data() + cell * np_ * NXF);
+      }
+    }
+  }
+
   void derive()
   {
+    run_job(JOB_DERIVE);
     // Largest finite values, NOT +/-inf: -ffast-math implies -ffinite-math-only, under
     // which some compilers (e.g. Apple clang) miscompile a min/max reduction seeded with
     // infinity and leave the accumulator at its init. FLT_MAX/-FLT_MAX are equivalent for
@@ -778,22 +987,13 @@ class FeatureComputer
       std::fill_n(msq, c_ * NMOM, 0.0);
       const size_t nc = (size_t)L.ny * L.nx;
       for (size_t cell = 0; cell < nc; ++cell)
-      {
-        const int64_t *IF_RESTRICT s = L.buf.data() + cell * c_ * NSUM;
-        double *IF_RESTRICT m = L.mom.data() + cell * c_ * NMOM;
         for (int k = 0; k < c_; ++k)
         {
-          double *IF_RESTRICT mk = m + (size_t)k * NMOM;
-          float *IF_RESTRICT fk = L.feat.data() + (cell * c_ + k) * NF;
-          derive_moments(s + (size_t)k * NSUM, mk);
-          derive_cell(s + (size_t)k * NSUM, mk, fk);
+          const double *IF_RESTRICT mk = L.mom.data() + cell * c_ * NMOM + (size_t)k * NMOM;
+          const float *IF_RESTRICT fk = L.feat.data() + (cell * c_ + k) * NF;
           fold_summary(fk, NF, &fmn[k * NF], &fmx[k * NF], &fsm[k * NF], &fsq[k * NF]);
           fold_summary(mk, NMOM, &mmn[k * NMOM], &mmx[k * NMOM], &msm[k * NMOM], &msq[k * NMOM]);
         }
-        if (np_)
-          derive_cross(m, s[CNT], L.xbuf.data() + cell * np_,
-                       L.xfeat.data() + cell * np_ * NXF);
-      }
       for (int k = 0; k < c_; ++k)
       {
         write_summary(NF, nc, &fmn[k * NF], &fmx[k * NF], &fsm[k * NF], &fsq[k * NF],
@@ -817,8 +1017,9 @@ public:
 
   void set_config(const std::vector<int64_t> &dims, const std::vector<int> &channels,
                   const std::vector<std::vector<int>> &grids,
-                  const std::vector<int64_t> &stride)
+                  const std::vector<int64_t> &stride, int threads)
   {
+    pool_stop();
     h_ = (int)dims[0];
     w_ = (int)dims[1];
     chan_ = channels;
@@ -894,19 +1095,6 @@ public:
       row_cell_[r] = (int)((int64_t)r * levels_[0].ny / h_);
 
     coff_.assign(c_, 0);
-    const size_t wcp = (size_t)c_ * w_ + SIMD_PAD;
-    r0_.assign(wcp, 0);
-    r1_.assign(wcp, 0);
-    r2_.assign(wcp, 0);
-    cmx_.assign(wcp, 0);
-    cmn_.assign(wcp, 0);
-    mx_.assign(wcp, 0);
-    mn_.assign(wcp, 0);
-    lb_.assign(wcp, 0);
-    vs_.assign(wcp, 0);
-    vd_.assign(wcp, 0);
-    gx_.assign(wcp, 0);
-    gy_.assign(wcp, 0);
 
     graw_.assign((size_t)c_ * NSUM, 0);
     gfeat_.assign((size_t)c_ * NF, 0.0f);
@@ -976,7 +1164,40 @@ public:
     whash_.assign((size_t)c_, 0);
     phash_.assign((size_t)c_, 0);
     hshape_ = {(size_t)c_};
+
+    // Split the finest cell rows evenly, then map each band back to image rows:
+    // row_cell_[r] >= a  <=>  r >= ceil(a * h_ / ny), so the ranges tile [0, h_)
+    // exactly. Rounding r0 up to the sy_ grid keeps the visited set identical to
+    // the serial walk -- every row is still touched, by exactly one band.
+    const int ncy = levels_[0].ny, nb = std::min(threads > 1 ? threads : 1, ncy);
+    bands_.clear();
+    for (int t = 0; t < nb; ++t)
+    {
+      const int a = (int)((int64_t)t * ncy / nb), z = (int)((int64_t)(t + 1) * ncy / nb);
+      int r0 = (int)(((int64_t)a * h_ + ncy - 1) / ncy);
+      const int r1 = (int)(((int64_t)z * h_ + ncy - 1) / ncy);
+      r0 = (r0 + sy_ - 1) / sy_ * sy_;
+      bands_.push_back({r0, r1, a, z});
+    }
+    const size_t wcp = (size_t)c_ * w_ + SIMD_PAD;
+    scr_.assign(bands_.size(), Scratch());
+    for (size_t b = 0; b < scr_.size(); ++b)
+    {
+      Scratch &s = scr_[b];
+      for (std::vector<uint8_t> *v : {&s.r0, &s.r1, &s.r2, &s.cmx, &s.cmn, &s.mx, &s.mn, &s.lb})
+        v->assign(wcp, 0);
+      for (std::vector<int16_t> *v : {&s.vs, &s.vd, &s.gx, &s.gy})
+        v->assign(wcp, 0);
+      if (b && !hfast_)
+        s.hsum.assign((size_t)HN * HN * c_, 0);
+    }
+    for (size_t b = 1; b < bands_.size(); ++b)
+      workers_.emplace_back([this, b] { worker((int)b); });
   }
+
+  int threads() const { return (int)bands_.size(); }
+
+  ~FeatureComputer() { pool_stop(); }
 
   // The channel pairs, as flat [i0, j0, i1, j1, ...]; empty when cross-channel is off.
   std::vector<int> pairs() const
@@ -1069,10 +1290,15 @@ NB_MODULE(imfeat_core, m)
   m.attr("HB") = HB;     // HOG orientation-bin count; Python derives its bin labels from this
   m.attr("LBPB") = LBPB; // LBP^riu2 bin count (9 uniform + 1 non-uniform)
   m.attr("XMAX") = XMAX; // cross-channel products are computed only for C <= XMAX
+  m.def("cpu_count", [] { //  0 when the runtime cannot tell; callers see at least 1
+    const unsigned n = std::thread::hardware_concurrency();
+    return (int)(n ? n : 1u);
+  });
   nb::class_<FeatureComputer>(m, "_FeatureComputerImpl")
       .def(nb::init<>())
       .def("set_config", &FeatureComputer::set_config, nb::arg("dims"), nb::arg("channels"),
-           nb::arg("grids"), nb::arg("stride"))
+           nb::arg("grids"), nb::arg("stride"), nb::arg("threads"))
+      .def("threads", &FeatureComputer::threads)
       .def("pairs", &FeatureComputer::pairs)
       .def(
           "raw",

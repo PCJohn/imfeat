@@ -47,16 +47,17 @@ import numpy as np
 from . import imfeat_core as _core  # type: ignore[attr-defined]
 
 __all__ = [
-    "FeatureComputer",
-    "MOMENTS",
-    "FEATURES",
-    "HOG_FEATURES",
     "COUNT_FEATURES",
-    "LBP_FEATURES",
     "CROSS_FEATURES",
     "DESCRIPTOR_FEATURES",
-    "SUMMARY_STATS",
+    "FEATURES",
     "HASHES",
+    "HOG_FEATURES",
+    "LBP_FEATURES",
+    "MOMENTS",
+    "SUMMARY_STATS",
+    "FeatureComputer",
+    "cpu_count",
 ]
 __version__ = "0.1.0"
 
@@ -153,6 +154,12 @@ class FeatureComputer:
     channel_axis : which axis of a multi-channel input holds channels (default
                    -1). Ignored for 2-D input. The other two axes, in order, are
                    (H, W). Read in place via a zero-copy transpose.
+    threads      : worker threads for the accumulate pass (default 1, no threads
+                   created). Rows are split into disjoint bands of finest cell
+                   rows, so the output is bit-identical at any thread count. The
+                   calling thread runs one band itself, so ``threads=2`` adds one
+                   worker. Capped at the finest grid's row count; ``.threads``
+                   reports what was actually used. See ``cpu_count()``.
 
     A single all-frame "global" reduction is returned alongside the grid levels.
     """
@@ -164,6 +171,7 @@ class FeatureComputer:
         stride: int | Sequence[int] | None = None,
         channels: Sequence[int] | None = None,
         channel_axis: int = -1,
+        threads: int = 1,
     ) -> None:
         shape = tuple(int(s) for s in shape)
         ndim = len(shape)
@@ -186,7 +194,11 @@ class FeatureComputer:
         self._grid = _parse_grid(grid)
         self._keys = [str(i) for i in range(len(self._grid))] + ["global"]
         self._impl = _core._FeatureComputerImpl()
-        self._impl.set_config([h, w, c], chan, self._grid, _parse_stride(stride))
+        self._impl.set_config(
+            [h, w, c], chan, self._grid, _parse_stride(stride), max(1, int(threads))
+        )
+        #: bands actually used, i.e. threads participating including the caller's.
+        self.threads: int = self._impl.threads()
         p = self._impl.pairs()
         #: pairs of *selected*-channel indices carried by the "xchan_*" maps, in order.
         #: Empty for a single channel and for C > imfeat_core.XMAX (hyperspectral).
@@ -204,10 +216,18 @@ class FeatureComputer:
 
     def _cut(self, a: np.ndarray, widths: Sequence[tuple[str, int]], i: str) -> dict:
         """Slice one wide (..., C, W) array into its feature groups, dropping the
-        size-1 channel axis for single-channel (2-D) input."""
-        out, o = {}, 0
+        size-1 channel axis for single-channel (2-D) input.
+
+        One flat copy up front, then views into it. Copying group by group instead is
+        a strided gather per group (stride = the full width W), which measures ~13x
+        slower and, once the accumulate pass was threaded, was the entire serial tail.
+        The copy means the returned arrays own their data and stay valid across later
+        calls, exactly as before -- but all groups from one level now share a single
+        base array, so holding one group retains the whole level.
+        """
+        b, out, o = a.copy(), {}, 0
         for name, n in widths:
-            v = a[..., o : o + n].copy()
+            v = b[..., o : o + n]
             out[f"{name}_{i}"] = v[..., 0, :] if self._chan_axis is None else v
             o += n
         return out
@@ -216,11 +236,13 @@ class FeatureComputer:
         """Slice one (C, F, NST) cross-cell summary into per-group "<name>_summary_i"
         arrays (last axis = SUMMARY_STATS), dropping the size-1 channel axis for
         single-channel (2-D) input."""
-        out, o = {}, 0
+        # core buffer is (C, F, NST); expose as (F, C, NST) so the channel axis is
+        # second-to-last (as in every other map), then drop it for 2-D input. Transpose
+        # once for the whole array rather than per group -- and since the groups then
+        # split along the leading axis, each one comes out contiguous.
+        b, out, o = np.ascontiguousarray(a.transpose(1, 0, 2)), {}, 0
         for name, n in widths:
-            # core buffer is (C, F, NST); expose as (F, C, NST) so the channel axis is
-            # second-to-last (as in every other map), then drop it for 2-D input.
-            v = np.ascontiguousarray(a[:, o : o + n, :].transpose(1, 0, 2))
+            v = b[o : o + n]
             out[f"{name}_summary_{i}"] = v[:, 0, :] if self._chan_axis is None else v
             o += n
         return out
@@ -284,3 +306,11 @@ class FeatureComputer:
         for name, h in zip(HASHES, hashes):
             out[name] = h.copy() if self._chan_axis is not None else h[0].copy()
         return out
+
+
+def cpu_count() -> int:
+    """Logical cores the runtime reports, so callers can budget `threads` against
+    whatever else shares the machine. Never returns less than 1. This is the raw
+    hardware count: it does not know about cgroup/container quotas, other
+    processes, or the P/E-core split on hybrid CPUs."""
+    return int(_core.cpu_count())
