@@ -401,12 +401,40 @@ cell reduction.
 | `cross` | per level, `(H, W, P, 2)` over `CROSS_FEATURES` | float32 |
 | `hashes` | `(3, C)` over `HASHES`, whole-frame | uint64 |
 
-`maps` is NHWC with the channel axis C-major over `FEATURE_NAMES`, so on a 256² thumbnail
-with a 4-level grid it is `(32,32,114) (16,16,114) (8,8,114) (4,4,114)` — an FPN P3–P6 shape
-family that feeds a detector neck or a per-cell tree model directly. `moments` repeats the
-trailing four channels of `maps` at full precision: m3 and m4 span a range float32 cannot hold
-to the accuracy the oracle tests require, so use `moments` when precision matters and `maps`
-when feeding a model.
+`maps` is NHWC, so it feeds a convolutional neck or a per-cell tree model directly. The
+channel axis is **C-major over `FEATURE_NAMES`**: channel 0's 38 features, then channel 1's,
+and so on, so `m.reshape(H, W, C, 38)` is a free view when you want the channel and feature
+axes separated. `moments` repeats the trailing four features of `maps` at full precision:
+m3 and m4 span a range float32 cannot hold to the accuracy the oracle tests require, so use
+`moments` when precision matters and `maps` when feeding a model.
+
+The levels form a **dyadic feature pyramid**, finest first, each level half the resolution of
+the one before and the last a single global cell. That is an FPN P3–P6 shape family, so an
+FPN/BiFPN neck, a shared-weight dense head, or a U-Net decoder can consume it as-is. On a
+1024² input with `grid=[(6,6),(5,5),(4,4),(3,3),(2,2),(1,1)]` and `C=3`:
+
+| level | shape | stride vs input |
+|---|---|---|
+| 0 | `(64, 64, 114)` | 16 |
+| 1 | `(32, 32, 114)` | 32 |
+| 2 | `(16, 16, 114)` | 64 |
+| 3 | `(8, 8, 114)` | 128 |
+| 4 | `(4, 4, 114)` | 256 |
+| 5 | `(2, 2, 114)` | 512 |
+| global | `(114,)` | whole frame |
+
+For **dense prediction** — segmentation, depth, any per-pixel head — the finest level is the
+one that sets your output resolution, and it is a cell grid rather than a pixel grid: level 0
+above predicts at stride 16. Push `grid` finer for a denser map (`(7,7)` gives stride 8 on a
+1024² input) and remember the constraint that comes with it — a cell needs roughly four
+sampled pixels per dimension for its moment and histogram features to mean anything, so
+`cell_px / stride >= 4`. At stride 8 with `stride=2` that is satisfied; at stride 8 with
+`stride=4` it is not. Upsampling a coarse cell grid to pixel resolution is a decoder's job,
+not something to fix by starving the cells.
+
+The finest level is also the only one you strictly need: every coarser level is a pure sum
+of the one below it, so a decoder can rebuild them, and they are provided because computing
+them during the single pass costs almost nothing.
 
 Every feature is per-pixel normalised, so no level carries a cell-area factor and one
 shared-weight head can read every level. The channels do span a very wide dynamic range
