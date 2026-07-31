@@ -133,14 +133,10 @@ class Pyramid(NamedTuple):
 
 
 _NS_RAW = 4  # raw structure-tensor width [Sxx, Syy, Sxy, count]
-_NS_FEAT = len(FEATURES)  # derived structure-tensor width = 5
 _NH = len(HOG_FEATURES)  # HOG bins
 _NC = len(COUNT_FEATURES)  # 2
 _NM = len(MOMENTS)  # 4
 _NL = len(LBP_FEATURES)  # 10
-_NX = len(CROSS_FEATURES)  # 2
-_ND = len(DESCRIPTOR_FEATURES)  # 8
-_NST = len(SUMMARY_STATS)  # 4
 
 
 def _parse_grid(grid: GridSpec) -> list[list[int]]:
