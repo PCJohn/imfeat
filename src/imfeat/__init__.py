@@ -1,4 +1,4 @@
-"""imfeat -- fast single-pass image feature extraction (moments + structure).
+"""imfeat -- fast single-pass image feature extraction on CPU.
 
 One traversal of the image produces, per pyramid cell per channel:
 
@@ -7,10 +7,10 @@ One traversal of the image produces, per pyramid cell per channel:
   * an L1-normalised HOG                 (9 orientation bins over [0, pi))
   * extrema densities                    [local_max, local_min]
   * an LBP^riu2_{8,1} histogram          (10 rotation-invariant uniform-LBP bins)
+  * derived nonlinear descriptors        (DESCRIPTOR_FEATURES, 8)
 
-and, once per cell (not per channel), for every pair of channels:
-
-  * cross-channel                        [cov, corr]
+plus, per cell, [cov, corr] for every pair of channels, and three whole-frame perceptual
+hashes (aHash / wHash / pHash) per channel.
 
 Every accumulator is an additive integer sum, so coarser pyramid levels and the
 frame-wide "global" reduction are exact sums of the finest cells -- depth is free
@@ -18,19 +18,20 @@ and the image is read exactly once. The nonlinear parts (eigenvalues, central
 moments, histogram normalisation) are derived once per cell at the end.
 
 Input is one uint8 image: 2-D ``(H, W)``, or multi-channel in OpenCV order
-``(H, W, C)`` for any C (set ``channel_axis`` for a different layout). Every
-channel is processed in the SAME spatial pass and appears as its own axis in the
-output (that axis is dropped for 2-D input).
+``(H, W, C)`` for any C (set ``channel_axis`` for a different layout).
 
     import imfeat
 
     fc = imfeat.FeatureComputer(shape=(256, 256, 3), grid=[(5, 5), (4, 4)])
-    f = fc.features(hsv_u8)
-    f["mom_0"]       # (32, 32, 3, 4)  float64  [mean, var, m3, m4]
-    f["struct_0"]    # (32, 32, 3, 5)  float32
-    f["hog_0"]       # (32, 32, 3, 9)  float32
-    f["cnt_0"]       # (32, 32, 3, 2)  float32
-    f["mom_global"]  # (3, 4)          whole-frame per-channel moments
+    p = fc.features(hsv_u8)
+    p.maps[0]      # (32, 32, 114) float32, 3 channels x FEATURE_NAMES, channel-major
+    p.maps[-1]     # (114,)        global level
+    p.moments[0]   # (32, 32, 3, 4) float64 MOMENTS at full precision
+    p.summary[0]   # (38, 3, 4)    float64 SUMMARY_STATS of each feature across cells
+    p.cross[0]     # (32, 32, 3, 2) float32 CROSS_FEATURES per channel pair
+    p.hashes       # (3, 3)        uint64  HASHES x channel
+
+``compute()`` returns the raw int64 accumulators instead, as a dict per group.
 
 Grid cells use floor division (``cell = row * n_cells // H``), so any shape works
 and, because cell counts are powers of two, level k's cell index is level 0's

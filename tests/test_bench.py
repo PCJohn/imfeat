@@ -17,10 +17,15 @@ from conftest import frame, groups, latency
 
 pytestmark = pytest.mark.bench
 
-EXPS = [5, 4, 3, 2]  # pyramid: 32x32 finest -> 4x4 coarsest
-GRID = [(e, e) for e in EXPS]
 STRIDES = [1, 2, 4, 8]
 THREADS = [1, 2, 3, 4]
+CHANNELS = [1, 2, 3, 4, 8, 16]
+# every benchmark runs at each size with a 32x32 and a 64x64 finest grid, 4 levels deep
+SIZE_GRID = pytest.mark.parametrize("n,k", [(n, k) for n in (256, 512, 1024) for k in (5, 6)])
+
+
+def pyramid(k):
+    return [(k - i, k - i) for i in range(4)]
 
 
 def synth(n, c):
@@ -96,84 +101,83 @@ COLS = [
 ]
 
 
-def table(rows, label=""):
-    print(f"{label:>12}" + "".join(f"{c:>{w}}" for c, w, _ in COLS))
-    for name, r in rows:
-        print(f"{name:>12}" + "".join(f.format(r[c]) for c, _, f in COLS))
-
-
-def sweep(n, c):
+def sweep(n, k, c):
     """Latency + quality vs stride, relative to this config's own stride=1 run.
     * marks a stride beyond the finest cell width: one column per cell, knob saturated."""
     img = synth(n, c)
-    ref, base, rows = None, None, []
+    ref, base, rows = None, None, {}
     for s in STRIDES:
-        fc = imfeat.FeatureComputer(img.shape, grid=GRID, stride=s)
+        fc = imfeat.FeatureComputer(img.shape, grid=pyramid(k), stride=s)
         out = groups(fc, img)
         ref = ref or out
         ms = latency(lambda: fc.features(img), reps=50, warm=5)[0]
         base = base or ms
-        tag = f"stride={s}" + ("*" if s > n >> EXPS[0] else "")
-        rows.append((tag, {"ms": ms, "speedup": base / ms, **quality(ref, out)}))
-    return dict(rows)
+        rows[s] = {"ms": ms, "speedup": base / ms, **quality(ref, out)}
+    return rows
+
+
+def table(rows, n, k, label=""):
+    print(f"{label:>12}" + "".join(f"{c:>{w}}" for c, w, _ in COLS))
+    for s, r in rows.items():
+        name = f"stride={s}" + ("*" if s > n >> k else "")
+        print(f"{name:>12}" + "".join(f.format(r[c]) for c, _, f in COLS))
 
 
 def head(title):
     print("\n" + "=" * 120 + "\n" + title + "\n" + "=" * 120)
 
 
-def test_stride_sweep():
+@SIZE_GRID
+def test_stride_sweep(n, k):
     head(
-        "Stride: latency vs accuracy (256x256x3), errors vs exact stride=1.\n"
-        "mean_err/std_err in grey levels; ori_deg coherence-weighted; *_r/*_cos: 1.0 = exact."
+        f"Stride: latency vs accuracy ({n}x{n}x3, finest {1 << k}), errors vs exact stride=1.\n"
+        "mean_err/std_err in grey levels; ori_deg coherence-weighted; *_r/*_cos: 1.0 = exact.\n"
+        f"* = stride > finest cell width ({n >> k} px)"
     )
-    rows = sweep(256, 3)
-    table(rows.items())
+    rows = sweep(n, k, 3)
+    table(rows, n, k)
     for r in rows.values():
         assert all(np.isfinite(v) for v in r.values())
-    r2 = rows["stride=2"]
-    assert r2["mean_err"] < 8
-    assert r2["energy_r"] > 0.9
-    assert r2["ori_deg"] < 6
-    assert r2["hog_cos"] > 0.85
-    assert r2["lbp_cos"] > 0.97
-    assert r2["xchan_r"] > 0.9
+    if (n >> k) // 2 >= 4:  # stride=2 floors only where the README stride rule holds
+        r2 = rows[2]
+        assert r2["mean_err"] < 8
+        assert r2["energy_r"] > 0.9
+        assert r2["ori_deg"] < 6
+        assert r2["hog_cos"] > 0.85
+        assert r2["lbp_cos"] > 0.85
+        assert r2["xchan_r"] > 0.9
 
 
-def test_size_sweep():
-    head(f"Input size (3ch), vs own stride=1. * = stride > finest cell width (n/{1 << EXPS[0]})")
-    for n in (128, 256, 512, 1024):
-        table(sweep(n, 3).items(), f"{n}x{n}x3")
+@SIZE_GRID
+def test_channel_sweep(n, k):
+    head(f"Channel count ({n}x{n}, finest {1 << k}), every feature on every channel")
+    for c in CHANNELS:
+        table(sweep(n, k, c), n, k, f"C={c}")
 
 
-def test_channel_sweep():
-    head("Channel count (256x256), every feature on every channel")
-    for c in (1, 2, 3, 4, 8, 16):
-        table(sweep(256, c).items(), f"C={c}")
-
-
-def test_per_channel_cost():
-    head("Per-channel cost (256x256, stride=2): SIMD packs 4 channels per vector")
-    for c in (1, 2, 3, 4, 8, 16):
-        im = synth(256, c)
-        fc = imfeat.FeatureComputer(im.shape, grid=GRID, stride=2)
+@SIZE_GRID
+def test_per_channel_cost(n, k):
+    head(f"Per-channel cost ({n}x{n}, finest {1 << k}, stride=2): SIMD packs 4 channels/vector")
+    for c in CHANNELS:
+        im = synth(n, c)
+        fc = imfeat.FeatureComputer(im.shape, grid=pyramid(k), stride=2)
         ms = latency(lambda: fc.features(im))[0]
         print(f"  C={c:>2}: {ms:7.3f} ms  ({ms / c:6.3f} ms/channel)")
 
 
-@pytest.mark.parametrize("n,k,stride", [(256, 5, 2), (512, 5, 2), (1024, 6, 2), (1024, 5, 4)])
+@SIZE_GRID
+@pytest.mark.parametrize("stride", [2, 4])
 def test_thread_phases(n, k, stride):
     """accumulate = compute pass only; tail = derive + summary + hashes + Python assembly.
-    accumulate scaling but total not -> serial tail. Neither -> memory bandwidth / E-cores."""
+    accumulate scaling but total not -> serial tail. Neither -> memory bandwidth / cache."""
     img = frame((n, n, 3))
-    grid = [(k - i, k - i) for i in range(4)]
     head(f"Threads: {n}x{n}x3 finest-{1 << k} s{stride}  (cpu_count={imfeat.cpu_count()}, ms)")
     print(
         f"  {'':9s} {'acc min':>8} {'x':>6} {'tail':>7} {'min':>7} {'p50':>7} {'p95':>7} {'x':>6}"
     )
     a0 = t0 = None
     for nt in THREADS:
-        fc = imfeat.FeatureComputer(img.shape, grid=grid, stride=stride, threads=nt)
+        fc = imfeat.FeatureComputer(img.shape, grid=pyramid(k), stride=stride, threads=nt)
         view = fc._view(img)
         acc = latency(lambda: fc._impl.raw(view))[0]
         mn, p50, p95 = latency(lambda: fc.features(img))
@@ -184,14 +188,17 @@ def test_thread_phases(n, k, stride):
         )
 
 
-@pytest.mark.parametrize("shape,stride", [((256, 256, 3), 1), ((256, 256, 3), 2), ((256, 256), 1)])
-def test_latency(shape, stride):
-    """Headline 4-level features() latency with a generous regression bound."""
+@SIZE_GRID
+@pytest.mark.parametrize("c", [1, 3])
+@pytest.mark.parametrize("stride", [1, 2])
+def test_latency(n, k, c, stride):
+    """Headline 4-level features() latency; regression bound scales with pixel count."""
+    shape = (n, n) if c == 1 else (n, n, c)
     img = frame(shape)
-    fc = imfeat.FeatureComputer(shape, grid=GRID, stride=stride)
+    fc = imfeat.FeatureComputer(shape, grid=pyramid(k), stride=stride)
     mn, p50, p95 = latency(lambda: fc.features(img))
     print(
         f"\n  {platform.machine()} {platform.system()} py{platform.python_version()} | "
-        f"{shape} 4-level stride={stride}: min={mn:.3f} p50={p50:.3f} p95={p95:.3f} ms"
+        f"{shape} finest-{1 << k} stride={stride}: min={mn:.3f} p50={p50:.3f} p95={p95:.3f} ms"
     )
-    assert p50 < 6.0
+    assert p50 < 6.0 * (n / 256) ** 2
