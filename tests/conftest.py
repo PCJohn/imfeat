@@ -59,6 +59,21 @@ def groups(fc: imfeat.FeatureComputer, img: np.ndarray) -> dict[str, np.ndarray]
     return out
 
 
+def pytest_addoption(parser):
+    parser.addoption(
+        "--full", action="store_true", help="also run tests needing cv2/imagehash/PIL/scipy"
+    )
+
+
+def pytest_collection_modifyitems(config, items):
+    if config.getoption("--full"):
+        return
+    skip = pytest.mark.skip(reason="reference-library test; run with --full")
+    for item in items:
+        if "full" in item.keywords:
+            item.add_marker(skip)
+
+
 @pytest.fixture
 def fgroups():
     return groups

@@ -18,4 +18,7 @@ cmake.build-type = "Release"
 wheel.packages = ["src/imfeat"]
 
 [tool.pytest.ini_options]
-markers = ["bench: benchmarks (timings printed with -s); skip with -m \"not bench\""]
+markers = [
+  "bench: benchmarks (timings printed with -s); skip with -m \"not bench\"",
+  "full: needs reference libraries (cv2, imagehash, PIL, scipy); enabled by --full",
+]

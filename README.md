@@ -39,6 +39,7 @@ f["mom_summary_0"] # (4, 3, 4)               [feat, channel, [min,max,mean,std]]
 pip install git+https://github.com/PCJohn/imfeat
 pytest -v -s                 # unit tests + benchmarks (tables print with -s)
 pytest -v -m "not bench"     # unit tests only
+pytest -v -s --full          # + cross-checks vs opencv-python / imagehash (install those first)
 ```
 
 Needs a C++17 compiler and CMake. Tested on Linux (AVX2), macOS/arm64 (NEON) and Windows.

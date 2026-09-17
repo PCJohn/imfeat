@@ -286,8 +286,10 @@ def test_stride_quality(stride):
     assert med_deg < 3.0
 
 
+@pytest.mark.full
 def test_opencv_sanity():
-    cv2 = pytest.importorskip("cv2")
+    import cv2
+
     img = textured()
     g = 32
     t = ss.FeatureComputer(img.shape, grid=[(5, 5)]).compute(img)["struct_0"]
@@ -494,8 +496,10 @@ def test_extrema_noise_positive():
 
 
 # ------------------------------ tier 3: cv2 + features ---------------------
+@pytest.mark.full
 def test_hog_opencv_sanity():
-    cv2 = pytest.importorskip("cv2")
+    import cv2
+
     img = textured()
     g = 32
     hog = (

@@ -15,10 +15,6 @@ mean/min/p50/max). Latency lives in test_bench.py.
 
 import numpy as np
 import pytest
-import scipy.fftpack
-from PIL import Image
-
-import imagehash
 
 import imfeat
 
@@ -69,6 +65,8 @@ def _unpack(u):
 
 
 def ref_hashes(img, nfx, stride):
+    import scipy.fftpack
+
     s32, c32 = _grid_sums(img, 32, nfx, stride)
     m32 = np.divide(s32, c32, out=np.zeros_like(s32), where=c32 > 0)
     s8 = s32.reshape(8, 4, 8, 4).sum((1, 3))
@@ -86,6 +84,7 @@ def _nfx(grid):
 
 
 # ---------------- 1. exactness vs numpy oracle -------------------------------
+@pytest.mark.full
 @pytest.mark.parametrize("size", SIZES)
 @pytest.mark.parametrize("stride", STRIDES)
 @pytest.mark.parametrize("grid", [[(0, 0)], [(3, 3)]])
@@ -98,6 +97,7 @@ def test_matches_oracle(size, stride, grid):
         assert got[k] == v, k
 
 
+@pytest.mark.full
 @pytest.mark.parametrize("stride", STRIDES)
 def test_matches_oracle_deep_grid(stride):
     # a 32x32 finest grid (requires 32 | shape) shares the pass's finest cells.
@@ -109,6 +109,7 @@ def test_matches_oracle_deep_grid(stride):
         assert got[k] == v, k
 
 
+@pytest.mark.full
 def test_oracle_multichannel_is_per_channel():
     img = rng.integers(0, 256, (96, 96, 3), np.uint8)
     got = groups(imfeat.FeatureComputer(img.shape, grid=[(3, 3)]), img)
@@ -124,7 +125,11 @@ def _distinct(n):
     return rng.permutation(256)[: n * n].astype(np.uint8).reshape(n, n)
 
 
+@pytest.mark.full
 def test_ahash_whash_vs_imagehash_native():
+    import imagehash
+    from PIL import Image
+
     for _ in range(300):
         g = _distinct(8)  # 8x8 input: imagehash's resize to 8x8 is identity
         f = groups(imfeat.FeatureComputer((8, 8), grid=[(3, 3)]), g)
@@ -133,7 +138,11 @@ def test_ahash_whash_vs_imagehash_native():
         assert np.array_equal(_unpack(f["whash"]), imagehash.whash(im).hash)
 
 
+@pytest.mark.full
 def test_phash_vs_imagehash_native():
+    import imagehash
+    from PIL import Image
+
     for _ in range(300):
         g = rng.integers(0, 256, (32, 32), np.uint8)  # 32x32: resize is identity
         f = groups(imfeat.FeatureComputer((32, 32), grid=[(5, 5)]), g)
@@ -141,7 +150,11 @@ def test_phash_vs_imagehash_native():
         assert np.array_equal(_unpack(f["phash"]), imagehash.phash(im).hash)
 
 
+@pytest.mark.full
 def test_vs_imagehash_per_channel_native():
+    import imagehash
+    from PIL import Image
+
     imgs = [_distinct(8) for _ in range(3)]
     hwc = np.ascontiguousarray(np.stack(imgs, -1))
     f = groups(imfeat.FeatureComputer(hwc.shape, grid=[(3, 3)]), hwc)
@@ -186,7 +199,11 @@ def _natural(h, w):
     return (255 * im / im.max()).astype(np.uint8)
 
 
+@pytest.mark.full
 def test_accuracy_report_vs_imagehash():
+    import imagehash
+    from PIL import Image
+
     ref = {"ahash": imagehash.average_hash, "whash": imagehash.whash, "phash": imagehash.phash}
     dist = {k: [] for k in ref}
     for _ in range(60):
