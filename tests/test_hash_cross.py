@@ -9,10 +9,9 @@ Tiers mirroring the other suites:
                     own median-tie jitter (its wHash round-trips through pywt).
   3. closed form -- flat and single-impulse images, derivable by hand.
 Plus an accuracy report (relative Hamming vs stock imagehash on full-size frames:
-mean/min/p50/max) and a latency check that the in-pass accumulation stays ~free.
+mean/min/p50/max). Latency lives in test_bench.py.
 """
 
-import time
 
 import numpy as np
 import pytest
@@ -204,20 +203,3 @@ def test_accuracy_report_vs_imagehash():
             f"  {k}: mean={d.mean():.3f} min={d.min():.3f} p50={np.median(d):.3f} max={d.max():.3f}"
         )
         assert d.mean() < 0.20, f"{k} drift too high ({d.mean():.3f})"
-
-
-# ---------------- latency: the in-pass accumulation is ~free ------------------
-def test_latency_reasonable():
-    img = rng.integers(0, 256, (256, 256, 3), np.uint8)
-    fc = imfeat.FeatureComputer(img.shape, grid=[(5, 5), (4, 4), (3, 3), (2, 2)])
-    for _ in range(5):
-        groups(fc, img)
-    ts = []
-    for _ in range(50):
-        t = time.perf_counter()
-        groups(fc, img)
-        ts.append((time.perf_counter() - t) * 1e3)
-    print(
-        f"\nfeatures()+hashes 256x256x3 4-level: p50={np.median(ts):.3f} ms, min={min(ts):.3f} ms"
-    )
-    assert np.median(ts) < 6.0  # generous; A/B in bench_compare shows the marginal cost

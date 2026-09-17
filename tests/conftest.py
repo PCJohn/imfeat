@@ -11,6 +11,8 @@ the pre-change output across six configs.
 
 from __future__ import annotations
 
+import time
+
 import numpy as np
 import pytest
 
@@ -60,3 +62,25 @@ def groups(fc: imfeat.FeatureComputer, img: np.ndarray) -> dict[str, np.ndarray]
 @pytest.fixture
 def fgroups():
     return groups
+
+
+def frame(shape: tuple[int, ...], seed: int = 0) -> np.ndarray:
+    """Deterministic textured uint8 frame: smooth wave + checker + noise."""
+    rng = np.random.default_rng(seed)
+    y, x = np.mgrid[0 : shape[0], 0 : shape[1]].astype(np.float64)
+    base = 90 + 60 * np.sin(y / 7.0) * np.cos(x / 11.0) + 40 * ((x // 9 + y // 5) % 2)
+    a = base[..., None] if len(shape) == 3 else base
+    return np.clip(a + rng.integers(-25, 26, shape), 0, 255).astype(np.uint8)
+
+
+def latency(fn, reps: int = 200, warm: int = 30) -> tuple[float, float, float]:
+    """(min, p50, p95) ms per call. Report min for cost, p95 for real-time tails."""
+    for _ in range(warm):
+        fn()
+    t = np.empty(reps)
+    for i in range(reps):
+        t0 = time.perf_counter()
+        fn()
+        t[i] = time.perf_counter() - t0
+    t *= 1e3
+    return float(t.min()), float(np.percentile(t, 50)), float(np.percentile(t, 95))

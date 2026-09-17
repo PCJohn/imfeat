@@ -10,10 +10,9 @@ test_struct.py:
                   textbook S2/n - mean^2 form cancels catastrophically.
 3. Consistency -- SIMD (multi-channel) vs scalar (single-channel) paths agree
                   bit-for-bit; channel selection and channel_axis are no-ops on
-                  the values; latency is reported.
+                  the values.
 """
 
-import time
 
 import numpy as np
 import pytest
@@ -243,15 +242,3 @@ def test_channel_axis_first():
     b = groups(imfeat.FeatureComputer(chw.shape, grid=[(5, 5)], channel_axis=0), chw)
     for k in a:
         assert np.array_equal(a[k], b[k]), k
-
-
-def test_latency():
-    img = np.stack([textured(), noise(), ramp()], -1)
-    fc = imfeat.FeatureComputer(img.shape, grid=[(5, 5), (4, 4), (3, 3), (2, 2)])
-    groups(fc, img)
-    t0 = time.perf_counter()
-    for _ in range(50):
-        groups(fc, img)
-    ms = (time.perf_counter() - t0) / 50 * 1e3
-    print(f"\n256x256x3, 4 levels, all features: {ms:.3f} ms/frame")
-    assert ms < 20.0

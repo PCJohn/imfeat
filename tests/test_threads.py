@@ -14,7 +14,7 @@ import pytest
 
 import imfeat
 
-from conftest import groups
+from conftest import frame, groups
 
 CONFIGS = [
     ((128, 128, 3), [(5, 5), (4, 4), (3, 3), (2, 2)], 2),
@@ -28,18 +28,9 @@ CONFIGS = [
 ]
 
 
-def _img(shape: tuple[int, ...], seed: int) -> np.ndarray:
-    rng = np.random.default_rng(seed)
-    h, w = shape[0], shape[1]
-    y, x = np.mgrid[0:h, 0:w].astype(np.float64)
-    base = 90 + 60 * np.sin(y / 7.0) * np.cos(x / 11.0) + 40 * ((x // 9 + y // 5) % 2)
-    a = base[..., None] if len(shape) == 3 else base
-    return np.clip(a + rng.integers(-25, 26, shape), 0, 255).astype(np.uint8)
-
-
 def _outputs(shape, grid, stride, threads):
     fc = imfeat.FeatureComputer(shape, grid=grid, stride=stride, threads=threads)
-    img = _img(shape, 7)
+    img = frame(shape, 7)
     return fc, {**fc.compute(img), **groups(fc, img)}
 
 
@@ -60,7 +51,7 @@ def test_repeated_frames_do_not_drift():
     """The pool is reused across frames; a stale barrier would show up as a
     difference on the second or third call, not the first."""
     fc = imfeat.FeatureComputer((128, 128, 3), grid=[(4, 4), (3, 3)], stride=2, threads=4)
-    imgs = [_img((128, 128, 3), s) for s in range(3)]
+    imgs = [frame((128, 128, 3), s) for s in range(3)]
     first = [{k: np.array(v) for k, v in groups(fc, im).items()} for im in imgs]
     for _ in range(3):
         for im, ref in zip(imgs, first):

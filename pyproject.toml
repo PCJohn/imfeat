@@ -16,3 +16,6 @@ dev = ["pytest", "numpy", "opencv-python"]
 [tool.scikit-build]
 cmake.build-type = "Release"
 wheel.packages = ["src/imfeat"]
+
+[tool.pytest.ini_options]
+markers = ["bench: benchmarks (timings printed with -s); skip with -m \"not bench\""]

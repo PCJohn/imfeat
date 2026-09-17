@@ -10,7 +10,6 @@ Three tiers, mirroring the existing suites:
                     feature in imfeat, which is the point of adding it.
 """
 
-import time
 
 import numpy as np
 import pytest
@@ -271,32 +270,3 @@ def test_cross_absent_without_pairs(c):
     fc = imfeat.FeatureComputer(img.shape, grid=[(2, 2)])
     assert fc.channel_pairs == []
     assert not any(k.startswith("xchan") for k in groups(fc, img))
-
-
-# ==========================================================================
-# latency
-# ==========================================================================
-def test_latency_regression(capsys):
-    """LBP and the cross products are meant to be free. Guard the regression, and
-    print enough context to diagnose a slow machine from the log alone."""
-    import platform
-
-    img = np.stack([textured(256)] * 3, -1)
-    pyr = [(5, 5), (4, 4), (3, 3), (2, 2)]
-    fc = imfeat.FeatureComputer(img.shape, grid=pyr, stride=2)
-    for _ in range(30):
-        groups(fc, img)
-    ts = []
-    for _ in range(100):
-        t0 = time.perf_counter()
-        groups(fc, img)
-        ts.append(time.perf_counter() - t0)
-    ts.sort()
-    p50, p95 = ts[50] * 1e3, ts[95] * 1e3
-    with capsys.disabled():
-        print(
-            f"\n  [imfeat-lat] {platform.machine()} {platform.system()} "
-            f"py{platform.python_version()} | 256x256x3 4-level stride=2 features(): "
-            f"p50={p50:.3f} ms p95={p95:.3f} ms min={ts[0] * 1e3:.3f} ms"
-        )
-    assert p50 < 5.0

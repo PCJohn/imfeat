@@ -7,14 +7,12 @@
                   noise / oriented line) checked through the derived features,
                   so we test that a channel *means* what we claim, not merely
                   that two implementations agree.
-3. Quality/latency -- knob sweeps (stride) scored against the stride-1 output
+3. Quality     -- knob sweeps (stride) scored against the stride-1 output
                   with vector-aware metrics (energy correlation, circular
-                  orientation error), an OpenCV sanity correlation, and a
-                  reported per-call latency.
+                  orientation error), and an OpenCV sanity correlation.
 """
 
 import math
-import time
 
 import numpy as np
 import pytest
@@ -252,7 +250,7 @@ def test_rotation_equivariance():
     assert np.allclose(fa[3], -fb[3], atol=1e-6)  # ori_sin negates
 
 
-# ============================== Tier 3: quality + latency =================
+# ============================== Tier 3: quality =================
 def _circ_orient_err(a, b):  # orientation is mod pi
     d = 2 * (a - b)
     return np.abs(np.arctan2(np.sin(d), np.cos(d))) / 2.0
@@ -333,52 +331,6 @@ def test_cpp_features_match_python():
     assert np.allclose(fe[..., 2], coh * np.cos(2 * ori), atol=1e-5)
     assert np.allclose(fe[..., 3], coh * np.sin(2 * ori), atol=1e-5)
     assert np.allclose(fe[..., 4], ref_cornerness(raw) / n, atol=1e-4)
-
-
-def test_latency_end_to_end(capsys):
-    # full path as framegate would call it: strided V channel in, float maps out
-    img = textured()
-    hsv = np.zeros((256, 256, 3), np.uint8)
-    hsv[:, :, 2] = img
-    v = hsv[:, :, 2]
-    pyr = [(5, 5), (4, 4), (3, 3), (2, 2)]
-    sc = ss.FeatureComputer(img.shape, grid=pyr)
-
-    def feats():
-        return groups(sc, v)
-
-    for _ in range(20):
-        feats()
-    best = []
-    for _ in range(50):
-        t0 = time.perf_counter()
-        feats()
-        best.append(time.perf_counter() - t0)
-    best.sort()
-    p50 = best[len(best) // 2] * 1e3
-    with capsys.disabled():
-        print(
-            f"\n  end-to-end (strided V -> 4-level float feature maps): "
-            f"p50={p50:.3f} ms, min={best[0] * 1e3:.3f} ms"
-        )
-    assert p50 < 5.0
-    img = textured()
-    pyr = [(5, 5), (4, 4), (3, 3), (2, 2)]
-    sc = ss.FeatureComputer(img.shape, grid=pyr)
-    for _ in range(20):
-        sc.compute(img)  # warmup
-    best = []
-    for _ in range(50):
-        t0 = time.perf_counter()
-        sc.compute(img)
-        best.append(time.perf_counter() - t0)
-    best.sort()
-    p50 = best[len(best) // 2] * 1e3
-    with capsys.disabled():
-        print(
-            f"\n  latency 256x256 4-level pyramid: p50={p50:.3f} ms, min={best[0] * 1e3:.3f} ms"
-        )
-    assert p50 < 5.0  # generous; real target is sub-ms
 
 
 # ==========================================================================

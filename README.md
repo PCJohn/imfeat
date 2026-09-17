@@ -37,7 +37,8 @@ f["mom_summary_0"] # (4, 3, 4)               [feat, channel, [min,max,mean,std]]
 
 ```bash
 pip install git+https://github.com/PCJohn/imfeat
-pytest tests -q        # 357 tests
+pytest -v -s                 # unit tests + benchmarks (tables print with -s)
+pytest -v -m "not bench"     # unit tests only
 ```
 
 Needs a C++17 compiler and CMake. Tested on Linux (AVX2), macOS/arm64 (NEON) and Windows.
@@ -360,7 +361,7 @@ Measured on a 256×256×3 frame, 4 pyramid levels, every feature on all 3 channe
 M-series; an AVX2 laptop lands within ~20%). Errors are against the exact `stride=1` output:
 `energy_r` is the correlation of the edge-energy map, `hog_cos` and `lbp_cos` the mean cosine
 similarity of the histograms. (The error columns are properties of the algorithm, not the
-machine; `bench_compare.py` prints these and `xchan_r` on any host.)
+machine; `tests/test_bench.py` prints these and `xchan_r` on any host.)
 
 | stride | ms | speedup | mean err (grey levels) | energy_r | orientation err | hog_cos | lbp_cos |
 |---|---|---|---|---|---|---|---|
@@ -484,8 +485,9 @@ Finer grids cost more than coarser ones (each cell's accumulators are flushed on
 so flush traffic grows with cell count while pixel work stays fixed). 32×32 is a good
 default; 128×128 works but is both slow and statistically thin unless the image is large.
 
-`bench_compare.py` reproduces all of the above, sweeping stride × input size × channel count
-and reporting latency next to per-feature-group accuracy.
+`tests/test_bench.py` reproduces all of the above (`pytest -v -s tests/test_bench.py`): stride ×
+input size × channel count sweeps with latency next to per-feature-group accuracy, plus the
+per-thread accumulate/tail split.
 
 ---
 
