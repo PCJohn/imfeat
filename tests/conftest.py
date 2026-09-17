@@ -63,6 +63,12 @@ def pytest_addoption(parser):
     parser.addoption(
         "--full", action="store_true", help="also run tests needing cv2/imagehash/PIL/scipy"
     )
+    parser.addoption("--reps", type=int, default=500, help="timed calls per latency stat")
+
+
+def pytest_configure(config):
+    global REPS
+    REPS = config.getoption("--reps")
 
 
 def pytest_collection_modifyitems(config, items):
@@ -88,8 +94,12 @@ def frame(shape: tuple[int, ...], seed: int = 0) -> np.ndarray:
     return np.clip(a + rng.integers(-25, 26, shape), 0, 255).astype(np.uint8)
 
 
-def latency(fn, reps: int = 500, warm: int = 30) -> dict[str, float]:
-    """Per-call ms stats. min estimates cost; mean/std, p90 and p99 the real-time tail."""
+REPS = 500
+
+
+def latency(fn, reps: int | None = None, warm: int = 30) -> dict[str, float]:
+    """Per-call ms stats over reps (default --reps). min estimates cost; std, p90, p99 the tail."""
+    reps = reps or REPS
     for _ in range(warm):
         fn()
     t = np.empty(reps)

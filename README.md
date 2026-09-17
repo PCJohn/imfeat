@@ -43,6 +43,7 @@ pip install git+https://github.com/PCJohn/imfeat
 pytest -v -s                 # unit tests + benchmarks (a few minutes; tables print with -s)
 pytest -v -m "not bench"     # unit tests only
 pytest -v -s --full          # + cross-checks vs opencv-python / imagehash (install those first)
+pytest -v -s --reps 200      # timed calls per latency stat (default 500)
 ```
 
 Needs a C++17 compiler and CMake. Tested on Linux (AVX2), macOS/arm64 (NEON) and Windows.
