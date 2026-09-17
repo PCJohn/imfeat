@@ -110,7 +110,7 @@ def sweep(n, k, c):
         fc = imfeat.FeatureComputer(img.shape, grid=pyramid(k), stride=s)
         out = groups(fc, img)
         ref = ref or out
-        ms = latency(lambda: fc.features(img), reps=50, warm=5)[0]
+        ms = latency(lambda: fc.features(img), reps=50, warm=5)["min"]
         base = base or ms
         rows[s] = {"ms": ms, "speedup": base / ms, **quality(ref, out)}
     return rows
@@ -121,6 +121,14 @@ def table(rows, n, k, label=""):
     for s, r in rows.items():
         name = f"stride={s}" + ("*" if s > n >> k else "")
         print(f"{name:>12}" + "".join(f.format(r[c]) for c, _, f in COLS))
+
+
+STATS = ("min", "mean", "std", "p50", "p90", "p99")
+STATS_HEAD = " ".join(f"{c:>7}" for c in STATS)
+
+
+def stats_row(st):
+    return " ".join(f"{st[c]:7.3f}" for c in STATS)
 
 
 def head(title):
@@ -161,7 +169,7 @@ def test_per_channel_cost(n, k):
     for c in CHANNELS:
         im = synth(n, c)
         fc = imfeat.FeatureComputer(im.shape, grid=pyramid(k), stride=2)
-        ms = latency(lambda: fc.features(im))[0]
+        ms = latency(lambda: fc.features(im), reps=50, warm=5)["min"]
         print(f"  C={c:>2}: {ms:7.3f} ms  ({ms / c:6.3f} ms/channel)")
 
 
@@ -172,19 +180,17 @@ def test_thread_phases(n, k, stride):
     accumulate scaling but total not -> serial tail. Neither -> memory bandwidth / cache."""
     img = frame((n, n, 3))
     head(f"Threads: {n}x{n}x3 finest-{1 << k} s{stride}  (cpu_count={imfeat.cpu_count()}, ms)")
-    print(
-        f"  {'':9s} {'acc min':>8} {'x':>6} {'tail':>7} {'min':>7} {'p50':>7} {'p95':>7} {'x':>6}"
-    )
+    print(f"  {'':9s} {'acc min':>8} {'x':>6} {'tail':>7} {STATS_HEAD} {'x':>6}")
     a0 = t0 = None
     for nt in THREADS:
         fc = imfeat.FeatureComputer(img.shape, grid=pyramid(k), stride=stride, threads=nt)
         view = fc._view(img)
-        acc = latency(lambda: fc._impl.raw(view))[0]
-        mn, p50, p95 = latency(lambda: fc.features(img))
-        a0, t0 = a0 or acc, t0 or mn
+        acc = latency(lambda: fc._impl.raw(view))["min"]
+        st = latency(lambda: fc.features(img))
+        a0, t0 = a0 or acc, t0 or st["min"]
         print(
-            f"  threads={fc.threads} {acc:8.3f} {a0 / acc:5.2f}x {mn - acc:7.3f} "
-            f"{mn:7.3f} {p50:7.3f} {p95:7.3f} {t0 / mn:5.2f}x"
+            f"  threads={fc.threads} {acc:8.3f} {a0 / acc:5.2f}x {st['min'] - acc:7.3f} "
+            f"{stats_row(st)} {t0 / st['min']:5.2f}x"
         )
 
 
@@ -196,9 +202,9 @@ def test_latency(n, k, c, stride):
     shape = (n, n) if c == 1 else (n, n, c)
     img = frame(shape)
     fc = imfeat.FeatureComputer(shape, grid=pyramid(k), stride=stride)
-    mn, p50, p95 = latency(lambda: fc.features(img))
+    st = latency(lambda: fc.features(img))
     print(
         f"\n  {platform.machine()} {platform.system()} py{platform.python_version()} | "
-        f"{shape} finest-{1 << k} stride={stride}: min={mn:.3f} p50={p50:.3f} p95={p95:.3f} ms"
+        f"{shape} finest-{1 << k} stride={stride}\n  ms: {STATS_HEAD}\n      {stats_row(st)}"
     )
-    assert p50 < 6.0 * (n / 256) ** 2
+    assert st["p50"] < 6.0 * (n / 256) ** 2

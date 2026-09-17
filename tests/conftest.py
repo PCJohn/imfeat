@@ -88,8 +88,8 @@ def frame(shape: tuple[int, ...], seed: int = 0) -> np.ndarray:
     return np.clip(a + rng.integers(-25, 26, shape), 0, 255).astype(np.uint8)
 
 
-def latency(fn, reps: int = 200, warm: int = 30) -> tuple[float, float, float]:
-    """(min, p50, p95) ms per call. Report min for cost, p95 for real-time tails."""
+def latency(fn, reps: int = 500, warm: int = 30) -> dict[str, float]:
+    """Per-call ms stats. min estimates cost; mean/std, p90 and p99 the real-time tail."""
     for _ in range(warm):
         fn()
     t = np.empty(reps)
@@ -98,4 +98,5 @@ def latency(fn, reps: int = 200, warm: int = 30) -> tuple[float, float, float]:
         fn()
         t[i] = time.perf_counter() - t0
     t *= 1e3
-    return float(t.min()), float(np.percentile(t, 50)), float(np.percentile(t, 95))
+    p50, p90, p99 = np.percentile(t, [50, 90, 99])
+    return {"min": t.min(), "mean": t.mean(), "std": t.std(), "p50": p50, "p90": p90, "p99": p99}
