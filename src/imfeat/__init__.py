@@ -99,6 +99,19 @@ DESCRIPTOR_FEATURES = (
     "rms_contrast",
 )
 
+# Bar/stroke detector ("bard_i"). A centre-surround test at BARD_NL lags: a pixel
+# scores only where BOTH taps at +/-d differ from it in the same direction, so step
+# edges score zero while strokes of width ~d score highly. cover is the fraction of
+# sampled pixels passing the noise gate; spec_* splits the gated response mass across
+# lags (a stroke-width spectrum); peak is its mass-weighted mean lag; peaked is the
+# profile's coefficient of variation (one dominant width vs texture); bal is dark/light
+# polarity in [-1, 1]. All but cover are ratios, hence invariant to stride and cell size.
+BARD_FEATURES = (
+    ("bard_cover",)
+    + tuple(f"bard_spec{j + 1}" for j in range(_core.BARD_NL))
+    + ("bard_peak", "bard_peaked", "bard_bal")
+)
+
 # Perceptual hashes ("ahash"/"whash"/"phash"), one uint64 (64 bits, row-major MSB-first)
 # per channel, computed whole-frame in the same pass (no pyramid). imagehash-compatible:
 # aHash/wHash threshold an 8x8 mean grid by its mean/median; pHash the low-freq 8x8 of a
@@ -111,9 +124,15 @@ HASHES = ("ahash", "whash", "phash")
 # over that pyramid level's cells (min/max exact; mean/std population, cell-weighted).
 SUMMARY_STATS = ("min", "max", "mean", "std")
 
-#: One channel's slice of the features() channel axis, in order (F = 38).
+#: One channel's slice of the features() channel axis, in order (F = 45).
 FEATURE_NAMES = (
-    FEATURES + HOG_FEATURES + COUNT_FEATURES + LBP_FEATURES + DESCRIPTOR_FEATURES + MOMENTS
+    FEATURES
+    + HOG_FEATURES
+    + COUNT_FEATURES
+    + LBP_FEATURES
+    + DESCRIPTOR_FEATURES
+    + BARD_FEATURES
+    + MOMENTS
 )
 
 

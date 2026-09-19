@@ -1,6 +1,6 @@
 """Named views over the pyramid, for the assertions in this suite.
 
-`features()` returns one `(H, W, C*38)` map per level. These tests were written
+`features()` returns one `(H, W, C*F)` map per level, F = len(FEATURE_NAMES). These tests were written
 against the older per-group dict and check values, not containers, so rather than
 rewrite two hundred assertions -- and risk one of them passing vacuously -- the split
 lives here, in one place, exercised by every test that uses it.
@@ -25,6 +25,7 @@ _W = (
     ("cnt", len(imfeat.COUNT_FEATURES)),
     ("lbp", len(imfeat.LBP_FEATURES)),
     ("desc", len(imfeat.DESCRIPTOR_FEATURES)),
+    ("bard", len(imfeat.BARD_FEATURES)),
     ("mom", len(imfeat.MOMENTS)),
 )
 _F = sum(n for _, n in _W)

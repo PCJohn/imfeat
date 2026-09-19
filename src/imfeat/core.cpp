@@ -5,6 +5,7 @@
 #include <nanobind/stl/vector.h>
 
 #include <algorithm>
+#include <climits>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -57,7 +58,40 @@ constexpr int NMOM = 4;
 constexpr int LBPB = 10;
 constexpr int LBP0 = PS0 + NMOM; // 19
 constexpr int SG4 = LBP0 + LBPB; // 29: sum of |grad|^4 = (gx^2+gy^2)^2, for gradient sparsity
-constexpr int NSUM = SG4 + 1;    // 30 int64 sums per cell per channel
+// Bar/stroke detector ("bard"). A centre-surround test at three lags: at lag d a
+// pixel is DARK if BOTH taps at +/-d are brighter than it, scoring the smaller of the
+// two margins, and LIGHT if both are darker. A step edge scores zero -- one side
+// matches the centre -- so this fires on strokes and thin structures of a given width,
+// which the Sobel/LBP banks conflate with ordinary contrast. Horizontal and vertical
+// combine with max; a pixel counts only if its best response over all lags reaches
+// BARD_TAU, and that gate is what makes the lag profile a shape descriptor rather
+// than a contrast one.
+constexpr int BARD_LAGS[] = {1, 2, 4};
+constexpr int BARD_NL = (int)(sizeof(BARD_LAGS) / sizeof(BARD_LAGS[0]));
+constexpr int BARD_SPAN = 2;   // a lag-d test reaches +/- d, so it spans 2d
+constexpr int BARD_TAU = 8;    // 8/255 gate: below this the response is sensor noise
+constexpr int BARD_MAXLAG = 4; // == BARD_LAGS[BARD_NL - 1]; sizes the plane halo
+constexpr int BARD0 = SG4 + 1;               // 30: gated-pixel count ("cover")
+constexpr int BARD_S0 = BARD0 + 1;           // 31: per-lag gated response mass
+constexpr int BARD_DARK = BARD_S0 + BARD_NL; // 34: max-over-lags dark mass
+constexpr int BARD_LIGHT = BARD_DARK + 1;    // 35: max-over-lags light mass
+constexpr int NSUM = BARD_LIGHT + 1;         // 36 int64 sums per cell per channel
+constexpr int BARD_NF = 4 + BARD_NL;   // cover, spec*NL, peak, peaked, bal
+constexpr int BARD_NMAP = 3 + BARD_NL; // dense maps: cover, resp*NL, dark, light
+// Slack bytes at both ends of a plane row: the column loop reads x +/- MAXLAG and
+// overruns its last vector, so padding buys a bounds-test-free hot loop.
+// Plane rows carry only the slack the taps need: MAXLAG on the left, and on the right
+// the final vector's tail, which the wide path bounds to total + MAXLAG. This is not
+// free space -- the window is 3 * slots * row bytes and wants to stay inside L1, and
+// 64 bytes a side alone pushes a 3-channel 512-wide window past 32 KB.
+constexpr int BARD_LPAD = 8;
+constexpr int BARD_RPAD = 8;
+// Rows of the rolling plane window; a power of two >= 2*MAXLAG+1 so the slot for row
+// y is y & (BARD_SLOTS-1). Vertical taps therefore wrap, and the kernels take an
+// explicit pointer per tap row rather than a row stride.
+// Rows of the rolling plane window. The fold now runs per CELL ROW, so every row of
+// the cell row in flight plus a MAXLAG halo each side stays resident: chh + 2*MAXLAG,
+// set at configure time. The slot for image row y is y % bard_slots_.
 constexpr int NF_S = 5;          // tensor-derived float channels
 // Model-ready nonlinear descriptors, all DERIVED from the sums above (no new
 // accumulators): standardized skew/kurtosis, two structure-tensor ratios, and two
@@ -65,7 +99,8 @@ constexpr int NF_S = 5;          // tensor-derived float channels
 // so a linear/shallow model cannot cheaply reconstruct them; dimensionless ones are
 // illumination-invariant, which helps few-shot on-the-fly training.
 constexpr int NDER = 8;
-constexpr int NF = NF_S + HB + 2 + LBPB + NDER; // 33 derived float32 per cell per channel
+constexpr int BARDF0 = NF_S + HB + 2 + LBPB + NDER; // 34: start of the bard block
+constexpr int NF = BARDF0 + BARD_NF; // 41 derived float32 per cell per channel
 // Cross-channel products Sum(v_i * v_j) over the C*(C-1)/2 unordered pairs. Off for
 // C=1 (no pairs) and for C > XMAX (hyperspectral: the pair count would explode).
 constexpr int XMAX = 8;
@@ -315,6 +350,372 @@ void accumulate_cross_row(const uint8_t *IF_RESTRICT vb, int strideC, int cw, in
 // grouped (once, in set_config) into runs that share a hash column and lie in one finest
 // cell, so each run is a contiguous column range [beg,end) stepped by sx with a constant
 // target cell: the sx==1 case reduces to a plain contiguous accumulation that vectorizes.
+// De-interleave ONE image row of every selected channel into the rolling plane
+// window, so the detector's +/-d column taps are unit-stride loads and the column
+// loop vectorizes at full u8 width. The window holds BARD_SLOTS rows (row y at slot
+// y & (BARD_SLOTS-1)), which is the whole point: a band's worth of planes is 1.2 MB
+// at 512x512x3 and spills L2, while the nine rows actually in play are ~36 KB and
+// stay hot. Every image row is de-interleaved exactly once either way.
+// `packed` (plain interleaved, channel k at byte k) takes the wide path; cs == 1
+// (already planar) is a memcpy; anything else walks scalar.
+// Gather each selected channel's row into a contiguous run: channel k lands at
+// out + k*ostride. Every layout imfeat accepts has a wide path here except the
+// general strided one, and the phase-split below reuses all of them rather than
+// carrying its own -- getting that wrong made a 2-channel or greyscale image fall to
+// a scalar byte loop over the whole frame.
+void gather_row(const uint8_t *IF_RESTRICT src, int64_t cs, const int64_t *IF_RESTRICT coff,
+                int c, int w, bool packed, uint8_t *IF_RESTRICT out, size_t ostride)
+{
+  namespace hn = hwy::HWY_NAMESPACE;
+  const hn::ScalableTag<uint8_t> du;
+  const size_t N = hn::Lanes(du);
+  if (cs == 1) // already planar (includes 2-D input)
+  {
+    for (int k = 0; k < c; ++k) std::memcpy(out + (size_t)k * ostride, src + coff[k], (size_t)w);
+    return;
+  }
+  size_t x = 0;
+  if (packed && c == 2)
+    for (; x + N <= (size_t)w; x += N)
+    {
+      decltype(hn::Zero(du)) a, b;
+      hn::LoadInterleaved2(du, src + x * 2, a, b);
+      hn::StoreU(a, du, out + x);
+      hn::StoreU(b, du, out + ostride + x);
+    }
+  else if (packed && c == 3)
+    for (; x + N <= (size_t)w; x += N)
+    {
+      decltype(hn::Zero(du)) a, b, e;
+      hn::LoadInterleaved3(du, src + x * 3, a, b, e);
+      hn::StoreU(a, du, out + x);
+      hn::StoreU(b, du, out + ostride + x);
+      hn::StoreU(e, du, out + 2 * ostride + x);
+    }
+  else if (packed && c == 4)
+    for (; x + N <= (size_t)w; x += N)
+    {
+      decltype(hn::Zero(du)) a, b, e, g;
+      hn::LoadInterleaved4(du, src + x * 4, a, b, e, g);
+      hn::StoreU(a, du, out + x);
+      hn::StoreU(b, du, out + ostride + x);
+      hn::StoreU(e, du, out + 2 * ostride + x);
+      hn::StoreU(g, du, out + 3 * ostride + x);
+    }
+  for (; x < (size_t)w; ++x)
+    for (int k = 0; k < c; ++k) out[(size_t)k * ostride + x] = src[(int64_t)x * cs + coff[k]];
+}
+
+// One image row into the rolling window. With P == 1 the gathered rows are the planes.
+// With P > 1 each row is then split by column phase: phase p holds columns p, p+P, ...
+// so the sampled columns are exactly phase 0 and a lag-d tap is still a contiguous
+// load, from phase (d % P) at index +/- d/P.
+void deinterleave_row(const uint8_t *IF_RESTRICT img, int64_t rs, int64_t cs,
+                      const int64_t *IF_RESTRICT coff, int c, int w, int y, bool packed,
+                      int64_t prs, int slots, int P, int64_t phs, uint8_t *IF_RESTRICT tmp,
+                      uint8_t *IF_RESTRICT dst)
+{
+  namespace hn = hwy::HWY_NAMESPACE;
+  const hn::ScalableTag<uint8_t> du;
+  const size_t N = hn::Lanes(du);
+  const uint8_t *IF_RESTRICT src = img + (int64_t)y * rs;
+  uint8_t *IF_RESTRICT d0 = dst + (size_t)(y % slots) * (size_t)prs + BARD_LPAD;
+  const size_t pstride = (size_t)slots * (size_t)prs;
+  if (P == 1)
+  {
+    gather_row(src, cs, coff, c, w, packed, d0, pstride);
+    return;
+  }
+  gather_row(src, cs, coff, c, w, packed, tmp, (size_t)w);
+  for (int k = 0; k < c; ++k)
+  {
+    const uint8_t *IF_RESTRICT lin = tmp + (size_t)k * (size_t)w;
+    uint8_t *IF_RESTRICT b = d0 + (size_t)k * pstride;
+    size_t x = 0;
+    if (P == 2)
+      for (; x + 2 * N <= (size_t)w; x += 2 * N)
+      {
+        const auto lo = hn::LoadU(du, lin + x), hi = hn::LoadU(du, lin + x + N);
+        hn::StoreU(hn::ConcatEven(du, hi, lo), du, b + x / 2);
+        hn::StoreU(hn::ConcatOdd(du, hi, lo), du, b + phs + x / 2);
+      }
+    for (; x < (size_t)w; ++x) b[(int64_t)(x % P) * phs + x / P] = lin[x];
+  }
+}
+
+// One pixel's gated maps, used only for the <= MAXLAG columns at each row end where
+// the vectorized body would read across the image border. This is the definition the
+// dense path must reproduce: a lag contributes on an axis only where BOTH its taps are
+// inside the image, and `lagmask` drops a lag on BOTH axes when its span exceeds the
+// smaller image side (dropping per-axis would differ on very thin images).
+inline void bard_pixel_vals(const uint8_t *IF_RESTRICT prow, const uint8_t *const *IF_RESTRICT up,
+                            const uint8_t *const *IF_RESTRICT dn, int H, int W, int r, int x,
+                            int lagmask, int32_t *IF_RESTRICT v)
+{
+  const int centre = prow[x];
+  int dmax = 0, lmax = 0, resp[BARD_NL];
+  for (int j = 0; j < BARD_NL; ++j)
+  {
+    const int d = BARD_LAGS[j];
+    int dd = 0, ll = 0;
+    if ((lagmask >> j) & 1)
+    {
+      if (x >= d && x < W - d)
+      {
+        const int l = prow[x - d], rr = prow[x + d];
+        dd = std::min(l - centre, rr - centre);
+        ll = std::min(centre - l, centre - rr);
+      }
+      if (r >= d && r < H - d)
+      {
+        const int tu = up[j][x], tv = dn[j][x];
+        dd = std::max(dd, std::min(tu - centre, tv - centre));
+        ll = std::max(ll, std::min(centre - tu, centre - tv));
+      }
+    }
+    dd = dd > 0 ? dd : 0;
+    ll = ll > 0 ? ll : 0;
+    resp[j] = std::max(dd, ll);
+    dmax = std::max(dmax, dd);
+    lmax = std::max(lmax, ll);
+  }
+  const bool keep = std::max(dmax, lmax) >= BARD_TAU;
+  v[0] = keep ? 1 : 0;
+  for (int j = 0; j < BARD_NL; ++j) v[1 + j] = keep ? resp[j] : 0;
+  v[1 + BARD_NL] = keep ? dmax : 0;
+  v[2 + BARD_NL] = keep ? lmax : 0;
+}
+
+// Map-writing wrapper, for the fold path that materializes rows.
+inline void bard_pixel(const uint8_t *IF_RESTRICT prow, const uint8_t *const *IF_RESTRICT up,
+                       const uint8_t *const *IF_RESTRICT dn, int H, int W, int r, int x,
+                       int lagmask, const uint8_t *IF_RESTRICT smask, uint8_t *IF_RESTRICT out,
+                       size_t os)
+{
+  int32_t v[BARD_NMAP];
+  bard_pixel_vals(prow, up, dn, H, W, r, x, lagmask, v);
+  const bool on = smask[x] != 0;
+  for (int t = 0; t < BARD_NMAP; ++t) out[(size_t)t * os + x] = on ? (uint8_t)v[t] : 0;
+}
+
+// One row's BARD_NMAP dense maps, already gated so the fold below is branchless.
+// COLUMNS ARE THE SIMD LANE -- at 64 uint8 lanes this is the widest loop in the
+// library, against accumulate_row's 4 int32 channel lanes, which is what lets a
+// second stencil ride along for near-free. Every tap is a saturating subtract, so
+// dark/light need no sign handling and nothing widens past uint8:
+//   min(max(l-c, 0), max(r-c, 0)) == min(SatSub(l, c), SatSub(r, c)).
+// peak == max_j max(dk_j, lt_j) == max(dmax, lmax), so the gate costs one compare.
+// Vertical-tap validity is a property of the ROW, hoisted out of the loop; horizontal
+// validity holds for every interior column by construction, and the row ends are
+// overwritten afterwards by bard_pixel.
+void bard_row_dense(const uint8_t *IF_RESTRICT prow, const uint8_t *const *IF_RESTRICT up,
+                    const uint8_t *const *IF_RESTRICT dn, int lagmask, int total,
+                    uint8_t *IF_RESTRICT out, size_t os, const bool *IF_RESTRICT vok,
+                    const uint8_t *IF_RESTRICT smask)
+{
+  namespace hn = hwy::HWY_NAMESPACE;
+  const hn::ScalableTag<uint8_t> du;
+  using V = decltype(hn::Zero(du));
+  const size_t N = hn::Lanes(du);
+  const auto tau = hn::Set(du, (uint8_t)BARD_TAU);
+  const auto one = hn::Set(du, (uint8_t)1);
+  for (int x = 0; x < total; x += (int)N)
+  {
+    const V c = hn::LoadU(du, prow + x);
+    V dmax = hn::Zero(du), lmax = hn::Zero(du), resp[BARD_NL];
+    for (int j = 0; j < BARD_NL; ++j)
+    {
+      const int d = BARD_LAGS[j];
+      V dk = hn::Zero(du), lt = hn::Zero(du);
+      if ((lagmask >> j) & 1)
+      {
+        const V l = hn::LoadU(du, prow + x - d), rr = hn::LoadU(du, prow + x + d);
+        dk = hn::Min(hn::SaturatedSub(l, c), hn::SaturatedSub(rr, c));
+        lt = hn::Min(hn::SaturatedSub(c, l), hn::SaturatedSub(c, rr));
+      }
+      if (vok[j])
+      {
+        const V u = hn::LoadU(du, up[j] + x);
+        const V v = hn::LoadU(du, dn[j] + x);
+        dk = hn::Max(dk, hn::Min(hn::SaturatedSub(u, c), hn::SaturatedSub(v, c)));
+        lt = hn::Max(lt, hn::Min(hn::SaturatedSub(c, u), hn::SaturatedSub(c, v)));
+      }
+      resp[j] = hn::Max(dk, lt);
+      dmax = hn::Max(dmax, dk);
+      lmax = hn::Max(lmax, lt);
+    }
+    // AND the sampling mesh into the gate: off-mesh columns come out zero, so the
+    // fold below sums a contiguous run per cell instead of a strided one, and the
+    // mesh costs one load and one And per vector rather than a stride in the fold.
+    const auto keep = hn::And(hn::Ge(hn::Max(dmax, lmax), tau),
+                              hn::Gt(hn::LoadU(du, smask + x), hn::Zero(du)));
+    hn::StoreU(hn::IfThenElseZero(keep, one), du, out + x);
+    for (int j = 0; j < BARD_NL; ++j)
+      hn::StoreU(hn::IfThenElseZero(keep, resp[j]), du, out + (size_t)(1 + j) * os + x);
+    hn::StoreU(hn::IfThenElseZero(keep, dmax), du, out + (size_t)(1 + BARD_NL) * os + x);
+    hn::StoreU(hn::IfThenElseZero(keep, lmax), du, out + (size_t)(2 + BARD_NL) * os + x);
+  }
+}
+
+// The fused path, run once per CELL ROW rather than once per row.
+//
+// Every sampled row of a cell row folds into the SAME cells, so the group sums are
+// carried in registers across all of them and memory is touched once per column
+// block instead of once per row -- at stride 2 and an 8-row cell that is a quarter
+// of the read-modify-writes. The dense maps are never materialized either: storing
+// and reloading BARD_NMAP bytes per pixel per channel cost more than the arithmetic,
+// which measurement showed to be nearly free (three lags cost the same as one).
+//
+// SumsOf8 (psadbw) horizontally sums each 8-byte group in one instruction; with cw a
+// multiple of 8 a group never straddles a cell, so groups reduce to cells at the end
+// with a shift. `smask` is the sampling mesh with the <= MAXLAG columns at both row
+// ends zeroed -- those would read across the image border, so the vector body scores
+// them zero and the caller adds their true contribution with bard_pixel_vals.
+void bard_cellrow_fused(const uint8_t *IF_RESTRICT pbase, int64_t prs, int slots,
+                        const int *IF_RESTRICT rws, int nrows, int H, int lagmask, int total,
+                        int cw, int gshift, int ncell, uint64_t *IF_RESTRICT cells,
+                        const uint8_t *IF_RESTRICT smask, const uint8_t *IF_RESTRICT valid,
+                        size_t vstride, int P, int64_t phs)
+{
+  namespace hn = hwy::HWY_NAMESPACE;
+  const hn::ScalableTag<uint8_t> du;
+  const hn::Repartition<uint64_t, decltype(du)> d64;
+  using V = decltype(hn::Zero(du));
+  using V64 = decltype(hn::Zero(d64));
+  const size_t N = hn::Lanes(du), G = N / 8;
+  const auto tau = hn::Set(du, (uint8_t)BARD_TAU);
+  const auto one = hn::Set(du, (uint8_t)1);
+  for (int x = 0, cell0 = 0; x < total; x += (int)N, cell0 += (int)N / cw)
+  {
+    V64 acc[BARD_NMAP];
+    for (int t = 0; t < BARD_NMAP; ++t) acc[t] = hn::Zero(d64);
+    const auto mesh = hn::Gt(hn::LoadU(du, smask + x), hn::Zero(du));
+    // A column's taps can only fall outside the image within MAXLAG of either end, so
+    // the validity masks are loaded for the two edge blocks and skipped everywhere else.
+    const bool edge = x < BARD_MAXLAG || x + (int)N > total - BARD_MAXLAG;
+    for (int q = 0; q < nrows; ++q)
+    {
+      const int r = rws[q];
+      const uint8_t *IF_RESTRICT prow = pbase + (size_t)(r % slots) * prs;
+      const V c = hn::LoadU(du, prow + x);
+      V dmax = hn::Zero(du), lmax = hn::Zero(du), resp[BARD_NL];
+      for (int j = 0; j < BARD_NL; ++j)
+      {
+        const int d = BARD_LAGS[j];
+        V dk = hn::Zero(du), lt = hn::Zero(du);
+        if ((lagmask >> j) & 1)
+        {
+          // min(max(l-c,0), max(r-c,0)) == max(min(l,r) - c, 0) == SatSub(min(l,r), c),
+          // and the light side is SatSub(c, max(l,r)). Combining the two axes with max
+          // distributes through the same way, so taking min/max of each tap PAIR first
+          // and doing the saturating subtract once per polarity turns 14 ops a lag
+          // into 8 -- and lag arithmetic is over half this kernel.
+          // Columns whose +/-d taps fall outside the image must contribute nothing on
+          // this axis -- but the vertical axis may still contribute, so the mask has to
+          // apply BEFORE the two axes combine. Forcing the dark side's base to 0 and the
+          // light side's to 255 does exactly that under saturating arithmetic: SatSub(0,
+          // c) and SatSub(c, 255) are both zero for every uint8 c. That removes the
+          // scalar per-pixel border strips, which measured at 39% of this kernel.
+          // column (x*P) +/- d lives in phase (d % P) at index x +/- d/P; with P == 1
+          // this is the plain prow + x -/+ d.
+          const int qd = d / P, rd = d % P;
+          const V l = hn::LoadU(du, prow + (rd ? (int64_t)(P - rd) * phs : 0) - (rd ? qd + 1 : qd)
+                                    + x);
+          const V rr = hn::LoadU(du, prow + (int64_t)rd * phs + qd + x);
+          V lo = hn::Min(l, rr), hi = hn::Max(l, rr);
+          if (edge) // only the first and last block of a row can hold invalid columns
+          {
+            const V vm = hn::LoadU(du, valid + (size_t)j * vstride + x);
+            lo = hn::And(lo, vm);
+            hi = hn::Or(hi, hn::Not(vm));
+          }
+          if (r >= d && r < H - d)
+          {
+            const V u = hn::LoadU(du, pbase + (size_t)((r - d) % slots) * prs + x);
+            const V v = hn::LoadU(du, pbase + (size_t)((r + d) % slots) * prs + x);
+            lo = hn::Max(lo, hn::Min(u, v));
+            hi = hn::Min(hi, hn::Max(u, v));
+          }
+          dk = hn::SaturatedSub(lo, c);
+          lt = hn::SaturatedSub(c, hi);
+        }
+        resp[j] = hn::Max(dk, lt);
+        dmax = hn::Max(dmax, dk);
+        lmax = hn::Max(lmax, lt);
+      }
+      // peak == max_j max(dk_j, lt_j) == max(dmax, lmax), so the gate is one compare
+      const auto keep = hn::And(hn::Ge(hn::Max(dmax, lmax), tau), mesh);
+      auto add = [&](int t, V val) {
+        acc[t] = hn::Add(acc[t], hn::SumsOf8(hn::IfThenElseZero(keep, val)));
+      };
+      add(0, one);
+      for (int j = 0; j < BARD_NL; ++j) add(1 + j, resp[j]);
+      add(1 + BARD_NL, dmax);
+      add(2 + BARD_NL, lmax);
+    }
+    for (int t = 0; t < BARD_NMAP; ++t) // groups -> cells, once per block per cell row
+    {
+      uint64_t *IF_RESTRICT a = cells + (size_t)t * ncell + cell0;
+      if (gshift == 0)
+        hn::StoreU(hn::Add(hn::LoadU(d64, a), acc[t]), d64, a);
+      else if (gshift == 1)
+      {
+        const hn::Half<decltype(d64)> dh;
+        const auto pr = hn::Add(hn::ConcatEven(d64, acc[t], acc[t]),
+                                hn::ConcatOdd(d64, acc[t], acc[t]));
+        hn::StoreU(hn::Add(hn::LoadU(dh, a), hn::LowerHalf(dh, pr)), dh, a);
+      }
+      else
+      {
+        uint64_t g[64];
+        hn::StoreU(acc[t], d64, g);
+        for (size_t i = 0; i < G; ++i) a[i >> gshift] += g[i];
+      }
+    }
+  }
+}
+
+// Fold one row's gated maps into that row's cell sums, on the sampling mesh. Gated-out
+// pixels contribute zero, so there is no branch; the maps are u8 and a cell row holds
+// at most a few hundred of them, so the partials stay in int32 until the cell closes.
+void bard_row_reduce(const uint8_t *IF_RESTRICT out, size_t os, int cw, int ncell, int ncellbuf,
+                     uint64_t *IF_RESTRICT cells, bool wide)
+{
+  namespace hn = hwy::HWY_NAMESPACE;
+  for (int t = 0; t < BARD_NMAP; ++t)
+  {
+    const uint8_t *IF_RESTRICT m = out + (size_t)t * os;
+    uint64_t *IF_RESTRICT a = cells + (size_t)t * ncell;
+    if (wide)
+    {
+      // SumsOf8 (psadbw) horizontally sums each 8-byte group into one u64, and with
+      // cw a multiple of 8 a group never straddles a cell, so one instruction does
+      // what was eight dependent byte adds. Off-mesh and gated-out columns are
+      // already zero, so no masking is needed here.
+      const hn::ScalableTag<uint8_t> du;
+      const hn::Repartition<uint64_t, decltype(du)> d64;
+      const size_t N = hn::Lanes(du), G = N / 8;
+      uint64_t g[64];
+      for (int x = 0; x < ncell * cw; x += (int)N)
+      {
+        hn::StoreU(hn::SumsOf8(hn::LoadU(du, m + x)), d64, g);
+        for (size_t i = 0; i < G; ++i)
+          a[(size_t)((x + 8 * (int)i) / cw)] += g[i];
+      }
+    }
+    else
+      for (int e = 0; e < ncell; ++e)
+      {
+        // off-mesh columns are already zero, so this is a flat contiguous sum the
+        // compiler vectorizes; u8 inputs and a cell row of a few hundred cannot
+        // overflow int32.
+        int32_t v = 0;
+        for (int x = e * cw, xe = e * cw + cw; x < xe; ++x) v += m[x];
+        a[(size_t)e] += (uint64_t)v;
+      }
+  }
+}
+
 void accumulate_hash_row(const uint8_t *IF_RESTRICT vb, int C, int sx,
                          const int *IF_RESTRICT beg, const int *IF_RESTRICT end,
                          const int *IF_RESTRICT rhc, int nrun, int64_t *IF_RESTRICT hrowbase)
@@ -354,6 +755,12 @@ class FeatureComputer
   std::vector<int> row_cell_;
   int32_t hcx_[HB - 1] = {}, hcy_[HB - 1] = {};
   int hog_card_[HB] = {};    // 1 for the axis-aligned (cardinal) orientation bins
+  int bard_chunk_rows_ = 4; // sampled rows per kernel call; bounds the plane window
+  std::vector<uint8_t> bvalid_; // per lag: 255 where both +/-d column taps are in range
+  size_t bvalid_stride_ = 0;
+  int bard_p_ = 1;           // column phases the planes are split into (1 = not split)
+  int bard_slots_ = 9;       // rolling plane window rows (see the window comment)
+  int bard_lagmask_ = 0;     // bit j set iff bard lag j fits the image (see bard_pixel)
   int np_ = 0;               // number of channel pairs (0 if C<2 or C>XMAX)
   std::vector<int> pi_, pj_; // the pairs, in (i<j) lexicographic order
 
@@ -365,6 +772,16 @@ class FeatureComputer
     std::vector<uint8_t> r0, r1, r2, cmx, cmn, mx, mn, lb;
     std::vector<int16_t> vs, vd, gx, gy;
     std::vector<int64_t> hsum;   // private hash partial; bands >0 only, and only if !hfast_
+    std::vector<uint8_t> bp;     // padded de-interleaved planes: rolling BARD_SLOTS-row window
+    std::vector<uint8_t> bq;     // the row in flight: BARD_NMAP gated maps
+    std::vector<uint8_t> smask;  // 255 on the sampling mesh, 0 off it
+    std::vector<uint8_t> lin;    // one row, channels contiguous, for the phase split
+    std::vector<uint8_t> smaskv; // smask with both border strips zeroed, for the fused path
+    std::vector<uint64_t> bcell; // [c][BARD_NMAP][ncell] sums for the cell row in flight
+    int64_t bp_rs = 0;           // padded plane row stride
+    size_t bqs = 0;              // stride between maps in bq
+    int64_t bp_phase = 0;        // stride between a row's phase planes
+    int bp_filled = 0;           // rows [.., bp_filled) of the window are loaded
     const uint8_t *vrow = nullptr; // centre row prepare_row settled on (image or scratch)
   };
   std::vector<Scratch> scr_;
@@ -476,6 +893,36 @@ class FeatureComputer
     // gain, relative to brightness (dark textured cells read as high contrast). The +1 grey
     // level floors the denominator on near-black cells.
     g[7] = (float)(sd / (mom[0] + 1.0));
+    // --- bar detector (see BARD_LAGS) ---
+    // Every term but `cover` is a ratio of gated sums, so the sampled-pixel count
+    // cancels and the block is invariant to stride and cell size.
+    float *IF_RESTRICT q = f + BARDF0;
+    q[0] = (float)((double)s[BARD0] * invn);
+    double btot = 0.0;
+    for (int j = 0; j < BARD_NL; ++j) btot += (double)s[BARD_S0 + j];
+    const double binv = btot > 1e-9 ? 1.0 / btot : 0.0;
+    double bpk = 0.0;
+    for (int j = 0; j < BARD_NL; ++j)
+    {
+      const double m = (double)s[BARD_S0 + j];
+      q[1 + j] = (float)(m * binv); // spectrum: share of response mass at this lag
+      bpk += m * (double)(j + 1);
+    }
+    q[1 + BARD_NL] = (float)(bpk * binv); // mass-weighted mean lag index, in [1, NL]
+    const double bmean = btot / (double)BARD_NL;
+    double bvar = 0.0;
+    for (int j = 0; j < BARD_NL; ++j)
+    {
+      const double e = (double)s[BARD_S0 + j] - bmean;
+      bvar += e * e;
+    }
+    bvar /= (double)BARD_NL;
+    // CV of the lag profile: high when one stroke width dominates, low when the
+    // response spreads evenly over every lag (texture).
+    q[2 + BARD_NL] = (float)(bmean > 1e-9 ? std::sqrt(bvar < 0.0 ? 0.0 : bvar) / bmean : 0.0);
+    const double bdk = (double)s[BARD_DARK], blt = (double)s[BARD_LIGHT];
+    // Polarity in [-1, 1]: +1 all light-on-dark, -1 all dark-on-light.
+    q[3 + BARD_NL] = (float)(bdk + blt > 1e-9 ? (blt - bdk) / (bdk + blt) : 0.0);
   }
 
   // Cross-channel covariance and Pearson correlation per channel pair, from the raw
@@ -659,14 +1106,117 @@ class FeatureComputer
     int64_t *IF_RESTRICT hs = hfast_ ? nullptr : (bi ? s.hsum.data() : hsum_.data());
     namespace hn = hwy::HWY_NAMESPACE;
     const int L = (int)hn::Lanes(hn::CappedTag<int32_t, SIMD_CH>());
+    // Prime the rolling window with the rows the first processed row's taps need.
+    int by = std::max(0, bands_[bi].r0 - BARD_MAXLAG);
+    for (int y = by; y <= std::min(h_ - 1, bands_[bi].r0 + BARD_MAXLAG); ++y)
+        deinterleave_row(img, rs, cs, coff_.data(), c_, w_, y, interleaved_, s.bp_rs, bard_slots_,
+                         bard_p_, s.bp_phase, s.lin.data(), s.bp.data());
+    s.bp_filled = std::min(h_ - 1, bands_[bi].r0 + BARD_MAXLAG) + 1;
+    // Everything below is in SAMPLED-column space: with the planes split into
+    // bard_p_ phases, phase 0 holds exactly the sampled columns, so a cell of cw image
+    // columns is cw / bard_p_ of them and the row is that many times nfx.
+    const int cw_s = cw / bard_p_;
+    const int bard_total = cw_s * nfx;
+    // psadbw groups 8 columns, so it can stand in for the per-cell fold only when a
+    // group never straddles a cell and the group -> cell map is a shift.
+    const int bard_gpc = cw_s / 8, bard_gshift = bard_gpc ? __builtin_ctz((unsigned)bard_gpc) : 0;
+    // ... and only while a vector spans a whole number of cells, so the running cell
+    // index advances exactly; wider cells than a vector fall back to the fold.
+    const int bard_lanes = (int)hn::Lanes(hn::ScalableTag<uint8_t>());
+    // ... and only while the row is a whole number of vectors, since a partial
+    // trailing vector's groups would scatter past the last cell.
+    const bool bard_wide = cw_s % 8 == 0 && bard_gpc > 0 && (bard_gpc & (bard_gpc - 1)) == 0
+                           && bard_total % cw_s == 0 && cw_s <= bard_lanes
+                           && bard_lanes % cw_s == 0 && bard_total % bard_lanes == 0;
+    int bard_cy = -1;
+    std::vector<int> bard_rows;
+    // Flush the open cell row's buffer into the pyramid accumulators.
+    auto bard_flush = [&](int cy) {
+      int64_t *IF_RESTRICT base = fb + (size_t)(cy * nfx) * c_ * NSUM;
+      // Cell-major. A cell's BARD_NMAP accumulators are adjacent in the destination, so
+      // this touches one cache line per cell per channel and writes it once. Walking
+      // maps on the outside instead strides the destination by c*NSUM int64 on every
+      // write and revisits each line BARD_NMAP times -- with nfx*c_*BARD_NMAP writes per
+      // cell row, that ordering is most of what the bank costs on a fine grid.
+      for (int e = 0; e < nfx; ++e)
+        for (int k = 0; k < c_; ++k)
+        {
+          int64_t *IF_RESTRICT d = base + (size_t)e * c_ * NSUM + (size_t)k * NSUM + BARD0;
+          const uint64_t *IF_RESTRICT src = s.bcell.data() + (size_t)k * BARD_NMAP * nfx + e;
+          for (int t = 0; t < BARD_NMAP; ++t) d[t] += (int64_t)src[(size_t)t * nfx];
+        }
+      std::fill(s.bcell.begin(), s.bcell.end(), (uint64_t)0);
+    };
+    // One cell row's bard pass: collect its sampled rows, run the fused kernel per
+    // channel, add the border columns the vector body scored zero, then flush.
+    // Run the rows collected so far. The plane window must hold every row a pending
+    // chunk can touch, so bounding the chunk bounds the window: tied to cell height it
+    // grows with the grid and spills L1, turning every tap into an L2 hit. Sums land in
+    // `cells` and are flushed to the pyramid when the cell row closes.
+    auto bard_chunk = [&]() {
+      if (bard_rows.empty()) return;
+      const size_t pstride = (size_t)bard_slots_ * (size_t)s.bp_rs;
+      for (int k = 0; k < c_; ++k)
+      {
+        const uint8_t *IF_RESTRICT pbase = s.bp.data() + (size_t)k * pstride + BARD_LPAD;
+        uint64_t *IF_RESTRICT cells = s.bcell.data() + (size_t)k * BARD_NMAP * nfx;
+        if (bard_wide)
+          bard_cellrow_fused(pbase, s.bp_rs, bard_slots_, bard_rows.data(),
+                             (int)bard_rows.size(), h_, bard_lagmask_,
+                             bard_total, cw_s, bard_gshift, nfx, cells, s.smask.data(),
+                             bvalid_.data(), bvalid_stride_, bard_p_, s.bp_phase);
+        for (size_t qi = 0; qi < bard_rows.size(); ++qi)
+        {
+          const int r = bard_rows[qi];
+          const uint8_t *IF_RESTRICT prow = pbase + (size_t)(r % bard_slots_) * s.bp_rs;
+          const uint8_t *up[BARD_NL], *dn[BARD_NL];
+          for (int j = 0; j < BARD_NL; ++j)
+          {
+            const int d = BARD_LAGS[j];
+            up[j] = pbase + (size_t)(((r - d) % bard_slots_ + bard_slots_) % bard_slots_) * s.bp_rs;
+            dn[j] = pbase + (size_t)((r + d) % bard_slots_) * s.bp_rs;
+          }
+          if (!bard_wide)
+          {
+            bool vok[BARD_NL];
+            for (int j = 0; j < BARD_NL; ++j)
+              vok[j] = ((bard_lagmask_ >> j) & 1) && r >= BARD_LAGS[j] && r < h_ - BARD_LAGS[j];
+            bard_row_dense(prow, up, dn, bard_lagmask_, bard_total, s.bq.data(), s.bqs, vok,
+                           s.smask.data()); // only reachable with bard_p_ == 1
+            for (int x = 0; x < BARD_MAXLAG && x < bard_total; ++x)
+              bard_pixel(prow, up, dn, h_, w_, r, x, bard_lagmask_, s.smask.data(), s.bq.data(),
+                         s.bqs);
+            for (int x = std::max(0, w_ - BARD_MAXLAG); x < bard_total; ++x)
+              bard_pixel(prow, up, dn, h_, w_, r, x, bard_lagmask_, s.smask.data(), s.bq.data(),
+                         s.bqs);
+            bard_row_reduce(s.bq.data(), s.bqs, cw_s, nfx, BARD_NMAP, cells, false);
+          }
+          // the fused path needs no border pass: its validity masks handle those columns
+        }
+      }
+      bard_rows.clear();
+    };
     for (int r = bands_[bi].r0; r < bands_[bi].r1; r += sy_)
     {
+      // A cell row's rows all fold into the same cells, so bard runs once the cell
+      // row is complete -- before the window advances past its rows.
+      if (row_cell_[r] != bard_cy)
+      {
+        bard_chunk();
+        if (bard_cy >= 0) bard_flush(bard_cy);
+        bard_cy = row_cell_[r];
+      }
       prepare_row(s, img, r, rs, cs);
       int64_t *IF_RESTRICT rb = fb + (size_t)(row_cell_[r] * nfx) * c_ * NSUM;
       for (int ch0 = 0; ch0 < c_; ch0 += L)
         accumulate_row(s.gx.data(), s.gy.data(), s.vrow, s.mx.data(), s.mn.data(), s.lb.data(),
                        c_, ch0, cw, nfx, std::min(L, c_ - ch0), sx_, hcx_, hcy_, c_ * NSUM,
                        rb + (size_t)ch0 * NSUM);
+      for (; s.bp_filled <= std::min(h_ - 1, r + BARD_MAXLAG); ++s.bp_filled)
+          deinterleave_row(img, rs, cs, coff_.data(), c_, w_, s.bp_filled, interleaved_, s.bp_rs,
+                           bard_slots_, bard_p_, s.bp_phase, s.lin.data(), s.bp.data());
+      bard_rows.push_back(r);
+      if ((int)bard_rows.size() == bard_chunk_rows_) bard_chunk();
       if (np_)
         accumulate_cross_row(s.vrow, c_, cw, nfx, sx_, np_, pi_.data(), pj_.data(),
                              fine.xbuf.data() + (size_t)(row_cell_[r] * nfx) * np_);
@@ -674,6 +1224,8 @@ class FeatureComputer
         accumulate_hash_row(s.vrow, c_, sx_, hrbeg_.data(), hrend_.data(), hrhc_.data(),
                             (int)hrhc_.size(), hs + (size_t)hrow_[r] * HN * c_);
     }
+    bard_chunk();
+    if (bard_cy >= 0) bard_flush(bard_cy);
   }
 
   void worker(int bi)
@@ -1037,6 +1589,11 @@ public:
           pj_.push_back(j);
         }
     np_ = (int)pi_.size();
+    // A lag whose span exceeds the smaller side is dropped on BOTH axes, matching the
+    // dense reference maps rather than testing each axis independently.
+    bard_lagmask_ = 0;
+    for (int j = 0; j < BARD_NL; ++j)
+      if (BARD_SPAN * BARD_LAGS[j] < std::min(h_, w_)) bard_lagmask_ |= 1 << j;
 
     for (int k = 1; k < HB; ++k)
     {
@@ -1094,6 +1651,36 @@ public:
     for (int r = 0; r < h_; ++r)
       row_cell_[r] = (int)((int64_t)r * levels_[0].ny / h_);
 
+    // The fold runs per cell row, so the plane window must span one cell row's rows
+    // plus a MAXLAG halo on each side.
+    // Sized so the window stays inside L1: a chunk reaches (chunk-1)*sy + 2*MAXLAG + 1
+    // rows, and the window is c * slots * (w + padding) bytes.
+    // A lag contributes on the horizontal axis only where BOTH its taps are inside the
+    // image; the mask is a property of the column alone, so it is built once here.
+    // Split the planes by column phase when a cell still holds a whole number of
+    // psadbw groups afterwards; otherwise leave them whole (P = 1). Sampled columns are
+    // phase 0, so the kernel walks 1/P as many vectors for identical output.
+    {
+      const int cwf = levels_.empty() ? 0 : w_ / levels_[0].nx;
+      bard_p_ = (sx_ > 1 && w_ % sx_ == 0 && cwf % (8 * sx_) == 0) ? sx_ : 1;
+    }
+    bvalid_stride_ = (size_t)(w_ / bard_p_) + SIMD_PAD + BARD_LPAD + BARD_RPAD;
+    bvalid_.assign(bvalid_stride_ * BARD_NL, 0);
+    for (int j = 0; j < BARD_NL; ++j)
+    {
+      const int d = BARD_LAGS[j];
+      for (int xs = 0; xs < w_ / bard_p_; ++xs)
+      {
+        const int x = xs * bard_p_; // original column of this sampled column
+        if (x >= d && x < w_ - d) bvalid_[(size_t)j * bvalid_stride_ + (size_t)xs] = 255;
+      }
+    }
+    // Chunk the whole cell row, not a fixed slice of it. A bigger chunk measured
+    // strictly faster at every size tried: each plane row's vector serves more of the
+    // centres that use it as a tap while it is still hot, and the per-block reduction
+    // amortizes over more rows. The window has to span the cell row plus a halo.
+    bard_chunk_rows_ = INT_MAX;
+    bard_slots_ = std::max(2 * BARD_MAXLAG + 1, h_ / levels_[0].ny + 2 * BARD_MAXLAG + 1);
     coff_.assign(c_, 0);
 
     graw_.assign((size_t)c_ * NSUM, 0);
@@ -1188,6 +1775,19 @@ public:
         v->assign(wcp, 0);
       for (std::vector<int16_t> *v : {&s.vs, &s.vd, &s.gx, &s.gy})
         v->assign(wcp, 0);
+      s.bp_phase = (int64_t)(w_ / bard_p_) + BARD_LPAD + BARD_RPAD;
+      s.bp_rs = s.bp_phase * bard_p_;
+      // one slack row so the final vector's overrun stays inside the allocation
+      s.bp.assign((size_t)c_ * (size_t)bard_slots_ * (size_t)s.bp_rs + (size_t)s.bp_rs, 0);
+      s.bqs = (size_t)w_ + SIMD_PAD + 128; // own store slack; not tied to plane padding // a whole vector of store slack for the row maps
+      s.bq.assign(s.bqs * (size_t)BARD_NMAP, 0);
+      s.smask.assign(s.bqs, 0);
+      for (int x = 0; x < w_ / bard_p_; x += sx_ / bard_p_) s.smask[(size_t)x] = 255;
+      s.bcell.assign((size_t)c_ * BARD_NMAP * (size_t)levels_[0].nx + 8, 0u);
+      s.lin.assign((size_t)c_ * (size_t)w_ + SIMD_PAD, 0);
+      s.smaskv = s.smask;
+      for (int x = 0; x < BARD_MAXLAG && x < w_; ++x) s.smaskv[(size_t)x] = 0;
+      for (int x = std::max(0, w_ - BARD_MAXLAG); x < w_; ++x) s.smaskv[(size_t)x] = 0;
       if (b && !hfast_)
         s.hsum.assign((size_t)HN * HN * c_, 0);
     }
@@ -1289,6 +1889,7 @@ NB_MODULE(imfeat_core, m)
   m.doc() = "imfeat internal C++ module. Public API: imfeat.FeatureComputer.";
   m.attr("HB") = HB;     // HOG orientation-bin count; Python derives its bin labels from this
   m.attr("LBPB") = LBPB; // LBP^riu2 bin count (9 uniform + 1 non-uniform)
+  m.attr("BARD_NL") = BARD_NL; // bar-detector lag count (sizes the spectrum block)
   m.attr("XMAX") = XMAX; // cross-channel products are computed only for C <= XMAX
   m.def("cpu_count", [] { //  0 when the runtime cannot tell; callers see at least 1
     const unsigned n = std::thread::hardware_concurrency();
