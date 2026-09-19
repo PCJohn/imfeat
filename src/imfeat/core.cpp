@@ -667,7 +667,7 @@ void bard_cellrow_fused(const uint8_t *IF_RESTRICT pbase, int64_t prs, int slots
       }
       else
       {
-        uint64_t g[64];
+        uint64_t g[HWY_MAX_BYTES / 8]; // one u64 per 8-byte group of the widest vector
         hn::StoreU(acc[t], d64, g);
         for (size_t i = 0; i < G; ++i) a[i >> gshift] += g[i];
       }
@@ -695,7 +695,7 @@ void bard_row_reduce(const uint8_t *IF_RESTRICT out, size_t os, int cw, int ncel
       const hn::ScalableTag<uint8_t> du;
       const hn::Repartition<uint64_t, decltype(du)> d64;
       const size_t N = hn::Lanes(du), G = N / 8;
-      uint64_t g[64];
+      uint64_t g[HWY_MAX_BYTES / 8]; // one u64 per 8-byte group of the widest vector
       for (int x = 0; x < ncell * cw; x += (int)N)
       {
         hn::StoreU(hn::SumsOf8(hn::LoadU(du, m + x)), d64, g);
@@ -1119,7 +1119,12 @@ class FeatureComputer
     const int bard_total = cw_s * nfx;
     // psadbw groups 8 columns, so it can stand in for the per-cell fold only when a
     // group never straddles a cell and the group -> cell map is a shift.
-    const int bard_gpc = cw_s / 8, bard_gshift = bard_gpc ? __builtin_ctz((unsigned)bard_gpc) : 0;
+    // log2 of the group count. bard_wide below requires a power of two, and this runs
+    // once per band, so a loop is clearer than a compiler builtin -- and __builtin_ctz
+    // does not exist on MSVC.
+    const int bard_gpc = cw_s / 8;
+    int bard_gshift = 0;
+    while ((1 << bard_gshift) < bard_gpc) ++bard_gshift;
     // ... and only while a vector spans a whole number of cells, so the running cell
     // index advances exactly; wider cells than a vector fall back to the fold.
     const int bard_lanes = (int)hn::Lanes(hn::ScalableTag<uint8_t>());
