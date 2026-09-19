@@ -1667,7 +1667,13 @@ public:
     // phase 0, so the kernel walks 1/P as many vectors for identical output.
     {
       const int cwf = levels_.empty() ? 0 : w_ / levels_[0].nx;
-      bard_p_ = (sx_ > 1 && w_ % sx_ == 0 && cwf % (8 * sx_) == 0) ? sx_ : 1;
+      // Split by column parity, never more than two phases: deinterleave_row only has
+      // a wide path for P <= 2, and more phases drop it onto the scalar per-byte loop
+      // (that cost +300% at 1024^2 finest-32 stride 4, where P would have been 4). Two
+      // is enough for any even stride anyway, since the sampled columns are always a
+      // subset of phase 0, and it is worth doing only while the split cell stays a
+      // whole psadbw group.
+      bard_p_ = (sx_ % 2 == 0 && w_ % 2 == 0 && cwf % 2 == 0 && (cwf / 2) % 8 == 0) ? 2 : 1;
     }
     bvalid_stride_ = (size_t)(w_ / bard_p_) + SIMD_PAD + BARD_LPAD + BARD_RPAD;
     bvalid_.assign(bvalid_stride_ * BARD_NL, 0);
