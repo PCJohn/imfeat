@@ -2,501 +2,285 @@
 
 Fast, exact, single-pass image feature extraction on CPU.
 
-`imfeat` walks an image **once** and returns, for every channel and every cell of a dyadic
-pyramid: intensity **moments**, gradient **structure-tensor** features, an **orientation
-histogram**, **extrema densities** and a rotation-invariant **LBP** histogram — plus
-**cross-channel** covariance between every pair of channels, and three whole-frame
-**perceptual hashes** (`imagehash`-compatible aHash / wHash / pHash). It is a
-C++/[Highway](https://github.com/google/highway) SIMD core behind a small
-[nanobind](https://github.com/wjakob/nanobind) Python API.
+`imfeat` walks a uint8 image **once** and returns, for every channel and every cell of a dyadic
+grid pyramid, 54 classical features: intensity **moments**, gradient **structure tensor**, an
+**orientation histogram**, **extrema densities**, a rotation-invariant **LBP** histogram,
+nonlinear **descriptors** of those, a **bar / stroke detector** and second-order **texture**
+energies (Laplacian, Laws). It also returns **cross-channel** covariance per channel pair,
+whole-frame **projection profiles** and three `imagehash`-compatible **perceptual hashes**.
 
-It is built for the front of a real-time vision pipeline: hand-crafted, well-understood,
-weakly-correlated features, cheap enough to run on every frame, that a downstream model (a
-net, a tree, a classical rule) can consume directly.
+It is a C++17 / [Highway](https://github.com/google/highway) SIMD core behind a small
+[nanobind](https://github.com/wjakob/nanobind) Python API, built for the front of a real-time
+pipeline: well-understood, weakly correlated features, cheap enough for every frame (about
+0.4 ms for a 256×256×3 frame at stride 2 on one core), that a net, a tree or a rule can
+consume directly. Every integer sum is exact and the output is bit-identical at any thread count.
 
 ```python
 import cv2, imfeat
 
-img = cv2.imread("frame.png")                      # (H, W, 3) uint8, BGR
-hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-
+hsv = cv2.cvtColor(cv2.imread("frame.png"), cv2.COLOR_BGR2HSV)      # (H, W, 3) uint8
 fc = imfeat.FeatureComputer(shape=hsv.shape, grid=[(5, 5), (4, 4)], stride=2)
-p = fc.features(hsv)                               # one pass, all channels, both levels
+p = fc.features(hsv)                       # one pass: all channels, both levels, global
 
-p.maps[0]         # (32, 32, 114) float32  3 channels x 38 FEATURE_NAMES, channel-major
-p.maps[-1]        # (114,)        float32  whole-frame (global) level
-p.moments[0]      # (32, 32, 3, 4) float64 [mean, var, m3, m4] at full precision
-p.summary[0]      # (38, 3, 4)    float64  each feature's [min, max, mean, std] across cells
-p.cross[0]        # (32, 32, 3, 2) float32 [cov, corr] per channel pair
-p.hashes          # (3, 3)        uint64   [ahash, whash, phash] x channel
+p.maps[0]      # (32, 32, 162) float32   3 channels x 54 FEATURE_NAMES, channel-major
+p.maps[-1]     # (162,)        float32   the whole-frame (global) level
+p.moments[0]   # (32, 32, 3, 4) float64  [mean, var, m3, m4] at full precision
+p.summary[0]   # (54, 3, 4)    float64   each feature's [min, max, mean, std] over the cells
+p.cross[0]     # (32, 32, 3, 2) float32  [cov, corr] per channel pair
+p.hashes       # (3, 3)        uint64    [ahash, whash, phash] x channel
+p.profiles     # (rows, cols)  float64   mean of each sampled row / column, per channel
 
-f = p.maps[0].reshape(32, 32, 3, 38)               # free view: (cy, cx, channel, feature)
+f = p.maps[0].reshape(32, 32, 3, 54)       # free view: (cy, cx, channel, feature)
 energy_v = f[..., 2, imfeat.FEATURE_NAMES.index("energy")]
 ```
+
+More detail lives in two companion documents:
+[docs/FEATURES.md](docs/FEATURES.md) (every feature: definition, formula, invariances, uses)
+and [docs/OPTIMIZATION.md](docs/OPTIMIZATION.md) (how the core got fast: what worked, what did
+not, how it was measured and verified).
 
 ---
 
 ## Install
 
 ```bash
-pip install git+https://github.com/PCJohn/imfeat
-pytest -v -s                 # unit tests + benchmarks (a few minutes; tables print with -s)
-pytest -v -m "not bench"     # unit tests only
+pip install git+https://github.com/PCJohn/imfeat      # needs a C++17 compiler and CMake
+pytest -v -m "not bench"     # unit tests
+pytest -v -s                 # + benchmark tables
 pytest -v -s --full          # + cross-checks vs opencv-python / imagehash (install those first)
-pytest -v -s --reps 200      # timed calls per latency stat (default 500)
 ```
 
-Needs a C++17 compiler and CMake. Tested on Linux (AVX2), macOS/arm64 (NEON) and Windows.
+Tested on Linux/GCC and Windows/MSVC (x86-64). macOS/arm64 (NEON) runs the same Highway code
+but has not been re-measured since the kernel rewrite described below.
 
 ---
 
 ## API
 
-Two calls. Construct once for a fixed input shape, then call per frame — every buffer is
-allocated up front and reused, so steady-state extraction allocates nothing.
+Construct once for a fixed input shape, then call per frame. Every buffer is allocated up
+front; in steady state a frame allocates nothing.
 
 ### `FeatureComputer(shape, grid, stride=None, channels=None, channel_axis=-1, threads=1)`
 
 | arg | meaning |
 |---|---|
-| `shape` | the exact shape of every image you will pass. `(H, W)` single channel, `(H, W, C)` multi-channel. |
-| `grid` | `k` → a 2^k × 2^k grid; `(ky, kx)` → 2^ky × 2^kx; or a **list** of those for a pyramid, finest → coarsest. Levels must be nested; the finest must divide `(H, W)`. |
-| `stride` | `None` / `int` / `(sy, sx)`. Subsamples which pixels are accumulated. See *Efficient use*. |
-| `channels` | which channels to process. Default `None` = **all of them**. |
-| `channel_axis` | where the channel axis lives. Default `-1` (OpenCV `(H, W, C)`). Read via a zero-copy transpose. |
-| `threads` | bands for the accumulate pass. Default `1`. Bit-identical output at any count; `.threads` reports what was used. See *Efficient use*. |
+| `shape` | exact shape of every image: `(H, W)` or `(H, W, C)`, uint8 |
+| `grid` | `k` → 2^k × 2^k cells; `(ky, kx)` → 2^ky × 2^kx; or a **list**, finest → coarsest, for a pyramid. Levels must nest; the finest must divide `(H, W)` |
+| `stride` | `None` / `int` / `(sy, sx)`: which pixels are sampled (restarting in every cell) |
+| `channels` | channels to process; default all |
+| `channel_axis` | default `-1` (OpenCV layout); read through a zero-copy transpose |
+| `threads` | bands of cell rows processed in parallel. Default `1`. Output is bit-identical at any count; `.threads` reports what was used, `imfeat.cpu_count()` what is available |
 
 ### `.features(img) -> Pyramid`
 
-The derived, model-ready pyramid, as a `Pyramid` namedtuple. Every list has one entry per
-grid level, finest first, then the 1-cell `global` level (shapes drop the `(cy, cx)` axes
-there). `C` is the number of selected channels, `F = 38 = len(imfeat.FEATURE_NAMES)`.
+A namedtuple. Lists have one entry per grid level, finest first, then a 1-cell `global` level
+(whose shapes drop `(cy, cx)`). `C` = selected channels, `F = len(imfeat.FEATURE_NAMES) = 54`.
 
 | field | shape per level | dtype | contents |
 |---|---|---|---|
-| `maps` | `(cy, cx, C*F)` | float32 | every per-channel feature, channel-major over `FEATURE_NAMES` |
-| `moments` | `(cy, cx, C, 4)` | float64 | `MOMENTS` — the trailing 4 features of `maps`, at full precision |
-| `summary` | `(F, C, 4)` | float64 | each feature reduced **across the level's cells** into `SUMMARY_STATS`; grid levels only |
-| `cross` | `(cy, cx, P, 2)` | float32 | `CROSS_FEATURES` — cov, corr per channel pair; empty list when `P = 0` |
-| `hashes` | `(3, C)` (not a list) | uint64 | `HASHES` — ahash, whash, phash per channel, whole-frame |
+| `maps` | `(cy, cx, C*F)` | float32 | every per-channel feature, **channel-major** over `FEATURE_NAMES` |
+| `moments` | `(cy, cx, C, 4)` | float64 | `MOMENTS` at full precision (m3, m4 outgrow float32) |
+| `summary` | `(F, C, 4)` | float64 | each feature over the level's cells as `SUMMARY_STATS = [min, max, mean, std]`; grid levels only |
+| `cross` | `(cy, cx, P, 2)` | float32 | `CROSS_FEATURES = [cov, corr]` per channel pair (`fc.channel_pairs`); empty for one channel or `C > 8` |
+| `hashes` | `(3, C)`, not a list | uint64 | `HASHES = [ahash, whash, phash]`, whole frame |
+| `profiles` | `((R, C), (K, C))` | float64 | mean of each sampled row and of each sampled column, whole frame |
 
-`FEATURE_NAMES` is the per-channel feature order, group by group: `FEATURES` (structure
-tensor, 5), `HOG_FEATURES` (9), `COUNT_FEATURES` (2), `LBP_FEATURES` (10),
-`DESCRIPTOR_FEATURES` (8), `MOMENTS` (4). So `m.reshape(cy, cx, C, 38)` is a free view with
-channel and feature axes separated. For 2-D `(H, W)` input `C = 1`: `maps` has 38 channels
-and the other fields keep a size-1 channel axis.
+`FEATURE_NAMES` concatenates the group tuples in order — index features by name, never by
+number:
 
-`moments` exists because m3 and m4 span a range float32 cannot hold to the accuracy the
-oracle tests require: use `moments` when precision matters and `maps` when feeding a model.
-
-`summary` is a per-level cross-cell reduction: for each channel and feature, the feature's
-value over the level's `cy·cx` cells, as `[min, max, mean, std]` (min/max exact, mean/std
-population). The peak cell variance of channel `V` on level 0 is
-
-```python
-p.summary[0][imfeat.FEATURE_NAMES.index("var"), V, imfeat.SUMMARY_STATS.index("max")]
-```
-
-It is folded into the derive pass (no extra traversal) and exists for grid levels only — a
-single global cell has a degenerate cross-cell summary.
-
-`cross` is the one group that is **not** per channel: one row per *pair* of channels,
-`P = C*(C-1)/2`, listed in `fc.channel_pairs` as index pairs into the selected channels. It
-is empty when there are no pairs — a single channel, or `C > 8`, where the quadratic pair
-count is not worth paying silently.
-
-`hashes` are whole-frame perceptual hashes (no pyramid): one `uint64` per channel, packed
-row-major MSB-first. See [§8](#8-perceptual-hashes--ahash-whash-phash) for what they encode
-and how they relate to the `imagehash` package.
-
-#### Using the pyramid
-
-The levels form a **dyadic feature pyramid**, finest first, each level half the resolution of
-the one before and the last a single global cell. That is an FPN P3–P6 shape family, so an
-FPN/BiFPN neck, a shared-weight dense head, or a U-Net decoder can consume it as-is. On a
-1024² input with `grid=[(6,6),(5,5),(4,4),(3,3),(2,2),(1,1)]` and `C=3`:
-
-| level | shape | stride vs input |
+| tuple | count | offset |
 |---|---|---|
-| 0 | `(64, 64, 114)` | 16 |
-| 1 | `(32, 32, 114)` | 32 |
-| 2 | `(16, 16, 114)` | 64 |
-| 3 | `(8, 8, 114)` | 128 |
-| 4 | `(4, 4, 114)` | 256 |
-| 5 | `(2, 2, 114)` | 512 |
-| global | `(114,)` | whole frame |
+| `FEATURES` (structure tensor) | 5 | 0 |
+| `HOG_FEATURES` | 9 | 5 |
+| `COUNT_FEATURES` (extrema) | 2 | 14 |
+| `LBP_FEATURES` | 10 | 16 |
+| `DESCRIPTOR_FEATURES` | 8 | 26 |
+| `BARD_FEATURES` | 7 | 34 |
+| `TEXTURE_FEATURES` | 9 | 41 |
+| `MOMENTS` | 4 | 50 |
 
-For **dense prediction** — segmentation, depth, any per-pixel head — the finest level is the
-one that sets your output resolution, and it is a cell grid rather than a pixel grid: level 0
-above predicts at stride 16. Push `grid` finer for a denser map (`(7,7)` gives stride 8 on a
-1024² input) and remember the constraint that comes with it — a cell needs roughly four
-sampled pixels per dimension for its moment and histogram features to mean anything, so
-`cell_px / stride >= 4`. At stride 8 with `stride=2` that is satisfied; at stride 8 with
-`stride=4` it is not. Upsampling a coarse cell grid to pixel resolution is a decoder's job,
-not something to fix by starving the cells.
+The returned arrays are views of one pooled block that they keep alive: they stay valid (and
+writable) across later calls and after the computer is gone, and the block is reused once the
+last of them is dropped.
 
-The finest level is also the only one you strictly need: every coarser level is a pure sum
-of the one below it, so a decoder can rebuild them, and they are provided because computing
-them during the single pass costs almost nothing.
+### `.compute(img) -> dict`
 
-Every feature is per-pixel normalised, so no level carries a cell-area factor and one
-shared-weight head can read every level. The channels do span a very wide dynamic range
-(histogram bins near 1e-2, fourth moments near 1e6), so standardise per channel against
-statistics fixed over a dataset before training — not per frame, which would throw away
-absolute brightness and contrast. `summary` is the cheap way to collect them.
-
-### `.compute(img) -> dict[str, np.ndarray]`
-
-The **raw int64 accumulators** before any nonlinear derivation, as a dict keyed
-`{group}_{level}` (`level` in `0 .. K-1` plus `global`): `struct_i` is
-`[Sxx, Syy, Sxy, count]`, `mom_i` the power sums `[S1, S2, S3, S4]`, `hog_i` the
-unnormalised gradient energy per bin, `cnt_i` and `lbp_i` the raw counts, and `xchan_i`
-the raw products `sum(v_i * v_j)`, shape `(cy, cx, P)`. The `C` axis is dropped for 2-D
-input and `xchan_*` is absent when there are no pairs. This is the low-level validation
-surface; its keys mirror the C++ slot layout.
-
-These are **purely additive**, which makes them composable: sum them over cells, levels,
-channels or *frames* and you get the exact accumulator of the union. Pool however your
-application likes, without re-reading the image.
+The raw **int64 sums** before any nonlinear step, keyed `{group}_{level}`: `struct_i`
+`[Sxx, Syy, Sxy, count]`, `mom_i` `[S1..S4]`, `hog_i`, `cnt_i`, `lbp_i`, and `xchan_i`
+(`Σ v_i·v_j` per channel pair). They are purely additive, so any pooling over cells, levels,
+channels or frames is one `numpy` sum away and exact:
 
 ```python
 raw  = fc.compute(img)
-# exact moments over an arbitrary region of interest -- no second pass
-ps   = raw["mom_0"][8:16, 4:12].sum(axis=(0, 1))            # (C, 4) power sums
-n    = raw["struct_0"][8:16, 4:12, :, 3].sum(axis=(0, 1))   # (C,)   pixel count
+ps   = raw["mom_0"][8:16, 4:12].sum(axis=(0, 1))            # (C, 4) power sums of a region
+n    = raw["struct_0"][8:16, 4:12, :, 3].sum(axis=(0, 1))   # (C,)   its sample count
 mean = ps[:, 0] / n
-var  = ps[:, 1] / n - mean**2
 ```
-
-### Constants
-
-`imfeat.MOMENTS`, `imfeat.FEATURES`, `imfeat.HOG_FEATURES`, `imfeat.COUNT_FEATURES`,
-`imfeat.LBP_FEATURES`, `imfeat.DESCRIPTOR_FEATURES` and `imfeat.CROSS_FEATURES` name each
-group's features, in order, so nothing has to be indexed by magic number;
-`imfeat.FEATURE_NAMES` is their concatenation along the `maps` feature axis.
-`imfeat.SUMMARY_STATS` names the last axis of `summary` (`min, max, mean, std`),
-`fc.channel_pairs` the pair axis of `cross`, and `imfeat.HASHES` the first axis of `hashes`.
 
 ---
 
-## Features computed
+## Features at a glance
 
-Everything below is computed **per channel** and **per cell**, in the same pass. Write `Ω`
-for the pixels a cell samples, and `n = |Ω|`.
+Per channel and per cell ([docs/FEATURES.md](docs/FEATURES.md) has the definitions):
 
-### 1. Intensity moments — `MOMENTS`, 4 values
-
-Central moments of the raw pixel value `v ∈ [0, 255]`:
-
-```
-mean = (1/n) Σ v
-var  = (1/n) Σ (v - mean)²      m3 = (1/n) Σ (v - mean)³      m4 = (1/n) Σ (v - mean)⁴
-```
-
-The standard descriptors follow: `std = √var`, `skew = m3 / std³`, `kurtosis = m4 / var²`.
-Skew is the useful one for bimodality (ink on paper, specular highlights); kurtosis for
-tailedness.
-
-**How.** The textbook two-pass form (mean, then deviations) cannot share a traversal with
-anything else, so imfeat accumulates the **raw power sums** `S1..S4 = Σv, Σv², Σv³, Σv⁴` as
-exact int64 and converts at the end. The naive conversion `var = S2/n - mean²` cancels
-catastrophically on low-variance, high-mean cells, so the sums are first shifted by the
-integer `K = round(mean)` through the binomial expansion:
-
-```
-T1 = S1 - nK
-T2 = S2 - 2K·S1 + nK²
-T3 = S3 - 3K·S2 + 3K²·S1 - nK³
-T4 = S4 - 4K·S3 + 6K²·S2 - 4K³·S1 + nK⁴
-```
-
-Each `Tᵢ` stays exact in int64, and the residual offset `d = T1/n` is `≤ 0.5`, so
-`var = T2/n - d²` has nothing left to cancel. Verified to rtol 1e-12 against numpy even on
-inputs drawn from `{250, 251}`, where the naive form loses ~10 digits.
-
-### 2. Gradient structure tensor — `FEATURES`, 5 values
-
-3×3 Sobel gradients `gx, gy` at every sampled pixel (replicate-padded at the border), then
-the summed second-moment matrix of the gradient field:
-
-```
-J = [ Σgx²   Σgxgy ]     tr = Σgx² + Σgy²     D = Σgx² - Σgy²     R = √(D² + 4(Σgxgy)²)
-    [ Σgxgy  Σgy²  ]
-```
-
-`R` is the spread between `J`'s eigenvalues `λ± = (tr ± R)/2`. The five outputs:
-
-| feature | formula | reads as |
+| group | what it measures | notable property |
 |---|---|---|
-| `energy` | `tr / n` | mean squared gradient magnitude — how much edge/texture is here |
-| `coherence` | `R / tr` | `∈ [0,1]`. 1 = one dominant edge direction, 0 = isotropic clutter |
-| `ori_cos` | `D / tr` | double-angle orientation vector, `cos 2θ` |
-| `ori_sin` | `2·Σgxgy / tr` | double-angle orientation vector, `sin 2θ` |
-| `cornerness` | `λ₋ / n = (tr - R) / 2n` | Shi–Tomasi: large only when *both* eigenvalues are |
+| moments | mean, variance, 3rd and 4th central moments | exact to 1e-12 even on low-variance cells |
+| structure tensor | edge energy, coherence, double-angle orientation, Shi–Tomasi cornerness | orientation averages correctly across cells |
+| HOG | 9-bin orientation histogram of gradient energy | integer binning, no `atan2` |
+| extrema | density of strict local maxima / minima | contrast-insensitive blob and speckle density |
+| LBP | rotation-invariant uniform LBP histogram (10 bins) | invariant to any monotonic intensity change |
+| descriptors | skew, kurtosis, edge sharpness, detail, HOG concentration / cardinality, gradient sparsity, RMS contrast | ratios and products a linear model cannot form |
+| bar detector | stroke cover, stroke-width spectrum, peak width, peakedness, polarity | fires on strokes, not on step edges |
+| texture | variance of the Laplacian, focus, six Laws 3×3 energies, line anisotropy | blur / sharpness, blobs, vertical-vs-horizontal strokes |
+| cross-channel | covariance and correlation per channel pair | the only group relating channels |
+| profiles, hashes | row / column projection profiles; aHash, wHash, pHash | whole frame: 1-D registration, near-duplicate keys |
 
-Orientation is stored as a **double-angle vector**, not an angle. Edge direction is mod π —
-`θ` and `θ+π` are the same edge — so averaging raw angles across cells is simply wrong (0°
-and 179° would average to 90°). The double-angle vector averages correctly, and its length
-*is* the coherence. Recover the angle with `θ = ½·atan2(ori_sin, ori_cos)`.
-
-The tensor is also usefully illumination-robust: brightening a region scales all its
-gradients equally, which moves `energy` but leaves `coherence` and the orientation vector
-alone.
-
-### 3. Orientation histogram — `HOG_FEATURES`, 9 values
-
-Each sampled pixel votes its **gradient energy** `gx² + gy²` into one of 9 orientation bins
-spanning `[0, π)` (bin `b` covers `[b, b+1)·π/9`). The histogram is L1-normalised per cell.
-
-Where the structure tensor reports one *dominant* orientation plus a scalar coherence, the
-histogram carries the full orientation *distribution* — enough to tell "two strong
-perpendicular edge families" (a grid, a fence, hatching) from "isotropic noise", which look
-identical to the tensor's coherence.
-
-**How.** Binning uses integer arithmetic, never `atan2`. The gradient is folded into the
-upper half-plane, then tested against the 8 bin-boundary rays by the sign of a cross
-product; the bin index is just the count of rays it lies past. Branch-free, exact, and it
-vectorises across channels.
-
-### 4. Extrema densities — `COUNT_FEATURES`, 2 values
-
-The fraction of a cell's sampled pixels that are a **strict** maximum (resp. minimum) over
-their 8-neighbourhood. A blob / speckle / keypoint density: high for texture, dots, noise
-and corners; ~0 for smooth gradients and flat regions. Unlike `energy` it is insensitive to
-contrast — a faint blob and a hard blob each count once.
-
-Since the border is replicate-padded, a border pixel sits inside its own neighbourhood and
-therefore can never be a strict extremum. That is deliberate, and consistent across the
-four sides.
-
-### 5. Rotation-invariant uniform LBP — `LBP_FEATURES`, 10 values
-
-The LBP^riu2_{8,1} histogram of Ojala et al. (2002). Each pixel is compared to its 8
-neighbours in **circular order**; the resulting 8-bit sign pattern is called *uniform* if it
-has at most two circular 0→1 transitions, and is then labelled by its popcount (0..8). Bin 9
-collects everything else. The popcount and the transition count are both invariant to
-rotating the ring, which is where the rotation invariance comes from.
-
-This is the one group with properties **no other feature here has**:
-
-* **invariant to any monotonic change of the intensity map** (only the sign of each
-  comparison matters) — so it survives gamma, exposure and contrast changes that move every
-  moment and every gradient statistic;
-* **invariant to 90° rotations and reflections** exactly, and largely to arbitrary rotation.
-
-Read it as a micro-texture descriptor: bins 0/8 are flat or spot-like neighbourhoods, the
-middle bins are edges and corners of varying sharpness, bin 9 is high-frequency clutter.
-
-The comparison is `neighbour >= centre`, so a flat neighbourhood is all-ones — a flat image
-lands entirely in bin 8. The border is replicate-padded, consistently with the extrema.
-
-### 6. Derived descriptors — `DESCRIPTOR_FEATURES`, 8 values
-
-Eight *nonlinear* summaries of the sums above, computed in the same pass at no extra
-accumulator cost. They exist for downstream models: a fast linear or shallow-tree classifier
-can form weighted sums of features for free but cannot cheaply compute a ratio, a product, a
-standardized moment, or a histogram's peakedness — so those are precomputed here rather than
-left for the model to rediscover. Most are invariant to contrast and brightness changes,
-which is what lets a model trained on a handful of pixels transfer across them.
-
-| name | definition | reads | what it separates |
-|---|---|---|---|
-| `std_skew` | `m3 / var^1.5` | moments | bimodal ink-on-paper text (strongly skewed) from symmetric scenes |
-| `excess_kurt` | `m4 / var^2 - 3` | moments | leptokurtic text, platykurtic binary/stripes, near-Gaussian photo |
-| `edge_sharpness` | `energy / (var + 1)` | struct+mom | in-focus detail per unit contrast (a focus/defocus map) |
-| `detail` | `energy * (1 - coherence)` | struct | isotropic edge clutter (QR, foliage) from a single clean edge |
-| `hog_concentration` | `sum p_i^2` over HOG bins | hog | one dominant orientation (barcode) from spread (QR) |
-| `hog_cardinality` | axis-aligned bin fraction | hog | horizontal/vertical structure (text, tables) from diagonal |
-| `grad_sparsity` | `n*sum(g^4)/(sum g^2)^2` = 1+CV^2(grad energy) | gradient | sparse strong edges (rules, glyph/infographic borders) from dense texture |
-| `rms_contrast` | `sqrt(var) / (mean + 1)` | moments | coefficient of variation (Peli 1990); brightness-relative contrast |
-
-`std_skew`, `edge_sharpness` and `detail` are exactly the hand-coded cues the `framegate`
-client computes today; promoting them to first-class features means the model reads them
-directly. `std_skew`, `excess_kurt`, `hog_concentration`, `hog_cardinality` and
-`grad_sparsity` are invariant to any `v -> a*v+b` (`a > 0`); `rms_contrast` to gain only;
-`edge_sharpness` approximately (the `+1` guards flat cells); `detail` scales with `a²`. The
-descriptors are derived only, so they appear in `features()` but not `compute()`; `grad_sparsity` is the one that adds an accumulator
-(`sum |grad|^4`) rather than being computed purely from existing sums.
-
-### 7. Cross-channel covariance — `CROSS_FEATURES`, 2 values per channel pair
-
-For each unordered pair of channels, `[cov, corr]`: the covariance and the Pearson
-correlation of the two channels' pixel values over the cell. Everything else in `imfeat`
-treats each channel independently; this is the only feature that says anything about how
-they *relate*. On RGB it separates neutral regions (all pairs ~+1) from saturated colour;
-on HSV or opponent spaces it picks up chromatic structure a per-channel statistic cannot.
-
-Only one new accumulator per pair is needed — the raw product `sum(v_i * v_j)` — because the
-means and variances are already in the moment sums.
-
-### 8. Perceptual hashes — `ahash`, `whash`, `phash`
-
-Three `imagehash`-compatible perceptual hashes, one `uint64` per channel, computed once for
-the whole frame (no pyramid, no per-cell variants). Bits are packed row-major, MSB first, so
-each is a fixed-width 64-bit key — the layout a multi-index-hashing store wants.
-
-All three are readouts of a mean grid, which is just `S1 = sum(v)` box-pooled to a fixed
-resolution:
-
-| hash | grid | bit rule |
-|---|---|---|
-| `ahash` (average) | 8×8 | cell mean `>` mean of the 64 cells |
-| `whash` (wavelet, Haar) | 8×8 | cell mean `>` median of the 64 cells |
-| `phash` (perceptual) | 32×32 | low-freq 8×8 of a 2-D DCT-II `>` its median |
-
-Because they need only `S1`, they add **no traversal**: when the finest pyramid grid already
-tiles 32×32 (e.g. a `(5,5)` finest level), the hash grid is a block-sum of the finest cells'
-`S1` and the hashes cost nothing beyond a tiny end-of-pass DCT and threshold. Only a finest
-grid coarser than 32×32 — which doesn't retain enough spatial detail for `phash` — falls back
-to a second lightweight sum over the row buffer already in cache (still one image traversal).
-
-The wavelet hash reduces to the same 8×8 mean grid as `ahash` under a median threshold: for
-Haar, `imagehash`'s `remove_max_haar_ll` subtracts a constant from every cell, which the
-median absorbs, so the bits are exactly a median-thresholded block-mean grid.
-
-**Match to `imagehash`.** `imfeat` box-pools (area averaging); `imagehash` resizes with
-Lanczos, so results are **bit-exact where no resize occurs** (an 8×8 input for a/w, 32×32 for
-p — the unit tests assert this) and differ only by that resampling on full-size frames. On
-natural 256×256 frames the relative Hamming distance to stock `imagehash` is ~0.00 for
-`whash`, ~0.01 for `phash` and ~0.12 for `ahash` (the mean threshold is the most
-resize-sensitive). Hashes are per channel like everything else, so `imagehash`'s single
-grayscale hash corresponds to running `imfeat` on a luma channel.
+Every feature is normalised per sample, so no level carries a cell-area factor and one shared
+head can read every level. Standardise per feature over a dataset before training (the
+dynamic range spans 1e-2 to 1e6); `summary` is the cheap way to collect the statistics.
 
 ---
 
-## The one-pass design
+## How it works
 
-Every per-pixel quantity is accumulated as an **additive int64 sum** into the finest cell of
-its channel — 30 sums per cell per channel:
+**Additive integer sums.** Every per-pixel quantity — gradient products, histogram votes,
+counts, powers of the pixel — is accumulated as an exact int64 sum into the finest cell of its
+channel: 44 sums per cell per channel, plus one per channel pair. Everything nonlinear
+(eigenvalues, central moments, normalisation, ratios) is derived from those sums once per
+cell. Two consequences are the whole design: every feature shares **one traversal** of the
+image, and a coarser cell is the exact sum of the cells inside it, so **pyramid depth is
+nearly free**.
 
-| slots | contents |
-|---|---|
-| 0..3 | `Sxx Syy Sxy count` — structure tensor |
-| 4..12 | HOG: gradient energy per orientation bin |
-| 13,14 | strict local max / min counts |
-| 15..18 | `S1 S2 S3 S4` — power sums of the pixel value |
-| 19..28 | LBP^riu2 bin counts |
-| 29 | `Σ|grad|⁴` — gradient sparsity |
+**Columns are the SIMD lane.** Each row is de-interleaved once into a rolling window of planar
+rows (split by column phase when the stride is even, so sampled columns become adjacent). One
+kernel reads a vector-wide block of columns from rows `r-1, r, r+1` and computes everything
+in-register. Three exact rewrites turn every sum into a plain vector add:
 
-plus, per cell, one further int64 per channel *pair* — `sum(v_i * v_j)` — the only sum that
-is not per channel.
+* **HOG without a scatter.** The eight bin-boundary tests are nested, so the kernel adds
+  `|grad|²` under each test's mask and the bins fall out as differences of those cumulative
+  sums. Each test is one `pmaddwd` over interleaved `(gy, gx)` — integer, no `atan2`.
+* **Moments of `v − 128`.** Centred pixels keep `w² ≤ 2¹⁴` inside 16-bit multiply-adds; a
+  binomial shift restores the raw power sums exactly.
+* **Shared row terms.** Each 3×3 row yields three 1-D responses once; Sobel, the Laplacian
+  and all six Laws masks are 1-D combinations of them.
 
-Two consequences fall out, and they are the whole design:
+Accumulators ride down all the sampled rows of a cell row and are folded from column lanes
+into cells once per block, so memory is written once per cell row rather than once per row.
 
-**Pyramid depth is free.** Because the sums are additive, a coarse cell is the *exact sum*
-of the finer cells inside it, and `global` is the sum of all of them. Extra levels cost one
-cheap reduction over cells — not another pass over pixels. Four levels cost ~5% more than
-one.
+**Cells are the second SIMD lane.** A block's cell sums stay contiguous per sum in a buffer
+that never leaves L1, and go three ways at once: into the 54 features, four cells per vector,
+through one compiled routine that every cell of every level shares; into the moments,
+re-centred on the rounded mean exactly (in doubles, which hold every integer involved below
+2⁵³); and, added in neighbouring pairs, straight into the next level's row. The finest level —
+most of the pyramid — is never stored or laid out as slots in `features()`; only `compute()`
+materialises it.
 
-**Everything shares one traversal.** Moments, gradients, histogram and extrema all read the
-same pixel while it is in register. The nonlinear parts — eigenvalues, central moments,
-histogram normalisation — are *not* additive, so they are deferred and derived once per cell
-at the end. That derivation is negligible: `features()` costs the same as `compute()`.
+**Nothing avoidable on the hot path.** No divides per row, block or cell (window slots wrap,
+offsets are tabulated, indices are running counts, the rounded mean is a multiply corrected by
+its exact remainder); no buffer zeroed between frames (first contributions store instead of
+add); no output copied (arrays view a pooled block).
 
-**Perceptual hashes ride along.** `ahash`/`whash`/`phash` need only `S1` at a fixed 32×32
-grid, which the same additivity provides: when the finest level tiles 32×32 they are a
-block-sum of its cells' `S1` and add nothing to the pass; only a coarser finest grid needs a
-second lightweight sum over the cached row buffer (never a second image traversal). Measured
-overhead is ~1–3% in the tiling case and ~3–7% in the fallback, on top of one frame.
-
-**Channels are the SIMD lane.** All channels are walked in the same spatial pass, packed
-four per vector, so every channel after the first is markedly cheaper.
-
-Cells are assigned by floor division (`cell = row * n_cells // H`), so any shape works; and
-because cell counts are powers of two, level *k*'s cell index is level 0's **shifted right**.
-A pixel's features at every scale are therefore an O(1) lookup — handy when assembling a
-per-pixel feature vector for a model.
+**Exactness.** Integer sums are bit-exact against numpy oracles. Floats are derived by one
+routine for all cells, so a grid derives to the same bits as any level of any pyramid and at
+any thread count. The moments' floating-point tail spells out its operations, fused
+multiply-adds included, so it does not drift with the compiler.
 
 ---
 
-## Efficient use
+## Performance
 
-Measured on a 256×256×3 frame, 4 pyramid levels, every feature on all 3 channels (Apple
-M-series; an AVX2 laptop lands within ~20%). Errors are against the exact `stride=1` output:
-`energy_r` is the correlation of the edge-energy map, `hog_cos` and `lbp_cos` the mean cosine
-similarity of the histograms. (The error columns are properties of the algorithm, not the
-machine; `tests/test_bench.py` prints these and `xchan_r` on any host.)
+`features()` end to end, 4 pyramid levels, every feature on every channel, one thread, ms.
+Two x86 machines: a 16-core 2.1 GHz Xeon (Linux, GCC) and a 22-thread laptop (Windows, MSVC).
+`pytest -v -s --full tests/test_bench.py` regenerates everything here.
 
-| stride | ms | speedup | mean err (grey levels) | energy_r | orientation err | hog_cos | lbp_cos |
-|---|---|---|---|---|---|---|---|
-| 1 | 1.35 | 1.0× | 0.0 | 1.000 | 0.0° | 1.000 | 1.000 |
-| **2** | **0.63** | **2.1×** | **4.3** | **0.952** | **3.6°** | **0.923** | **0.990** |
-| 4 | 0.36 | 3.8× | 10.7 | 0.824 | 4.9° | 0.832 | 0.958 |
-| 8 | 0.24 | 5.6× | 23.0 | 0.583 | 5.3° | 0.755 | 0.834 |
+Finest grid 32×32 (Xeon / laptop):
 
-The LBP histogram degrades far more gracefully under subsampling than the extrema density
-does (`cnt_r` falls to 0.53 by stride 4), because it is a histogram over many pixels rather
-than a count of rare events.
+| input | stride=1 | stride=2 | stride=4 | stride=8 |
+|---|---|---|---|---|
+| 256×256×3 | 0.90 / 0.73 | 0.43 / 0.35 | 0.36 / 0.30 | 0.33 / 0.27 |
+| 512×512×3 | 2.42 / 2.06 | 0.95 / 0.77 | 0.48 / 0.40 | 0.41 / 0.35 |
+| 1024×1024×3 | 8.06 / 6.97 | 2.57 / 2.20 | 1.12 / 1.00 | 0.73 / 0.57 |
+| 1024×1024 (C=1) | 2.71 / 2.29 | 0.88 / 0.73 | 0.39 / 0.30 | 0.24 / 0.19 |
 
-**The stride rule: keep `cell_width / stride ≥ 4`.** Stride's real currency is *samples per
-cell*, not pixels per image. At 256² on a 32×32 grid the cells are 8 px wide, so `stride=2`
-(16 samples/cell) is the sweet spot and `stride=4` starts to cost the structure maps. On a
-1024² frame the same grid gives 32 px cells, so `stride=8` is still safe — and 11× faster.
-Push stride past the cell width and it degenerates to one column per cell: the moments
-survive, the structure maps do not.
+Cost is linear in channels (0.12–0.17 ms per channel at 256², stride 2, from C=1 to C=16) and
+in sampled pixels, plus a per-cell term that no stride removes: at 256² with 8 px cells, going
+from stride 2 to 8 saves little, because what is left is folding, deriving and summarising 54
+features for 1024 cells × 3 channels.
 
-**Moments degrade far more gracefully than the structure maps.** At `stride=4` the cell
-means are still within ~11 grey levels while edge-energy correlation has fallen to 0.82. If
-you consume only moments, you can be much more aggressive.
+Accuracy of a stride against the exact `stride=1` output (256×256×3, 32×32 grid; properties of
+the algorithm, not the machine):
 
-**Scale by resolution first, stride second.** Cost is linear in pixels walked, so halving
-the working resolution is a clean 4× *and* keeps samples-per-cell intact. Resize, extract,
-then use stride as the final trim.
+| stride | mean err (grey levels) | energy_r | orientation err | hog_cos | lbp_cos |
+|---|---|---|---|---|---|
+| **2** | **4.6** | **0.954** | **3.4°** | **0.926** | **0.990** |
+| 4 | 10.8 | 0.822 | 4.5° | 0.838 | 0.958 |
+| 8 | 23.9 | 0.570 | 5.0° | 0.761 | 0.834 |
 
-**Take all the pyramid levels** — they are nearly free, and give multi-scale context for one
-cell reduction.
-
-**Threading is opt-in and bit-exact.** `threads=N` splits the accumulate pass into disjoint
-bands of finest cell rows. Two bands never touch the same accumulator, so there are no atomics
-on the hot path, and because every accumulator is an int64 sum that cannot overflow the output
-is *identical* at any thread count — derived floats included, since the coarse-level rollup,
-the summary fold and the hash readout still run serially after the join. The calling thread
-takes one band, so `threads=2` creates one worker. `N` is capped at the finest grid's row count
-(`grid=0` has one cell row and cannot split); `.threads` reports what was used, and
-`imfeat.cpu_count()` the logical cores available.
-
-Measured on an M-series laptop, `features()` end to end, min of 200 frames:
+Threads (`features()` min, Xeon / laptop):
 
 | frame | grid, stride | 1 thread | 2 | 3 | 4 |
 |---|---|---|---|---|---|
-| 256×256×3 | finest-32, s2 | 0.62 ms | 0.41 (1.5×) | 0.36 (1.7×) | 0.30 (2.1×) |
-| 512×512×3 | finest-32, s2 | 1.73 ms | 0.95 (1.8×) | 0.76 (2.3×) | 0.61 (2.8×) |
-| 1024×1024×3 | finest-64, s2 | 7.11 ms | 3.69 (1.9×) | 2.90 (2.5×) | 2.31 (3.1×) |
-| 1024×1024×3 | finest-32, s4 | 2.42 ms | 1.29 (1.9×) | 1.01 (2.4×) | 0.80 (3.0×) |
+| 256×256×3 | finest-32, s2 | 0.42 / 0.35 | 0.45 / 0.27 | 0.35 / 0.31 | 0.34 / 0.29 |
+| 512×512×3 | finest-32, s2 | 0.93 / 0.77 | 0.75 / 0.45 | 0.57 / 0.37 | 0.60 / 0.48 |
+| 1024×1024×3 | finest-64, s2 | 3.64 / 2.99 | 2.63 / 1.66 | 1.88 / 1.25 | 1.62 / 1.59 |
+| 1024×1024×3 | finest-32, s4 | 1.12 / 0.92 | 0.82 / 0.53 | 0.60 / 0.42 | 0.51 / 0.53 |
 
-The accumulate pass itself scales at 3.4× on four threads; the gap to that is the serial tail,
-which is a fixed cost and so hurts small frames most. Workers park on a condition variable
-between frames rather than spinning, so idle bands cost no CPU — the intent is to leave the
-other cores to other real-time work. Thread *placement* is left to the OS: there is no
-portable core-pinning API (macOS has none), so pin from the caller if your platform can.
+### Using it well
 
-**Channels after the first are cheap:** 0.34 ms at C=1, 0.65 ms at C=3, then a flat ~0.21 ms
-per additional channel. The full feature set on all of H, S and V costs ~1.9× one channel,
-not 3×.
+* **Keep `cell_width / stride ≥ 4`.** Stride's currency is samples per cell. On 8 px cells
+  `stride=2` is the sweet spot; on a 1024² frame with 32 px cells `stride=8` is still safe and
+  11× faster than `stride=1`. Moments survive aggressive strides far better than the
+  structure maps do.
+* **Scale by resolution first, stride second.** Halving the resolution is a clean 4× and
+  keeps samples per cell intact.
+* **Take all the pyramid levels** — they are nearly free.
+* **Prefer power-of-two strides and cell widths.** Anything is exact, but cells of 4, 8, 16…
+  sampled columns tile a vector block; other widths are walked one masked block per cell.
+* **Threads pay from about a millisecond per frame.** Workers park between frames (the cores
+  are meant to be shared), so below that the wake-up plus the serial tail (summary, coarse
+  levels, hashes) rivals the work saved, and whether two threads beat one is up to the
+  machine: at 256² they do on the laptop above and do not on the Xeon. Measure first.
 
-| input | stride=1 | stride=2 | stride=4 |
-|---|---|---|---|
-| 128×128×3 | 0.47 ms | 0.29 ms | 0.20 ms |
-| 256×256×3 | 1.35 ms | 0.63 ms | 0.36 ms |
-| 512×512×3 | 4.79 ms | 2.04 ms | 0.99 ms |
-| 1024×1024×3 | 18.5 ms | 7.6 ms | 3.4 ms |
+---
 
-Finer grids cost more than coarser ones (each cell's accumulators are flushed once per row,
-so flush traffic grows with cell count while pixel work stays fixed). 32×32 is a good
-default; 128×128 works but is both slow and statistically thin unless the image is large.
+## Exactness and testing
 
-`tests/test_bench.py` reproduces all of the above (`pytest -v -s tests/test_bench.py`): stride ×
-input size × channel count sweeps with latency next to per-feature-group accuracy, plus the
-per-thread accumulate/tail split.
+710 tests. Integer sums are compared **exactly** with numpy / OpenCV oracles over block
+geometries (cells narrower and wider than a vector, masked meshes, odd strides, rows that
+overrun a block, tiny images); floats with the oracles' tolerances; hashes with `imagehash`.
+Invariants are tested directly: multi-channel equals per-channel, a pyramid equals separate
+computers bit for bit, output is bit-identical across 1, 2, 3, 4 and 8 threads, results survive
+later calls and outlive their computer. Development additionally compared 14,328 output arrays
+bit for bit against the previous build on AVX2, AVX-512 and SSE4 after every change, and ran
+the suite under AddressSanitizer.
+
+---
+
+## Optimization notes
+
+Against the original single-pass implementation this core is 2.2–3.3× faster for three
+channels and up to 8× for one (13.8 M → 5.2 M instructions and 35,000 → 13 integer divisions
+per 256×256×3 frame), while computing 9 more features, with every previous output unchanged
+bar two bar-detector corner cases that were bugs.
+The short version, with the full log in [docs/OPTIMIZATION.md](docs/OPTIMIZATION.md):
+
+* **What worked:** choosing the SIMD lane twice (columns for pixels, cells for the per-cell
+  stage); algebraic rewrites that make every sum a vector add; keeping data in the layout the
+  next stage reads; never storing the finest level; removing every per-row / per-cell divide;
+  pooled zero-copy outputs.
+* **What did not:** vectorising the scalar derive with two-lane divides; a SIMD transposition
+  of cell sums; a generic roll-up helper with runtime group sizes; delaying reads to dodge
+  store forwarding; compiler attributes to switch off `-ffast-math` locally.
+* **Lessons:** count work (instructions and divider operations), not just milliseconds —
+  timings hid a 10% cost in integer divides and flattered a change that removed nothing;
+  bit-exactness across code paths comes from sharing one compiled body, not from flags.
 
 ---
 
 ## Scope
 
-Input is always **uint8** — 2-D or 3-D, any channel count (1, 3, or hyperspectral). Floating
-point input, N-D tensors and arbitrary axis reductions are deliberately out of scope: the
-uint8 assumption is exactly what makes the exact-integer accumulators possible.
-
-Reductions beyond the built-in cells / levels / global are not really a limitation, since
-`compute()` hands back additive sums: any pooling over cells, channels or frames is one
-`numpy` sum away, and per-row or per-column moments are just a `(k, 0)` or `(0, k)` grid.
+Input is always **uint8**, 2-D or 3-D, any channel count. Floating-point input, N-D tensors
+and arbitrary axis reductions are out of scope: the uint8 assumption is what makes the exact
+integer accumulators possible. Reductions beyond cells / levels / global are one `numpy` sum
+over `compute()`'s output away.

@@ -176,11 +176,12 @@ def test_per_channel_cost(n, k):
 @SIZE_GRID
 @pytest.mark.parametrize("stride", [2, 4])
 def test_thread_phases(n, k, stride):
-    """accumulate = compute pass only; tail = derive + summary + hashes + Python assembly.
-    accumulate scaling but total not -> serial tail. Neither -> memory bandwidth / cache."""
+    """features() and raw() against the thread count. They are different passes: features()
+    derives the finest level as it goes and never stores it, raw() stores and returns every
+    level's sums, so neither is a part of the other."""
     img = frame((n, n, 3))
     head(f"Threads: {n}x{n}x3 finest-{1 << k} s{stride}  (cpu_count={imfeat.cpu_count()}, ms)")
-    print(f"  {'':9s} {'acc min':>8} {'x':>6} {'tail':>7} {STATS_HEAD} {'x':>6}")
+    print(f"  {'':9s} {'raw min':>8} {'x':>6} {STATS_HEAD} {'x':>6}")
     a0 = t0 = None
     for nt in THREADS:
         fc = imfeat.FeatureComputer(img.shape, grid=pyramid(k), stride=stride, threads=nt)
@@ -189,7 +190,7 @@ def test_thread_phases(n, k, stride):
         st = latency(lambda: fc.features(img))
         a0, t0 = a0 or acc, t0 or st["min"]
         print(
-            f"  threads={fc.threads} {acc:8.3f} {a0 / acc:5.2f}x {st['min'] - acc:7.3f} "
+            f"  threads={fc.threads} {acc:8.3f} {a0 / acc:5.2f}x "
             f"{stats_row(st)} {t0 / st['min']:5.2f}x"
         )
 

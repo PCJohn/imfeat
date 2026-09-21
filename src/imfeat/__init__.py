@@ -112,6 +112,26 @@ BARD_FEATURES = (
     + ("bard_peak", "bard_peaked", "bard_bal")
 )
 
+# Second-order texture from the 3x3 neighbourhood Sobel already reads. lap_var is the variance
+# of the 4-neighbour Laplacian, the usual focus measure, and focus divides it by `energy`:
+# second-order detail per unit of first-order, which blur lowers and contrast does not.
+# laws_XY is the mean squared response of the 3x3 Laws mask with X down the rows and Y along
+# the columns, from L = [1 2 1], E = [-1 0 1], S = [-1 2 -1] (LE and EL are Sobel's gx and gy,
+# which `energy` already covers): ee is diagonal structure, ss spots, ls / sl vertical /
+# horizontal lines, es / se line ends and ripples. line_aniso is (ls - sl) / (ls + sl) in
+# [-1, 1]: +1 when every line is vertical.
+TEXTURE_FEATURES = (
+    "lap_var",
+    "focus",
+    "laws_ee",
+    "laws_ss",
+    "laws_ls",
+    "laws_sl",
+    "laws_es",
+    "laws_se",
+    "line_aniso",
+)
+
 # Perceptual hashes ("ahash"/"whash"/"phash"), one uint64 (64 bits, row-major MSB-first)
 # per channel, computed whole-frame in the same pass (no pyramid). imagehash-compatible:
 # aHash/wHash threshold an 8x8 mean grid by its mean/median; pHash the low-freq 8x8 of a
@@ -124,7 +144,7 @@ HASHES = ("ahash", "whash", "phash")
 # over that pyramid level's cells (min/max exact; mean/std population, cell-weighted).
 SUMMARY_STATS = ("min", "max", "mean", "std")
 
-#: One channel's slice of the features() channel axis, in order (F = 45).
+#: One channel's slice of the features() channel axis, in order (F = 54).
 FEATURE_NAMES = (
     FEATURES
     + HOG_FEATURES
@@ -132,6 +152,7 @@ FEATURE_NAMES = (
     + LBP_FEATURES
     + DESCRIPTOR_FEATURES
     + BARD_FEATURES
+    + TEXTURE_FEATURES
     + MOMENTS
 )
 
@@ -143,13 +164,17 @@ class Pyramid(NamedTuple):
               span a range float32 cannot hold to the accuracy the oracle tests demand
     summary : per level except global, (F, C, 4) float64 over SUMMARY_STATS
     cross   : per level, (H, W, P, 2) float32 over CROSS_FEATURES; empty when C > XMAX
-    hashes  : (3, C) uint64 over HASHES, whole-frame"""
+    hashes  : (3, C) uint64 over HASHES, whole-frame
+    profiles: (rows, cols), float64 (R, C) and (K, C): mean intensity along each sampled row and
+              each sampled column, in order -- projection profiles, for 1-D shift estimates
+              and for finding text lines"""
 
     maps: list[np.ndarray]
     moments: list[np.ndarray]
     summary: list[np.ndarray]
     cross: list[np.ndarray]
     hashes: np.ndarray
+    profiles: tuple[np.ndarray, np.ndarray]
 
 
 _NS_RAW = 4  # raw structure-tensor width [Sxx, Syy, Sxy, count]
@@ -174,27 +199,6 @@ def _parse_stride(stride: int | Sequence[int] | None) -> list[int]:
     if isinstance(stride, int):
         return [stride, stride]
     return [int(stride[0]), int(stride[1])]
-
-
-def _join_map(f: np.ndarray, m: np.ndarray) -> np.ndarray:
-    """(.., C, 34) float32 + (.., C, 4) float64 -> (.., C*38) float32, channel-major."""
-    nf = f.shape[-1]
-    out = np.empty((*f.shape[:-1], nf + m.shape[-1]), np.float32)
-    out[..., :nf] = f
-    out[..., nf:] = m
-    return out.reshape(*f.shape[:-2], -1)
-
-
-def _join_summary(f: np.ndarray, m: np.ndarray) -> np.ndarray:
-    """(C, 34, 4) + (C, 4, 4) -> (38, C, 4) float64, feature axis first to match
-    FEATURE_NAMES. float64 because the min and max entries have to compare equal to the
-    cell values they reduce, and the moment cells are float64; widening the float32
-    half is exact, so both stay so."""
-    nf = f.shape[1]
-    out = np.empty((f.shape[0], nf + m.shape[1], f.shape[2]), np.float64)
-    out[:, :nf] = f
-    out[:, nf:] = m
-    return np.ascontiguousarray(out.transpose(1, 0, 2))
 
 
 class FeatureComputer:
@@ -279,16 +283,13 @@ class FeatureComputer:
         """Slice one wide (..., C, W) array into its feature groups, dropping the
         size-1 channel axis for single-channel (2-D) input.
 
-        One flat copy up front, then views into it. Copying group by group instead is
-        a strided gather per group (stride = the full width W), which measures ~13x
-        slower and, once the accumulate pass was threaded, was the entire serial tail.
-        The copy means the returned arrays own their data and stay valid across later
-        calls, exactly as before -- but all groups from one level now share a single
-        base array, so holding one group retains the whole level.
+        The groups are views into `a`, which the binding already hands over as a copy that
+        owns its data: the returned arrays stay valid across later calls, but all groups
+        from one level share that one base array, so holding one group retains the level.
         """
-        b, out, o = a.copy(), {}, 0
+        out, o = {}, 0
         for name, n in widths:
-            v = b[..., o : o + n]
+            v = a[..., o : o + n]
             out[f"{name}_{i}"] = v[..., 0, :] if self._chan_axis is None else v
             o += n
         return out
@@ -306,13 +307,15 @@ class FeatureComputer:
         frame, which would discard absolute brightness and contrast. `summary` is the
         cheap way to collect them.
         """
-        feat, mom, cross, fsum, msum, hashes = self._impl.features(self._view(img))
+        # Every array arrives in its final layout, sharing ownership of this call's block.
+        maps, mom, cross, summary, hashes, rows, cols = self._impl.features(self._view(img))
         return Pyramid(
-            maps=[_join_map(f, m) for f, m in zip(feat, mom)],
-            moments=[np.asarray(m).copy() for m in mom],
-            summary=[_join_summary(a, b) for a, b in zip(fsum, msum)],
-            cross=[x.copy() for x in cross],
-            hashes=np.stack([np.asarray(h) for h in hashes]),
+            maps=maps,
+            moments=mom,
+            summary=summary,
+            cross=cross,
+            hashes=hashes,
+            profiles=(rows, cols),
         )
 
     def compute(self, img: np.ndarray) -> dict[str, np.ndarray]:
@@ -332,7 +335,7 @@ class FeatureComputer:
         for i, a in zip(self._keys, lv):
             out.update(self._cut(a, widths, i))
         for i, x in zip(self._keys, cross):
-            out[f"xchan_{i}"] = x.copy()
+            out[f"xchan_{i}"] = x
         return out
 
 
