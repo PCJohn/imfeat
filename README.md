@@ -158,23 +158,24 @@ kernel reads a vector-wide block of columns from rows `r-1, r, r+1` and computes
 in-register. Three exact rewrites turn every sum into a plain vector add:
 
 * **HOG without a scatter.** The eight bin-boundary tests are nested, so the kernel adds
-  `|grad|²` under each test's mask and the bins fall out as differences of those cumulative
+  `gx² + gy²` under each test's mask and the bins fall out as differences of those cumulative
   sums. Each test is one `pmaddwd` over interleaved `(gy, gx)` — integer, no `atan2`.
-* **Moments of `v − 128`.** Centred pixels keep `w² ≤ 2¹⁴` inside 16-bit multiply-adds; a
+* **Moments of `w = v − 128`.** Centred pixels keep `w² ≤ 2¹⁴` inside 16-bit multiply-adds; a
   binomial shift restores the raw power sums exactly.
 * **Shared row terms.** Each 3×3 row yields three 1-D responses once; Sobel, the Laplacian
   and all six Laws masks are 1-D combinations of them.
 
-Accumulators ride down all the sampled rows of a cell row and are folded from column lanes
-into cells once per block, so memory is written once per cell row rather than once per row.
+The accumulators ride down all the sampled rows of a *cell row* (one row of finest-grid
+cells) and are folded from column lanes into cells once per block, so memory is written once
+per cell row rather than once per image row.
 
 **Cells are the second SIMD lane.** A block's cell sums stay contiguous per sum in a buffer
 that never leaves L1, and go three ways at once: into the 54 features, four cells per vector,
 through one compiled routine that every cell of every level shares; into the moments,
 re-centred on the rounded mean exactly (in doubles, which hold every integer involved below
 2⁵³); and, added in neighbouring pairs, straight into the next level's row. The finest level —
-most of the pyramid — is never stored or laid out as slots in `features()`; only `compute()`
-materialises it.
+most of the pyramid — is therefore never stored by `features()`; only `compute()`, which
+returns the sums themselves, materialises it.
 
 **Nothing avoidable on the hot path.** No divides per row, block or cell (window slots wrap,
 offsets are tabulated, indices are running counts, the rounded mean is a multiply corrected by
@@ -246,35 +247,43 @@ Threads (`features()` min, Xeon / laptop):
 
 ## Exactness and testing
 
-710 tests. Integer sums are compared **exactly** with numpy / OpenCV oracles over block
-geometries (cells narrower and wider than a vector, masked meshes, odd strides, rows that
-overrun a block, tiny images); floats with the oracles' tolerances; hashes with `imagehash`.
-Invariants are tested directly: multi-channel equals per-channel, a pyramid equals separate
-computers bit for bit, output is bit-identical across 1, 2, 3, 4 and 8 threads, results survive
-later calls and outlive their computer. Development additionally compared 14,328 output arrays
-bit for bit against the previous build on AVX2, AVX-512 and SSE4 after every change, and ran
-the suite under AddressSanitizer.
+The suite has 710 tests:
+
+* **Oracles.** Integer sums are compared *exactly* with numpy / OpenCV implementations, over
+  geometries chosen to reach every kernel path (cells narrower and wider than a vector, masked
+  sampling meshes, odd strides, rows that overrun a block, tiny images). Floats are compared
+  within the oracles' tolerances, hashes with `imagehash`.
+* **Invariants.** Multi-channel equals per-channel; a pyramid equals separate single-level
+  computers bit for bit; output is bit-identical across 1, 2, 3, 4 and 8 threads; results
+  survive later calls and outlive their computer.
+
+During development every change was additionally compared bit for bit with the previous
+build over 14,328 output arrays on AVX2, AVX-512 and SSE4 builds, and run under
+AddressSanitizer.
 
 ---
 
 ## Optimization notes
 
-Against the original single-pass implementation this core is 2.2–3.3× faster for three
-channels and up to 8× for one (13.8 M → 5.2 M instructions and 35,000 → 13 integer divisions
-per 256×256×3 frame), while computing 9 more features, with every previous output unchanged
-bar two bar-detector corner cases that were bugs.
-The short version, with the full log in [docs/OPTIMIZATION.md](docs/OPTIMIZATION.md):
+The core was rewritten from an earlier single-pass implementation (commit `1c35817`), which
+already had the additive-sum design but used the vector lanes for *channels* and stored the
+finest level. Against it, this version is 2.2–3.3× faster for three channels and up to 8× for
+one — 13.8 M → 5.2 M instructions and 35,000 → 13 integer divisions per 256×256×3 frame —
+while computing nine more features. Every earlier output is unchanged, apart from two
+bar-detector corner cases that were bugs. The short version, with the full log in
+[docs/OPTIMIZATION.md](docs/OPTIMIZATION.md):
 
-* **What worked:** choosing the SIMD lane twice (columns for pixels, cells for the per-cell
-  stage); algebraic rewrites that make every sum a vector add; keeping data in the layout the
-  next stage reads; never storing the finest level; removing every per-row / per-cell divide;
-  pooled zero-copy outputs.
-* **What did not:** vectorising the scalar derive with two-lane divides; a SIMD transposition
-  of cell sums; a generic roll-up helper with runtime group sizes; delaying reads to dodge
-  store forwarding; compiler attributes to switch off `-ffast-math` locally.
+* **What worked:** choosing the SIMD lane per stage (columns for pixels, cells for the
+  per-cell work); algebraic rewrites that make every sum a vector add; never building a
+  representation no consumer needs (the finest level is not stored); removing every divide
+  from the bookkeeping; pooled zero-copy outputs.
+* **What did not:** pairing divisions into two-lane vectors inside a scalar derive; moving
+  cell sums between layouts with SIMD; a generic roll-up helper with run-time group sizes;
+  reordering reads to avoid store-forwarding stalls; compiler attributes to switch
+  `-ffast-math` off for one function.
 * **Lessons:** count work (instructions and divider operations), not just milliseconds —
-  timings hid a 10% cost in integer divides and flattered a change that removed nothing;
-  bit-exactness across code paths comes from sharing one compiled body, not from flags.
+  timings hid a 10% cost in integer divides and flattered a change that removed nothing; and
+  bit-exactness across code paths comes from sharing one compiled routine, not from flags.
 
 ---
 

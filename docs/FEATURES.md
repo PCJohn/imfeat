@@ -136,10 +136,10 @@ From the same 3×3 neighbourhood Sobel reads. With the 1-D masks `L = [1 2 1]`, 
 |---|---|---|
 | `lap_var` | variance of the 4-neighbour Laplacian `up + down + left + right − 4c` | the standard focus / blur score; blob energy |
 | `focus` | `lap_var / energy` | second-order detail per unit of first-order: blur lowers it, contrast does not |
-| `laws_ee` | mean squared `EE` response | diagonal structure |
-| `laws_ss` | … `SS` | spots |
-| `laws_ls`, `laws_sl` | … `LS`, `SL` | vertical / horizontal lines |
-| `laws_es`, `laws_se` | … `ES`, `SE` | line ends, ripples |
+| `laws_ee` | mean squared response of the `EE` mask | diagonal structure |
+| `laws_ss` | mean squared response of the `SS` mask | spots |
+| `laws_ls`, `laws_sl` | mean squared responses of the `LS` and `SL` masks | vertical / horizontal lines |
+| `laws_es`, `laws_se` | mean squared responses of the `ES` and `SE` masks | line ends, ripples |
 | `line_aniso` | `(ls − sl) / (ls + sl)` ∈ [−1, 1] | +1 when every line is vertical, as most scripts' strokes are |
 
 The Laws energies scale with contrast²; normalise by `var` or `energy` downstream if needed.
@@ -147,7 +147,10 @@ The Laws energies scale with contrast²; normalise by `var` or `energy` downstre
 ## 8. Intensity moments — `MOMENTS`
 
 ```
-mean = (1/n) Σ v      var = (1/n) Σ (v − mean)²      m3 = (1/n) Σ (v − mean)³      m4 = (1/n) Σ (v − mean)⁴
+mean = (1/n) Σ v
+var  = (1/n) Σ (v − mean)²
+m3   = (1/n) Σ (v − mean)³
+m4   = (1/n) Σ (v − mean)⁴
 ```
 
 `maps` carries float32 copies; `Pyramid.moments` the float64 values (m3 and m4 outgrow
@@ -155,7 +158,10 @@ float32). The power sums are accumulated as exact integers and re-centred on the
 `K` by the binomial expansion before any floating point:
 
 ```
-T1 = S1 − nK      T2 = S2 − 2K·S1 + nK²      T3 = S3 − 3K·S2 + 3K²·S1 − nK³      T4 = S4 − 4K·S3 + 6K²·S2 − 4K³·S1 + nK⁴
+T1 = S1 − nK
+T2 = S2 − 2K·S1 + nK²
+T3 = S3 − 3K·S2 + 3K²·S1 − nK³
+T4 = S4 − 4K·S3 + 6K²·S2 − 4K³·S1 + nK⁴
 ```
 
 The residual offset `d = T1/n` is at most 0.5, so `var = T2/n − d²` has nothing left to
@@ -208,7 +214,7 @@ natural 256×256 frames the relative Hamming distance is ~0.00 (`whash`), ~0.01 
 | 13, 14 | strict local max / min counts |
 | 15..18 | `S1 S2 S3 S4` — power sums of the pixel value |
 | 19..28 | LBP bin counts |
-| 29 | `Σ|grad|⁴` |
+| 29 | `Σ(gx² + gy²)²` — the sum of squared gradient energies, for `grad_sparsity` |
 | 30..35 | bar detector: gated-pixel count, response mass per lag, dark and light mass |
 | 36, 37 | Laplacian: `ΣL`, `ΣL²` |
 | 38..43 | squared Laws responses: EE, SS, LS, SL, ES, SE |
@@ -229,3 +235,7 @@ pixel grid. Push `grid` finer for a denser map, but keep roughly four sampled pi
 per dimension (`cell_px / stride ≥ 4`) or the moment and histogram features stop meaning
 anything; upsampling is a decoder's job. The finest level is also the only one strictly
 needed: every coarser level is an exact sum of it, provided because it costs almost nothing.
+
+Cell counts are powers of two, so a cell's index at level `k` is its level-0 index shifted
+right: a pixel's features at every scale are an O(1) lookup when assembling a per-pixel
+vector for a model.
