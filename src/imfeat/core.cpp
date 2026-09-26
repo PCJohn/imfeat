@@ -636,6 +636,194 @@ void split_phases(const uint8_t *IF_RESTRICT src, size_t n, int P, size_t phs,
   }
 }
 
+// --- colour conversion, fused into the row gather ---------------------------------------------
+// A host that has a BGR frame and wants features in HSV would otherwise convert the whole image
+// first (cvtColor: a pass that writes and re-reads it). Here the three source channels are
+// converted as each row is de-interleaved, in the band's thread, so the conversion costs no
+// memory traffic and threads like the rest. The outputs are cv2.cvtColor's bytes exactly: the
+// tests compare every one of the 2^24 colours. Adding a conversion means a Convert code, a row
+// kernel like hsv_row, a case in convert_row, and an entry in the Python table.
+enum Convert
+{
+  CONV_NONE = 0,
+  CONV_BGR2HSV = 1 // OpenCV's 8-bit BGR -> HSV, hue in [0, 180)
+};
+
+// OpenCV's 8-bit RGB2HSV_b, with its fixed-point tables (hsv_shift 12):
+//   v = max(b, g, r), diff = v - min(b, g, r)
+//   s = (diff * sdiv[v] + 2^11) >> 12,               sdiv[i] = round(255 * 2^12 / i)
+//   h = (h6 * hdiv[diff] + 2^11) >> 12, + 180 if < 0, hdiv[i] = round(180 * 2^12 / (6 i))
+//   h6 = g - b           if v == r
+//      = b - r + 2 diff  if v == g (and v != r)
+//      = r - g + 4 diff  otherwise
+// (>> the arithmetic shift, i.e. floor; sdiv[0] = hdiv[0] = 0). No quotient in either table is
+// a half -- 2 * 255 * 2^12 and 2 * 30 * 2^12 hold more twos than any i < 256 -- so "round" needs
+// no tie rule, and (2 N + i) / (2 i) in integers is it.
+constexpr int HSV_SHIFT = 12;
+constexpr int32_t HSV_SNUM = 255 << HSV_SHIFT;
+constexpr int32_t HSV_HNUM = (180 << HSV_SHIFT) / 6;
+constexpr int32_t HSV_HALF = 1 << (HSV_SHIFT - 1);
+constexpr int32_t HSV_HRANGE = 180;
+
+struct HsvTables
+{
+  int32_t sdiv[256], hdiv[256];
+  constexpr HsvTables() : sdiv{}, hdiv{}
+  {
+    for (int i = 1; i < 256; ++i)
+    {
+      sdiv[i] = (2 * HSV_SNUM + i) / (2 * i);
+      hdiv[i] = (2 * HSV_HNUM + i) / (2 * i);
+    }
+  }
+};
+constexpr HsvTables kHsv;
+
+inline void hsv_pixel(int b, int g, int r, uint8_t *IF_RESTRICT hsv)
+{
+  const int v = std::max(b, std::max(g, r)), diff = v - std::min(b, std::min(g, r));
+  const int h6 = v == r ? g - b : v == g ? b - r + 2 * diff : r - g + 4 * diff;
+  const int h = (h6 * kHsv.hdiv[diff] + HSV_HALF) >> HSV_SHIFT; // floors: OpenCV's own shift
+  hsv[0] = (uint8_t)(h < 0 ? h + HSV_HRANGE : h);
+  hsv[1] = (uint8_t)((diff * kHsv.sdiv[v] + HSV_HALF) >> HSV_SHIFT);
+  hsv[2] = (uint8_t)v;
+}
+
+// round(NUM / x) per lane, x in [1, 255]: a float quotient, then the integer remainder makes
+// it exact -- the float only has to land within one of the answer, which any division does.
+template <int32_t NUM>
+HWY_INLINE V32 hsv_round_div(V32 x)
+{
+  const hn::Repartition<float, D8> df;
+  V32 q = hn::NearestInt(hn::Div(hn::Set(df, (float)NUM), hn::ConvertTo(df, x)));
+  const V32 r2 = hn::ShiftLeft<1>(hn::Sub(hn::Set(d32, NUM), hn::Mul(q, x))); // 2 * remainder
+  q = hn::Sub(q, hn::VecFromMask(d32, hn::Gt(r2, x)));         // remainder > x/2: one more
+  q = hn::Add(q, hn::VecFromMask(d32, hn::Lt(r2, hn::Neg(x)))); // < -x/2: one less
+  return q;
+}
+
+// One block of pixels to hsv[0..2]; the H and S planes only when asked for (the unasked ones
+// hold V). The same integers as hsv_pixel: v and diff stay bytes, h6 is 16-bit, the two
+// fixed-point products are 32-bit; the tables come from hsv_round_div instead of a gather.
+template <bool kH, bool kS>
+HWY_INLINE void hsv_block(V8 b, V8 g, V8 r, V8 *IF_RESTRICT hsv)
+{
+  const V8 v = hn::Max(hn::Max(b, g), r), diff = hn::Sub(v, hn::Min(hn::Min(b, g), r));
+  hsv[0] = hsv[1] = hsv[2] = v;
+  if (!kH && !kS) return;
+  V16 h16[2], s16[2];
+  for (int half = 0; half < 2; ++half)
+  {
+    auto wide = [&](V8 a)
+    { return half ? hn::PromoteUpperTo(d16, a) : hn::PromoteLowerTo(d16, a); };
+    const V16 b1 = wide(b), g1 = wide(g), r1 = wide(r), v1 = wide(v), d1 = wide(diff);
+    const V16 h6 = hn::IfThenElse(
+        hn::Eq(v1, r1), hn::Sub(g1, b1),
+        hn::IfThenElse(hn::Eq(v1, g1), hn::Add(hn::Sub(b1, r1), hn::ShiftLeft<1>(d1)),
+                       hn::Add(hn::Sub(r1, g1), hn::ShiftLeft<2>(d1))));
+    V32 h32[2], s32[2];
+    for (int q = 0; q < 2; ++q)
+    {
+      auto wider = [&](V16 a)
+      { return q ? hn::PromoteUpperTo(d32, a) : hn::PromoteLowerTo(d32, a); };
+      const V32 d2 = wider(d1), zero = hn::Zero(d32), one = hn::Set(d32, 1),
+                half_ = hn::Set(d32, HSV_HALF);
+      if (kS)
+      {
+        const V32 v2 = wider(v1);
+        const V32 sdiv =
+            hn::IfThenElseZero(hn::Gt(v2, zero), hsv_round_div<HSV_SNUM>(hn::Max(v2, one)));
+        s32[q] = hn::ShiftRight<HSV_SHIFT>(hn::Add(hn::Mul(d2, sdiv), half_));
+      }
+      if (kH)
+      {
+        const V32 hdiv =
+            hn::IfThenElseZero(hn::Gt(d2, zero), hsv_round_div<HSV_HNUM>(hn::Max(d2, one)));
+        const V32 h = hn::ShiftRight<HSV_SHIFT>(hn::Add(hn::Mul(wider(h6), hdiv), half_));
+        h32[q] = hn::Add(h, hn::IfThenElseZero(hn::Lt(h, zero), hn::Set(d32, HSV_HRANGE)));
+      }
+    }
+    if (kS) s16[half] = hn::OrderedDemote2To(d16, s32[0], s32[1]);
+    if (kH) h16[half] = hn::OrderedDemote2To(d16, h32[0], h32[1]);
+  }
+  if (kS) hsv[1] = hn::OrderedDemote2To(d8, s16[0], s16[1]);
+  if (kH) hsv[0] = hn::OrderedDemote2To(d8, h16[0], h16[1]);
+}
+
+// One row: the selected HSV channels (chan[0..c), each to out + k*ostride, as gather_row lays
+// them out) from the three source channels at bytes coff[0..2] of each pixel. `packed`: the
+// pixels are 3 contiguous bytes in B, G, R order. `tmp` holds 3*w bytes for the strided case.
+template <bool kH, bool kS>
+void hsv_row(const uint8_t *IF_RESTRICT src, int64_t cs, const int64_t *IF_RESTRICT coff,
+             const int *IF_RESTRICT chan, int c, int w, bool packed, uint8_t *IF_RESTRICT tmp,
+             uint8_t *IF_RESTRICT out, size_t ostride)
+{
+  const size_t N = hn::Lanes(d8);
+  const uint8_t *p[3];
+  int64_t ps = 1; // p[k] + x * ps is channel k of pixel x
+  if (packed)
+  {
+    for (int k = 0; k < 3; ++k) p[k] = src + k;
+    ps = 3;
+  }
+  else if (cs == 1) // planar
+    for (int k = 0; k < 3; ++k) p[k] = src + coff[k];
+  else // anything else: gathered a pixel at a time first
+    for (int k = 0; k < 3; ++k)
+    {
+      uint8_t *IF_RESTRICT plane = tmp + (size_t)k * (size_t)w;
+      for (int x = 0; x < w; ++x) plane[x] = src[(int64_t)x * cs + coff[k]];
+      p[k] = plane;
+    }
+  size_t x = 0;
+  V8 hsv[3];
+  for (; x + N <= (size_t)w; x += N)
+  {
+    V8 b, g, r;
+    if (packed)
+      hn::LoadInterleaved3(d8, src + x * 3, b, g, r);
+    else
+    {
+      b = hn::LoadU(d8, p[0] + x);
+      g = hn::LoadU(d8, p[1] + x);
+      r = hn::LoadU(d8, p[2] + x);
+    }
+    hsv_block<kH, kS>(b, g, r, hsv);
+    for (int k = 0; k < c; ++k) hn::StoreU(hsv[chan[k]], d8, out + (size_t)k * ostride + x);
+  }
+  for (; x < (size_t)w; ++x)
+  {
+    uint8_t px[3];
+    hsv_pixel(p[0][x * ps], p[1][x * ps], p[2][x * ps], px);
+    for (int k = 0; k < c; ++k) out[(size_t)k * ostride + x] = px[chan[k]];
+  }
+}
+
+// gather_row's counterpart under a conversion: the selected feature-space channels of one row,
+// converted from the source channels at coff[0..2], channel k of `chan` at out + k*ostride.
+void convert_row(int conv, const uint8_t *IF_RESTRICT src, int64_t cs,
+                 const int64_t *IF_RESTRICT coff, const int *IF_RESTRICT chan, int c, int w,
+                 bool packed, uint8_t *IF_RESTRICT tmp, uint8_t *IF_RESTRICT out, size_t ostride)
+{
+  bool want[3] = {false, false, false};
+  for (int k = 0; k < c; ++k) want[chan[k]] = true;
+  switch (conv)
+  {
+  case CONV_BGR2HSV:
+    if (want[0] && want[1])
+      hsv_row<true, true>(src, cs, coff, chan, c, w, packed, tmp, out, ostride);
+    else if (want[0])
+      hsv_row<true, false>(src, cs, coff, chan, c, w, packed, tmp, out, ostride);
+    else if (want[1])
+      hsv_row<false, true>(src, cs, coff, chan, c, w, packed, tmp, out, ostride);
+    else
+      hsv_row<false, false>(src, cs, coff, chan, c, w, packed, tmp, out, ostride);
+    return;
+  default:
+    throw std::invalid_argument("unknown colour conversion");
+  }
+}
+
 // Gather each selected channel's row into a contiguous run: channel k lands at
 // out + k*ostride. Every layout imfeat accepts has a wide path here except the
 // general strided one, and the phase-split below reuses all of them rather than
@@ -694,18 +882,22 @@ void gather_row(const uint8_t *IF_RESTRICT src, int64_t cs, const int64_t *IF_RE
 // kernel()'s 3x3 taps need no border logic: column -1 is lane -1 of the last phase, and
 // column w (reachable only when P == 1) is lane w.
 void deinterleave_row(const uint8_t *IF_RESTRICT img, int64_t rs, int64_t cs,
-                      const int64_t *IF_RESTRICT coff, int c, int w, int y, bool packed,
-                      int64_t prs, int slots, int slot, int P, int64_t phs,
-                      uint8_t *IF_RESTRICT tmp, uint8_t *IF_RESTRICT dst)
+                      const int64_t *IF_RESTRICT coff, const int *IF_RESTRICT chan, int conv,
+                      int c, int w, int y, bool packed, int64_t prs, int slots, int slot, int P,
+                      int64_t phs, uint8_t *IF_RESTRICT tmp, uint8_t *IF_RESTRICT dst)
 {
   const uint8_t *IF_RESTRICT src = img + (int64_t)y * rs;
   uint8_t *IF_RESTRICT d0 = dst + (size_t)slot * (size_t)prs + PAD_L; // slot == y % slots
   const size_t pstride = (size_t)slots * (size_t)prs;
   uint8_t *IF_RESTRICT scratch = tmp + (size_t)c * (size_t)w;
-  if (P == 1)
-    gather_row(src, cs, coff, c, w, packed, scratch, d0, pstride);
-  else
-    gather_row(src, cs, coff, c, w, packed, scratch, tmp, (size_t)w);
+  // straight into the window, or into tmp's first c planes for the split below
+  uint8_t *IF_RESTRICT row = P == 1 ? d0 : tmp;
+  const size_t rstride = P == 1 ? pstride : (size_t)w;
+  if (conv == CONV_NONE)
+    gather_row(src, cs, coff, c, w, packed, scratch, row, rstride);
+  else // its own 3 planes of scratch, past the split's
+    convert_row(conv, src, cs, coff, chan, c, w, packed, tmp + (size_t)3 * c * (size_t)w, row,
+                rstride);
   for (int k = 0; k < c; ++k)
   {
     uint8_t *IF_RESTRICT b = d0 + (size_t)k * pstride;
@@ -811,8 +1003,10 @@ class FeatureComputer
 {
   int h_ = 0, w_ = 0, c_ = 1, sy_ = 1, sx_ = 1;
   bool interleaved_ = false; // source rows are already the (H,W,C) layout we want
-  std::vector<int> chan_;
-  std::vector<int64_t> coff_; // per-selected-channel offset within a pixel
+  int conv_ = CONV_NONE;     // colour conversion fused into the row gather (see Convert)
+  std::vector<int> chan_;    // the selected channels, of the converted image when conv_
+  std::vector<int64_t> coff_; // per-selected-channel (per-source-channel when conv_) offset
+                              // within a pixel
   std::vector<Level> levels_;
   int16_t ray_[HB - 1][2] = {}; // bin-boundary ray j as (cx, -cy): t = cx*qy - cy*qx in one pmaddwd
   int hog_card_[HB] = {};    // 1 for the axis-aligned (cardinal) orientation bins
@@ -1546,8 +1740,9 @@ class FeatureComputer
       {
         for (; s.filled <= std::min(h_ - 1, rows.back() + BARD_MAXLAG); ++s.filled)
         {
-          deinterleave_row(img, rs, cs, coff_.data(), c_, w_, s.filled, interleaved_, s.row_stride,
-                           slots_, s.fslot, phases_, s.phase_stride, s.lin.data(), s.planes.data());
+          deinterleave_row(img, rs, cs, coff_.data(), chan_.data(), conv_, c_, w_, s.filled,
+                           interleaved_, s.row_stride, slots_, s.fslot, phases_, s.phase_stride,
+                           s.lin.data(), s.planes.data());
           s.fslot = s.fslot + 1 == slots_ ? 0 : s.fslot + 1;
         }
         derived = cell_row(s, rows, (size_t)cy, rolls, hs, dst, dstx);
@@ -1714,9 +1909,21 @@ class FeatureComputer
         std::fill(scr_[b].hsum.begin(), scr_[b].hsum.end(), (int64_t)0);
     }
 
-    for (int k = 0; k < c_; ++k)
-      coff_[k] = (int64_t)chan_[k] * chs;
-    interleaved_ = chs == 1 && cs == c_ && chan_[0] == 0 && chan_.back() == c_ - 1;
+    if (conv_ == CONV_NONE)
+    {
+      interleaved_ = chs == 1 && cs == c_; // ... and the selection is every channel in order
+      for (int k = 0; k < c_; ++k)
+      {
+        coff_[k] = (int64_t)chan_[k] * chs;
+        interleaved_ = interleaved_ && chan_[k] == k;
+      }
+    }
+    else // the conversion reads all three source channels whatever is selected
+    {
+      for (int k = 0; k < 3; ++k)
+        coff_[k] = (int64_t)k * chs;
+      interleaved_ = chs == 1 && cs == 3;
+    }
     task_img_ = img;
     task_rs_ = rs;
     task_cs_ = cs;
@@ -2107,7 +2314,7 @@ public:
 
   void set_config(const std::vector<int64_t> &dims, const std::vector<int> &channels,
                   const std::vector<std::vector<int>> &grids,
-                  const std::vector<int64_t> &stride, int threads)
+                  const std::vector<int64_t> &stride, int threads, int convert)
   {
     pool_stop();
     size_t block = 0; // the output block: every features() array at a 64-byte-aligned offset
@@ -2123,6 +2330,11 @@ public:
     c_ = (int)chan_.size();
     sy_ = (int)stride[0];
     sx_ = (int)stride[1];
+    conv_ = convert;
+    if (conv_ != CONV_NONE && conv_ != CONV_BGR2HSV)
+      throw std::invalid_argument("unknown colour conversion");
+    if (conv_ != CONV_NONE && dims[2] != 3)
+      throw std::invalid_argument("a colour conversion needs a 3-channel image");
 
     pi_.clear();
     pj_.clear();
@@ -2255,7 +2467,7 @@ public:
     slots_ = std::max(2 * BARD_MAXLAG + 1, h_ / levels_[0].ny + 2 * BARD_MAXLAG + 1);
     symod_ = sy_ % slots_;
     for (up_shift_ = 0; levels_.size() > 1 && (1 << up_shift_) < levels_[1].fy;) ++up_shift_;
-    coff_.assign(c_, 0);
+    coff_.assign((size_t)std::max(c_, conv_ != CONV_NONE ? 3 : 0), 0);
 
     graw_.assign((size_t)c_ * NSUM, 0);
     ogfeat_ = place((size_t)c_ * NMAP * sizeof(float));
@@ -2362,7 +2574,8 @@ public:
       // a slack row and block so the final vector's overrun stays inside the allocation
       s.planes.assign(
           (size_t)c_ * (size_t)slots_ * (size_t)s.row_stride + (size_t)s.row_stride + 2 * N, 0);
-      s.lin.assign((size_t)3 * c_ * (size_t)w_ + N, 0);
+      // a row of gathered planes, the phase split's scratch, and the conversion's source planes
+      s.lin.assign((size_t)(3 * c_ + (conv_ != CONV_NONE ? 3 : 0)) * (size_t)w_ + N, 0);
       if (b) s.hsum.assign((size_t)HN * HN * c_, 0);
       s.row.assign((size_t)levels_[0].nx * c_ * NSUM, 0);
       if (levels_.size() > 1) s.up.assign((size_t)c_ * K_N * ((size_t)levels_[1].nx + N), 0);
@@ -2476,6 +2689,37 @@ public:
 };
 
 using Arr = nb::ndarray<nb::numpy, const uint8_t, nb::device::cpu>;
+
+// The conversion on its own: a new (H, W, 3) image from an (H, W, 3) one in any layout. The
+// same row kernel the pass fuses, so this is also how the tests pin that kernel to OpenCV.
+nb::ndarray<nb::numpy, uint8_t> convert_image(Arr a, int conv)
+{
+  if (a.ndim() != 3 || a.shape(2) != 3)
+    throw std::invalid_argument("convert: expected an (H, W, 3) uint8 image");
+  const size_t h = a.shape(0), w = a.shape(1), N = hn::Lanes(d8);
+  const int64_t rs = a.stride(0), cs = a.stride(1), chs = a.stride(2);
+  const int64_t coff[3] = {0, chs, 2 * chs};
+  const int chan[3] = {0, 1, 2};
+  const bool packed = chs == 1 && cs == 3;
+  auto *buf = new uint8_t[h * w * 3];
+  const nb::capsule owner(buf, [](void *p) noexcept { delete[] static_cast<uint8_t *>(p); });
+  std::vector<uint8_t> tmp(6 * w + N); // 3 source planes, then the 3 converted ones
+  uint8_t *IF_RESTRICT planes = tmp.data() + 3 * w;
+  for (size_t y = 0; y < h; ++y)
+  {
+    convert_row(conv, a.data() + (int64_t)y * rs, cs, coff, chan, 3, (int)w, packed, tmp.data(),
+                planes, w);
+    uint8_t *IF_RESTRICT row = buf + y * w * 3;
+    size_t x = 0;
+    for (; x + N <= w; x += N)
+      hn::StoreInterleaved3(hn::LoadU(d8, planes + x), hn::LoadU(d8, planes + w + x),
+                            hn::LoadU(d8, planes + 2 * w + x), d8, row + x * 3);
+    for (; x < w; ++x)
+      for (size_t k = 0; k < 3; ++k) row[x * 3 + k] = planes[k * w + x];
+  }
+  const size_t shape[3] = {h, w, 3};
+  return nb::ndarray<nb::numpy, uint8_t>(buf, 3, shape, owner);
+}
 } // namespace
 
 NB_MODULE(imfeat_core, m)
@@ -2485,14 +2729,17 @@ NB_MODULE(imfeat_core, m)
   m.attr("LBPB") = LBPB; // LBP^riu2 bin count (9 uniform + 1 non-uniform)
   m.attr("BARD_NL") = BARD_NL; // bar-detector lag count (sizes the spectrum block)
   m.attr("XMAX") = XMAX; // cross-channel products are computed only for C <= XMAX
+  m.attr("CONVERT_NONE") = (int)CONV_NONE; // colour conversions fused into the pass (Convert)
+  m.attr("CONVERT_BGR2HSV") = (int)CONV_BGR2HSV;
   m.def("cpu_count", [] { //  0 when the runtime cannot tell; callers see at least 1
     const unsigned n = std::thread::hardware_concurrency();
     return (int)(n ? n : 1u);
   });
+  m.def("convert", &convert_image, nb::arg("arr"), nb::arg("conversion"));
   nb::class_<FeatureComputer>(m, "_FeatureComputerImpl")
       .def(nb::init<>())
       .def("set_config", &FeatureComputer::set_config, nb::arg("dims"), nb::arg("channels"),
-           nb::arg("grids"), nb::arg("stride"), nb::arg("threads"))
+           nb::arg("grids"), nb::arg("stride"), nb::arg("threads"), nb::arg("convert"))
       .def("threads", &FeatureComputer::threads)
       .def("pairs", &FeatureComputer::pairs)
       .def(

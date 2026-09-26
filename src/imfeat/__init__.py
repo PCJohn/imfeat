@@ -18,12 +18,14 @@ and the image is read exactly once. The nonlinear parts (eigenvalues, central
 moments, histogram normalisation) are derived once per cell at the end.
 
 Input is one uint8 image: 2-D ``(H, W)``, or multi-channel in OpenCV order
-``(H, W, C)`` for any C (set ``channel_axis`` for a different layout).
+``(H, W, C)`` for any C (set ``channel_axis`` for a different layout). A 3-channel image
+is colour: by default it is taken as BGR (OpenCV's order) and the features are computed
+in HSV, the conversion running inside the pass (``input_space`` / ``feature_space``).
 
     import imfeat
 
     fc = imfeat.FeatureComputer(shape=(256, 256, 3), grid=[(5, 5), (4, 4)])
-    p = fc.features(hsv_u8)
+    p = fc.features(bgr_u8)
     p.maps[0]      # (32, 32, 114) float32, 3 channels x FEATURE_NAMES, channel-major
     p.maps[-1]     # (114,)        global level
     p.moments[0]   # (32, 32, 3, 4) float64 MOMENTS at full precision
@@ -48,6 +50,7 @@ import numpy as np
 from . import imfeat_core as _core  # type: ignore[attr-defined]
 
 __all__ = [
+    "COLOR_SPACES",
     "COUNT_FEATURES",
     "CROSS_FEATURES",
     "DESCRIPTOR_FEATURES",
@@ -60,12 +63,16 @@ __all__ = [
     "SUMMARY_STATS",
     "FeatureComputer",
     "Pyramid",
+    "convert",
     "cpu_count",
 ]
 __version__ = "0.1.0"
 
 # Grid spec accepted by FeatureComputer: k, (ky, kx), or a list of either.
 GridSpec = Union[int, Sequence[int], Sequence[Sequence[int]]]
+
+#: Colour spaces of 3-channel images, as `input_space` / `feature_space` name them.
+COLOR_SPACES = ("bgr", "hsv")
 
 # Raw central moments of the pixel values ("mom_i" / "mom_global"), float64.
 MOMENTS = ("mean", "var", "m3", "m4")
@@ -201,6 +208,31 @@ def _parse_stride(stride: int | Sequence[int] | None) -> list[int]:
     return [int(stride[0]), int(stride[1])]
 
 
+# (input, feature) -> the core's conversion, for the pairs that differ. Each is a row kernel
+# in core.cpp (see Convert there); a new space or pair is an entry here and a kernel there.
+_CONVERSIONS: dict[tuple[str, str], int] = {("bgr", "hsv"): _core.CONVERT_BGR2HSV}
+
+
+def _conversion(input_space: str, feature_space: str | None, channels: int) -> int:
+    """The core's conversion code for `channels`-channel input in `input_space` when the
+    features are wanted in `feature_space` (None: on the channels as they are)."""
+    for name in (input_space, feature_space):
+        if name is not None and name not in COLOR_SPACES:
+            raise ValueError(f"unknown colour space {name!r}; known: {', '.join(COLOR_SPACES)}")
+    if feature_space is None or feature_space == input_space or channels == 1:
+        return int(_core.CONVERT_NONE)  # nothing to convert, or no colour to convert
+    if channels != 3:
+        raise ValueError(
+            f"{input_space} -> {feature_space} needs a 3-channel image, not {channels} channels;"
+            " pass feature_space=None to take the channels as they are"
+        )
+    try:
+        return int(_CONVERSIONS[input_space, feature_space])
+    except KeyError:
+        pairs = ", ".join(f"{a} -> {b}" for a, b in _CONVERSIONS)
+        raise ValueError(f"no {input_space} -> {feature_space} conversion; have {pairs}") from None
+
+
 class FeatureComputer:
     """Stateful feature extractor for a fixed uint8 input shape.
 
@@ -225,6 +257,18 @@ class FeatureComputer:
                    calling thread runs one band itself, so ``threads=2`` adds one
                    worker. Capped at the finest grid's row count; ``.threads``
                    reports what was actually used. See ``cpu_count()``.
+    input_space  : the colour space of the images passed in: "bgr" (OpenCV's order,
+                   the default) or "hsv". See ``COLOR_SPACES``.
+    feature_space: the colour space the features are computed in, "hsv" by default:
+                   a BGR frame straight from OpenCV gets HSV features with no
+                   ``cvtColor`` pass, the conversion running inside the extraction
+                   (in every band's thread, as each row is read), bit for bit what
+                   ``cv2.cvtColor(img, cv2.COLOR_BGR2HSV)`` gives. ``None`` takes the
+                   channels as they are, as does naming the input's own space.
+                   ``channels`` then index the feature space (HSV: 0, 1, 2 = H, S, V).
+                   Only a 3-channel image is colour: a 2-D or single-channel one is
+                   taken as it is, and any other channel count needs
+                   ``feature_space=None``.
 
     A single all-frame "global" reduction is returned alongside the grid levels.
     """
@@ -237,6 +281,8 @@ class FeatureComputer:
         channels: Sequence[int] | None = None,
         channel_axis: int = -1,
         threads: int = 1,
+        input_space: str = "bgr",
+        feature_space: str | None = "hsv",
     ) -> None:
         shape = tuple(int(s) for s in shape)
         ndim = len(shape)
@@ -256,11 +302,14 @@ class FeatureComputer:
         chan = list(range(c)) if channels is None else [int(x) for x in channels]
         if not chan or any(not 0 <= x < c for x in chan):
             raise ValueError(f"channels must be a non-empty subset of range({c})")
+        conversion = _conversion(input_space, feature_space, c)
+        #: whether the pass converts the input's colour space (False: channels as given).
+        self.converts: bool = conversion != _core.CONVERT_NONE
         self._grid = _parse_grid(grid)
         self._keys = [str(i) for i in range(len(self._grid))] + ["global"]
         self._impl = _core._FeatureComputerImpl()
         self._impl.set_config(
-            [h, w, c], chan, self._grid, _parse_stride(stride), max(1, int(threads))
+            [h, w, c], chan, self._grid, _parse_stride(stride), max(1, int(threads)), conversion
         )
         #: bands actually used, i.e. threads participating including the caller's.
         self.threads: int = self._impl.threads()
@@ -337,6 +386,21 @@ class FeatureComputer:
         for i, x in zip(self._keys, cross):
             out[f"xchan_{i}"] = x
         return out
+
+
+def convert(img: np.ndarray, input_space: str = "bgr", feature_space: str = "hsv") -> np.ndarray:
+    """``img``, an ``(H, W, 3)`` uint8 image in ``input_space``, as a new ``(H, W, 3)``
+    array in ``feature_space``: the conversion ``FeatureComputer`` fuses into its pass,
+    on its own. For bgr -> hsv the bytes are ``cv2.cvtColor(img, cv2.COLOR_BGR2HSV)``'s.
+    Any strides (a view is fine); the same space twice is a copy."""
+    if img.ndim != 3 or img.shape[2] != 3:
+        raise ValueError(f"expected an (H, W, 3) image, got shape {img.shape}")
+    if img.dtype != np.uint8:
+        raise TypeError("input must be uint8")
+    conversion = _conversion(input_space, feature_space, 3)
+    if conversion == _core.CONVERT_NONE:
+        return np.array(img, dtype=np.uint8, order="C")
+    return np.asarray(_core.convert(img, conversion))
 
 
 def cpu_count() -> int:

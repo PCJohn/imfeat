@@ -2,6 +2,8 @@
 
 Timings are printed (run with -s), never asserted beyond generous regression bounds.
 Accuracy is deterministic, so it is gated. Skip all of it with -m "not bench".
+The images are synthetic planes, taken as they are (``feature_space=None``); the colour
+conversion's own cost is ``test_colour_conversion``.
 """
 
 from __future__ import annotations
@@ -107,7 +109,7 @@ def sweep(n, k, c):
     img = synth(n, c)
     ref, base, rows = None, None, {}
     for s in STRIDES:
-        fc = imfeat.FeatureComputer(img.shape, grid=pyramid(k), stride=s)
+        fc = imfeat.FeatureComputer(img.shape, grid=pyramid(k), stride=s, feature_space=None)
         out = groups(fc, img)
         ref = ref or out
         ms = latency(lambda: fc.features(img), reps=50, warm=5)["min"]
@@ -168,7 +170,7 @@ def test_per_channel_cost(n, k):
     head(f"Per-channel cost ({n}x{n}, finest {1 << k}, stride=2): SIMD packs 4 channels/vector")
     for c in CHANNELS:
         im = synth(n, c)
-        fc = imfeat.FeatureComputer(im.shape, grid=pyramid(k), stride=2)
+        fc = imfeat.FeatureComputer(im.shape, grid=pyramid(k), stride=2, feature_space=None)
         ms = latency(lambda: fc.features(im), reps=50, warm=5)["min"]
         print(f"  C={c:>2}: {ms:7.3f} ms  ({ms / c:6.3f} ms/channel)")
 
@@ -184,7 +186,9 @@ def test_thread_phases(n, k, stride):
     print(f"  {'':9s} {'raw min':>8} {'x':>6} {STATS_HEAD} {'x':>6}")
     a0 = t0 = None
     for nt in THREADS:
-        fc = imfeat.FeatureComputer(img.shape, grid=pyramid(k), stride=stride, threads=nt)
+        fc = imfeat.FeatureComputer(
+            img.shape, grid=pyramid(k), stride=stride, threads=nt, feature_space=None
+        )
         view = fc._view(img)
         acc = latency(lambda: fc._impl.raw(view))["min"]
         st = latency(lambda: fc.features(img))
@@ -202,10 +206,32 @@ def test_latency(n, k, c, stride):
     """Headline 4-level features() latency; regression bound scales with pixel count."""
     shape = (n, n) if c == 1 else (n, n, c)
     img = frame(shape)
-    fc = imfeat.FeatureComputer(shape, grid=pyramid(k), stride=stride)
+    fc = imfeat.FeatureComputer(shape, grid=pyramid(k), stride=stride, feature_space=None)
     st = latency(lambda: fc.features(img))
     print(
         f"\n  {platform.machine()} {platform.system()} py{platform.python_version()} | "
         f"{shape} finest-{1 << k} stride={stride}\n  ms: {STATS_HEAD}\n      {stats_row(st)}"
     )
     assert st["p50"] < 6.0 * (n / 256) ** 2
+
+
+@pytest.mark.parametrize("threads", [1, 2, 4])
+def test_colour_conversion(threads):
+    """A BGR frame to HSV features: the conversion fused into the pass against OpenCV's
+    cvtColor followed by the pass on its output (the two give the same bytes)."""
+    cv2 = pytest.importorskip("cv2")
+    n, k = 1024, 6
+    bgr = frame((n, n, 3))
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    fused = imfeat.FeatureComputer(bgr.shape, grid=pyramid(k), threads=threads)
+    asis = imfeat.FeatureComputer(bgr.shape, grid=pyramid(k), threads=threads, feature_space=None)
+    head(f"BGR -> HSV features: {n}x{n}x3 finest-{1 << k} stride=1, threads={fused.threads} (ms)")
+    rows = [
+        ("cv2.cvtColor", lambda: cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)),
+        ("pass on HSV", lambda: asis.features(hsv)),
+        ("cvtColor + pass", lambda: asis.features(cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV))),
+        ("fused pass on BGR", lambda: fused.features(bgr)),
+    ]
+    print(f"  {'':18s} {STATS_HEAD}")
+    for name, fn in rows:
+        print(f"  {name:18s} {stats_row(latency(fn, reps=100, warm=10))}")

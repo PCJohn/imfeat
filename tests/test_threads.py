@@ -29,7 +29,9 @@ CONFIGS = [
 
 
 def _outputs(shape, grid, stride, threads):
-    fc = imfeat.FeatureComputer(shape, grid=grid, stride=stride, threads=threads)
+    fc = imfeat.FeatureComputer(
+        shape, grid=grid, stride=stride, threads=threads, feature_space=None
+    )
     img = frame(shape, 7)
     return fc, {**fc.compute(img), **groups(fc, img)}
 
@@ -50,7 +52,9 @@ def test_threads_are_bit_exact(shape, grid, stride, threads):
 def test_repeated_frames_do_not_drift():
     """The pool is reused across frames; a stale barrier would show up as a
     difference on the second or third call, not the first."""
-    fc = imfeat.FeatureComputer((128, 128, 3), grid=[(4, 4), (3, 3)], stride=2, threads=4)
+    fc = imfeat.FeatureComputer(
+        (128, 128, 3), grid=[(4, 4), (3, 3)], stride=2, threads=4, feature_space=None
+    )
     imgs = [frame((128, 128, 3), s) for s in range(3)]
     first = [{k: np.array(v) for k, v in groups(fc, im).items()} for im in imgs]
     for _ in range(3):

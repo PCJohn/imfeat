@@ -119,7 +119,7 @@ def test_non_contiguous_input():
 def test_simd_group_boundaries(nch):
     """Channels are processed in groups of 4 lanes; check the ragged tail."""
     img = rng.integers(0, 256, (64, 64, nch), dtype=np.uint8)
-    r = groups(imfeat.FeatureComputer(img.shape, grid=[(3, 3)]), img)
+    r = groups(imfeat.FeatureComputer(img.shape, grid=[(3, 3)], feature_space=None), img)
     for c in range(nch):
         plane = np.ascontiguousarray(img[:, :, c])
         solo = groups(imfeat.FeatureComputer(plane.shape, grid=[(3, 3)]), plane)

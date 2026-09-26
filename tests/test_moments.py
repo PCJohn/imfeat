@@ -193,7 +193,8 @@ def test_stride_preserves_moments():
 def test_multichannel_matches_per_channel():
     """Channels-in-lanes SIMD (C>=2) must agree bit-for-bit with the scalar path."""
     img = np.stack([textured(), noise(), ramp()], -1)
-    multi = groups(imfeat.FeatureComputer(img.shape, grid=[(5, 5), (3, 3)]), img)
+    fc = imfeat.FeatureComputer(img.shape, grid=[(5, 5), (3, 3)], feature_space=None)
+    multi = groups(fc, img)
     for c in range(3):
         plane = np.ascontiguousarray(img[:, :, c])
         solo = groups(imfeat.FeatureComputer(plane.shape, grid=[(5, 5), (3, 3)]),
@@ -207,7 +208,7 @@ def test_multichannel_matches_per_channel():
 @pytest.mark.parametrize("nch", [1, 2, 3, 5, 8])
 def test_arbitrary_channel_count(nch):
     img = rng.integers(0, 256, (128, 128, nch), dtype=np.uint8)
-    r = groups(imfeat.FeatureComputer(img.shape, grid=[(4, 4)]), img)
+    r = groups(imfeat.FeatureComputer(img.shape, grid=[(4, 4)], feature_space=None), img)
     assert r["mom_0"].shape == (16, 16, nch, 4)
     for c in range(nch):
         ref = ref_moments(img[:, :, c].astype(np.float64).ravel())

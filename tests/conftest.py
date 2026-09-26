@@ -7,6 +7,10 @@ lives here, in one place, exercised by every test that uses it.
 
 `groups(fc, img)` reproduces the old mapping exactly: verified array-for-array against
 the pre-change output across six configs.
+
+The multi-channel images here are stacks of synthetic planes, not colour: the tests that
+check per-channel arithmetic against an oracle pass ``feature_space=None`` and get the
+planes as they are. The colour conversion has its own tests in test_color.py.
 """
 
 from __future__ import annotations

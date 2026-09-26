@@ -100,6 +100,7 @@ Chronologically. Times are single-thread `features()`; instruction counts are pe
 | 3 | Finest level streamed instead of stored; outputs derived into pooled blocks; HOG / LBP normalised in SIMD; summary folded in batches | development VM: 0.55 → 0.37 ms at 256×256×3 stride 2 |
 | 4 | Nine texture features and the projection profiles added | a cost: +20% |
 | 5 | Per-cell stage reworked (details below) | instructions 6.37 M → 5.23 M (−18%); Xeon 0.58 → 0.42 ms (−28%); laptop 0.45 → 0.35 ms (−22%) |
+| 6 | BGR → HSV conversion fused into the row gather (details below) | development VM, 1024×1024×3 stride 1: `cvtColor` + pass 11.7 → 10.7 ms at one thread (the conversion costs 0.7 ms inside the pass against `cvtColor`'s 1.4 ms plus a write and a read of the image), 8.6 → 5.9 ms median at two |
 
 **Step 1, the kernel.** Besides the change of lane, three algebraic rewrites turn every sum
 into a plain vector add:
@@ -135,6 +136,22 @@ cell and row indices, pyramid factors, the rounded mean. They became wrapped cou
 per-configuration tables, shifts, and a multiply by `1/n` corrected by its exact remainder. An
 instruction count treats a 40-cycle divide like an add, so this was invisible until divider
 operations were counted separately.
+
+**Step 6, the colour conversion.** A host with a BGR frame that wants HSV features used to
+run `cv2.cvtColor` first: a pass that writes a second image and reads it back. The conversion
+now happens where each row is de-interleaved, in every band's thread, so it costs no memory
+traffic and threads like the rest. The output is exactly OpenCV's 8-bit integer formula
+(`RGB2HSV_b`, hue in `[0, 180)`), checked against `cv2.cvtColor` on all 2^24 colours on the
+AVX-512, AVX2, SSE4 and SSSE3 builds. What made it cheap is not gathering: OpenCV's formula
+takes two per-pixel table values, `round(255·2¹²/v)` and `round(30·2¹²/diff)`, and a 256-entry
+gather per lane is slow on every x86 generation. Instead each value is a float division
+(exact IEEE division on x86 and AArch64, one `vdivps` per vector) rounded to the nearest
+integer and then *corrected by its integer remainder*: `2r > x` adds one, `2r < −x` takes one
+away, which makes the value exact by construction whatever the float did, provided it landed
+within one. Neither table has a half-way case (the numerators carry more factors of two than
+any divisor below 256), so "nearest" needs no tie rule. Everything else stays in bytes (`v`,
+`diff`), 16-bit lanes (the signed hue numerator) and 32-bit lanes (the two fixed-point
+products), and the H and S planes are only computed when a selected channel asks for them.
 
 ## What did not work
 
@@ -211,9 +228,11 @@ it accumulator loads and stores.
 
 ## Verifying
 
-* The repository's tests, extended from 599 to 710: oracle tests for the bar detector (numpy)
+* The repository's tests, extended from 599 to 747: oracle tests for the bar detector (numpy)
   and for the texture sums (exact), over block geometries chosen to reach every kernel path;
-  output lifetime; profiles; threads 1, 2, 3, 4 and 8.
+  output lifetime; profiles; threads 1, 2, 3, 4 and 8; the colour conversion against
+  `cv2.cvtColor` on every BGR value, through the vector path and the scalar tail, and the
+  fused pass against the pass on the converted image, byte for byte.
 * A bit-identity harness: 14,328 output arrays (6 shapes × 4 channel counts × 5 grids ×
   6 strides × 2 kinds of image, at 1, 2 and 3 threads) hashed per build and compared with the
   previous build after every change, on AVX2, AVX-512 and SSE4 builds.

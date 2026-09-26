@@ -112,7 +112,7 @@ def test_matches_oracle_deep_grid(stride):
 @pytest.mark.full
 def test_oracle_multichannel_is_per_channel():
     img = rng.integers(0, 256, (96, 96, 3), np.uint8)
-    got = groups(imfeat.FeatureComputer(img.shape, grid=[(3, 3)]), img)
+    got = groups(imfeat.FeatureComputer(img.shape, grid=[(3, 3)], feature_space=None), img)
     for c in range(3):
         ref = ref_hashes(np.ascontiguousarray(img[:, :, c]), 8, (1, 1))
         for k, v in ref.items():
@@ -157,7 +157,7 @@ def test_vs_imagehash_per_channel_native():
 
     imgs = [_distinct(8) for _ in range(3)]
     hwc = np.ascontiguousarray(np.stack(imgs, -1))
-    f = groups(imfeat.FeatureComputer(hwc.shape, grid=[(3, 3)]), hwc)
+    f = groups(imfeat.FeatureComputer(hwc.shape, grid=[(3, 3)], feature_space=None), hwc)
     for c, g in enumerate(imgs):
         im = Image.fromarray(g, "L")
         assert np.array_equal(_unpack(f["ahash"][c]), imagehash.average_hash(im).hash)

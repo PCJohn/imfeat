@@ -57,7 +57,7 @@ def test_bard_sums_match_oracle(shape, grid, stride, channels):
     sy, sx = (stride, stride) if isinstance(stride, int) else stride
     planes = [bars(shape, seed) for seed in range(channels)]
     img = planes[0] if channels == 1 else np.stack(planes, -1)
-    fc = imfeat.FeatureComputer(img.shape, grid=[grid], stride=stride)
+    fc = imfeat.FeatureComputer(img.shape, grid=[grid], stride=stride, feature_space=None)
     raw = fc._impl.raw(fc._view(img))[0][0][..., BARD0 : BARD0 + 3 + len(imfeat.BARD_FEATURES) - 4]
     for k, gray in enumerate(planes):
         np.testing.assert_array_equal(
@@ -68,7 +68,9 @@ def test_bard_sums_match_oracle(shape, grid, stride, channels):
 def test_bard_sums_are_thread_invariant():
     img = np.stack([bars((96, 160), seed) for seed in range(3)], -1)
     runs = [
-        imfeat.FeatureComputer(img.shape, grid=[(4, 4), (2, 2)], stride=2, threads=t)._impl.raw(img)
+        imfeat.FeatureComputer(
+            img.shape, grid=[(4, 4), (2, 2)], stride=2, threads=t, feature_space=None
+        )._impl.raw(img)
         for t in (1, 2, 3)
     ]
     for other in runs[1:]:

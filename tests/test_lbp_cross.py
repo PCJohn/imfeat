@@ -120,7 +120,8 @@ def test_lbp_exact(img, grid, stride):
 @pytest.mark.parametrize("stride", STRIDES)
 def test_cross_exact(grid, stride):
     img = np.stack([textured(), noise(), vstep()], -1)
-    r = imfeat.FeatureComputer(img.shape, grid=grid, stride=stride).compute(img)
+    fc = imfeat.FeatureComputer(img.shape, grid=grid, stride=stride, feature_space=None)
+    r = fc.compute(img)
     for i, ref in enumerate(ref_cross(img, grid, stride)):
         assert np.array_equal(r[f"xchan_{i}"], ref)
 
@@ -128,9 +129,9 @@ def test_cross_exact(grid, stride):
 def test_bins_partition_the_pixels():
     """Every sampled pixel lands in exactly one bin, so the bins sum to the count."""
     img = np.stack([textured(), noise()], -1)
-    r = imfeat.FeatureComputer(img.shape, grid=[(3, 3)], stride=2).compute(img)
+    r = imfeat.FeatureComputer(img.shape, grid=[(3, 3)], stride=2, feature_space=None).compute(img)
     assert np.array_equal(r["lbp_0"].sum(-1), r["struct_0"][..., 3])
-    f = groups(imfeat.FeatureComputer(img.shape, grid=[(3, 3)], stride=2), img)
+    f = groups(imfeat.FeatureComputer(img.shape, grid=[(3, 3)], stride=2, feature_space=None), img)
     assert np.allclose(f["lbp_0"].sum(-1), 1.0)
 
 
@@ -227,7 +228,7 @@ def test_rotation_invariance():
 def test_cross_identical_and_negated_channels():
     v = textured()
     img = np.stack([v, v, 255 - v], -1)
-    fc = imfeat.FeatureComputer(img.shape, grid=[(2, 2)])
+    fc = imfeat.FeatureComputer(img.shape, grid=[(2, 2)], feature_space=None)
     f = groups(fc, img)
     assert fc.channel_pairs == [(0, 1), (0, 2), (1, 2)]
     cov, corr = f["xchan_0"][..., 0], f["xchan_0"][..., 1]
@@ -238,14 +239,14 @@ def test_cross_identical_and_negated_channels():
 
 def test_cross_independent_channels_decorrelate():
     img = np.stack([noise(256), noise(256)], -1)
-    f = groups(imfeat.FeatureComputer(img.shape, grid=[(0, 0)]), img)
+    f = groups(imfeat.FeatureComputer(img.shape, grid=[(0, 0)], feature_space=None), img)
     assert abs(f["xchan_global"][0, 1]) < 0.02
 
 
 def test_cross_matches_numpy_corrcoef():
     v = textured()
     img = np.stack([v, noise(), np.clip(v // 2 + 40, 0, 255).astype(np.uint8)], -1)
-    f = groups(imfeat.FeatureComputer(img.shape, grid=[(1, 1)]), img)
+    f = groups(imfeat.FeatureComputer(img.shape, grid=[(1, 1)], feature_space=None), img)
     for cy in range(2):
         for cx in range(2):
             blk = img[cy * 32 : cy * 32 + 32, cx * 32 : cx * 32 + 32].astype(float)
@@ -256,7 +257,7 @@ def test_cross_matches_numpy_corrcoef():
 
 def test_cross_constant_channel_is_zero_not_nan():
     img = np.stack([textured(), np.full((64, 64), 9, np.uint8)], -1)
-    f = groups(imfeat.FeatureComputer(img.shape, grid=[(2, 2)]), img)
+    f = groups(imfeat.FeatureComputer(img.shape, grid=[(2, 2)], feature_space=None), img)
     assert np.all(np.isfinite(f["xchan_0"]))
     assert np.allclose(f["xchan_0"][..., 1], 0.0)
 
@@ -267,6 +268,6 @@ def test_cross_absent_without_pairs(c):
     switched off rather than silently quadratic."""
     shape = (32, 32) if c == 1 else (32, 32, c)
     img = rng.integers(0, 256, shape, dtype=np.uint8)
-    fc = imfeat.FeatureComputer(img.shape, grid=[(2, 2)])
+    fc = imfeat.FeatureComputer(img.shape, grid=[(2, 2)], feature_space=None)
     assert fc.channel_pairs == []
     assert not any(k.startswith("xchan") for k in groups(fc, img))

@@ -75,7 +75,7 @@ def test_only_grid_levels_have_summaries():
 def test_flat_image_summary():
     """A constant image: every cell identical, so min==max==mean and std==0."""
     img = np.full((32, 32, 3), 7, np.uint8)
-    f = groups(imfeat.FeatureComputer(img.shape, grid=[(4, 4)]), img)
+    f = groups(imfeat.FeatureComputer(img.shape, grid=[(4, 4)], feature_space=None), img)
     s = f["mom_summary_0"]  # (4, 3, 4)
     mean_stat = s[imfeat.MOMENTS.index("mean")]  # (C, 4): [min,max,mean,std] of cell means
     assert np.allclose(mean_stat[:, 0], 7.0) and np.allclose(mean_stat[:, 1], 7.0)

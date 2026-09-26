@@ -18,9 +18,10 @@ consume directly. Every integer sum is exact and the output is bit-identical at 
 ```python
 import cv2, imfeat
 
-hsv = cv2.cvtColor(cv2.imread("frame.png"), cv2.COLOR_BGR2HSV)      # (H, W, 3) uint8
-fc = imfeat.FeatureComputer(shape=hsv.shape, grid=[(5, 5), (4, 4)], stride=2)
-p = fc.features(hsv)                       # one pass: all channels, both levels, global
+bgr = cv2.imread("frame.png")                                        # (H, W, 3) uint8
+fc = imfeat.FeatureComputer(shape=bgr.shape, grid=[(5, 5), (4, 4)], stride=2)
+p = fc.features(bgr)                       # one pass: HSV features (converted inside),
+                                           # all channels, both levels, global
 
 p.maps[0]      # (32, 32, 162) float32   3 channels x 54 FEATURE_NAMES, channel-major
 p.maps[-1]     # (162,)        float32   the whole-frame (global) level
@@ -60,16 +61,18 @@ but has not been re-measured since the kernel rewrite described below.
 Construct once for a fixed input shape, then call per frame. Every buffer is allocated up
 front; in steady state a frame allocates nothing.
 
-### `FeatureComputer(shape, grid, stride=None, channels=None, channel_axis=-1, threads=1)`
+### `FeatureComputer(shape, grid, stride=None, channels=None, channel_axis=-1, threads=1, input_space="bgr", feature_space="hsv")`
 
 | arg | meaning |
 |---|---|
 | `shape` | exact shape of every image: `(H, W)` or `(H, W, C)`, uint8 |
 | `grid` | `k` → 2^k × 2^k cells; `(ky, kx)` → 2^ky × 2^kx; or a **list**, finest → coarsest, for a pyramid. Levels must nest; the finest must divide `(H, W)` |
 | `stride` | `None` / `int` / `(sy, sx)`: which pixels are sampled (restarting in every cell) |
-| `channels` | channels to process; default all |
+| `channels` | channels to process (of the feature space, when it differs from the input's); default all |
 | `channel_axis` | default `-1` (OpenCV layout); read through a zero-copy transpose |
 | `threads` | bands of cell rows processed in parallel. Default `1`. Output is bit-identical at any count; `.threads` reports what was used, `imfeat.cpu_count()` what is available |
+| `input_space` | colour space of the images passed in: `"bgr"` (OpenCV's order, the default) or `"hsv"` |
+| `feature_space` | colour space the features are computed in, `"hsv"` by default: a BGR frame gets HSV features with no `cvtColor` pass, the conversion running inside the extraction (per band, as each row is read) and giving exactly `cv2.cvtColor(img, cv2.COLOR_BGR2HSV)`'s bytes (checked on all 2^24 colours). `None`, or the input's own space, takes the channels as they are. Only 3-channel images are colour: 2-D and single-channel input is taken as it is, any other channel count needs `feature_space=None`. `.converts` says whether a conversion is on; `imfeat.convert(img)` is the conversion on its own |
 
 ### `.features(img) -> Pyramid`
 
@@ -247,12 +250,14 @@ Threads (`features()` min, Xeon / laptop):
 
 ## Exactness and testing
 
-The suite has 710 tests:
+The suite has 747 tests:
 
 * **Oracles.** Integer sums are compared *exactly* with numpy / OpenCV implementations, over
   geometries chosen to reach every kernel path (cells narrower and wider than a vector, masked
   sampling meshes, odd strides, rows that overrun a block, tiny images). Floats are compared
-  within the oracles' tolerances, hashes with `imagehash`.
+  within the oracles' tolerances, hashes with `imagehash`. The fused BGR → HSV conversion is
+  compared with `cv2.cvtColor` on all 2^24 colours, through the vector path and the scalar
+  tail, and the pass on a BGR image with the pass on its converted copy, byte for byte.
 * **Invariants.** Multi-channel equals per-channel; a pyramid equals separate single-level
   computers bit for bit; output is bit-identical across 1, 2, 3, 4 and 8 threads; results
   survive later calls and outlive their computer.

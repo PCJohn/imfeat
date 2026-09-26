@@ -61,7 +61,9 @@ def strides(stride) -> tuple[int, int]:
 def test_texture_sums_are_exact(shape, grid, stride, channels, threads):
     planes = [frame(shape, seed) for seed in range(channels)]
     img = planes[0] if channels == 1 else np.stack(planes, -1)
-    fc = imfeat.FeatureComputer(img.shape, grid=[grid], stride=stride, threads=threads)
+    fc = imfeat.FeatureComputer(
+        img.shape, grid=[grid], stride=stride, threads=threads, feature_space=None
+    )
     raw = fc._impl.raw(fc._view(img))[0][0][..., LAP1 : LAP1 + 8]
     for k, gray in enumerate(planes):
         want = oracle(gray, 1 << grid[0], 1 << grid[1], *strides(stride))
@@ -98,7 +100,9 @@ def test_texture_features(shape, grid, stride):
 def test_projection_profiles(shape, grid, stride, threads):
     img = np.stack([frame(shape, seed) for seed in range(3)], -1)
     sy, sx = strides(stride)
-    fc = imfeat.FeatureComputer(img.shape, grid=[grid], stride=stride, threads=threads)
+    fc = imfeat.FeatureComputer(
+        img.shape, grid=[grid], stride=stride, threads=threads, feature_space=None
+    )
     rows, cols = fc.features(img).profiles
     m = mesh(shape, 1 << grid[1], sy, sx)
     on_rows, on_cols = m.any(1), m.any(0)

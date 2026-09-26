@@ -856,7 +856,7 @@ def test_multichannel_matches_numpy_oracle(c, grid, stride):
     n = 64
     imgs = chan_imgs(n, c)
     hwc = stack_hwc(imgs)
-    sc = ss.FeatureComputer((n, n, c), grid=grid, stride=stride)
+    sc = ss.FeatureComputer((n, n, c), grid=grid, stride=stride, feature_space=None)
     raw = sc.compute(hwc)
     for ch, img in enumerate(imgs):  # oracle each channel independently, then compare
         lv = ref_levels(img, grid, stride)
@@ -874,7 +874,7 @@ def test_multichannel_equals_single_channel(c):
     n, grid, stride = 96, [(4, 4), (2, 2)], (1, 1)
     imgs = chan_imgs(n, c)
     hwc = stack_hwc(imgs)
-    mc = ss.FeatureComputer((n, n, c), grid=grid, stride=stride)
+    mc = ss.FeatureComputer((n, n, c), grid=grid, stride=stride, feature_space=None)
     rmc, fmc = mc.compute(hwc), groups(mc, hwc)
     for ch, img in enumerate(imgs):
         sc = ss.FeatureComputer((n, n), grid=grid, stride=stride)
@@ -950,7 +950,7 @@ def test_multichannel_hog_sum_identity():
     # per channel, sum of HOG bins == Sxx + Syy (energy), the exact integer identity
     n, c = 96, 4
     hwc = stack_hwc(chan_imgs(n, c))
-    r = ss.FeatureComputer((n, n, c), grid=[(4, 4)], stride=(2, 2)).compute(hwc)
+    r = ss.FeatureComputer((n, n, c), grid=[(4, 4)], stride=(2, 2), feature_space=None).compute(hwc)
     hog_sum = r["hog_0"].sum(-1)
     energy = r["struct_0"][..., 0] + r["struct_0"][..., 1]
     assert np.array_equal(hog_sum, energy)
