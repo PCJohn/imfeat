@@ -20,7 +20,9 @@ moments, histogram normalisation) are derived once per cell at the end.
 Input is one uint8 image: 2-D ``(H, W)``, or multi-channel in OpenCV order
 ``(H, W, C)`` for any C (set ``channel_axis`` for a different layout). A 3-channel image
 is colour: by default it is taken as BGR (OpenCV's order) and the features are computed
-in HSV, the conversion running inside the pass (``input_space`` / ``feature_space``).
+in HSV, the conversion running inside the pass (``input_space`` / ``feature_space``). With
+``thumb`` the image is a frame the pass thumbnails on the way in, exactly as
+``cv2.resize(..., INTER_AREA)`` would, so a host hands over the frame itself.
 
     import imfeat
 
@@ -65,6 +67,7 @@ __all__ = [
     "Pyramid",
     "convert",
     "cpu_count",
+    "resize_area",
 ]
 __version__ = "0.1.0"
 
@@ -208,6 +211,22 @@ def _parse_stride(stride: int | Sequence[int] | None) -> list[int]:
     return [int(stride[0]), int(stride[1])]
 
 
+def _parse_thumb(thumb: int | Sequence[int] | None) -> tuple[int, int] | None:
+    """-> (rows, cols), or None. Accepts one int for a square thumbnail."""
+    if thumb is None:
+        return None
+    if isinstance(thumb, int):
+        rows = cols = thumb
+    else:
+        t = list(thumb)
+        if len(t) != 2:
+            raise ValueError("thumb must be (rows, cols) or one int")
+        rows, cols = int(t[0]), int(t[1])
+    if rows < 1 or cols < 1:
+        raise ValueError("thumb must have at least one row and one column")
+    return rows, cols
+
+
 # (input, feature) -> the core's conversion, for the pairs that differ. Each is a row kernel
 # in core.cpp (see Convert there); a new space or pair is an entry here and a kernel there.
 _CONVERSIONS: dict[tuple[str, str], int] = {("bgr", "hsv"): _core.CONVERT_BGR2HSV}
@@ -257,6 +276,14 @@ class FeatureComputer:
                    calling thread runs one band itself, so ``threads=2`` adds one
                    worker. Capped at the finest grid's row count; ``.threads``
                    reports what was actually used. See ``cpu_count()``.
+    thumb        : ``(rows, cols)`` (or one int for a square) to resize every image to
+                   before anything else, inside the pass: each band makes its own rows of
+                   the thumbnail from the frame's rows, bit for bit what
+                   ``cv2.resize(frame, (cols, rows), interpolation=cv2.INTER_AREA)`` gives
+                   (downscaling only, up to 4 channels: an upscale is not INTER_AREA in
+                   OpenCV, so resize with cv2 first). ``shape`` is then the frame's, the
+                   grid divides the thumbnail, and ``features(frame, thumb_out=buf)``
+                   also writes the thumbnail for reuse. See ``resize_area``.
     input_space  : the colour space of the images passed in: "bgr" (OpenCV's order,
                    the default) or "hsv". See ``COLOR_SPACES``.
     feature_space: the colour space the features are computed in, "hsv" by default:
@@ -283,6 +310,7 @@ class FeatureComputer:
         threads: int = 1,
         input_space: str = "bgr",
         feature_space: str | None = "hsv",
+        thumb: int | Sequence[int] | None = None,
     ) -> None:
         shape = tuple(int(s) for s in shape)
         ndim = len(shape)
@@ -305,11 +333,19 @@ class FeatureComputer:
         conversion = _conversion(input_space, feature_space, c)
         #: whether the pass converts the input's colour space (False: channels as given).
         self.converts: bool = conversion != _core.CONVERT_NONE
+        #: the ``(rows, cols)`` the pass resizes every image to first, or None.
+        self.thumb: tuple[int, int] | None = _parse_thumb(thumb)
         self._grid = _parse_grid(grid)
         self._keys = [str(i) for i in range(len(self._grid))] + ["global"]
         self._impl = _core._FeatureComputerImpl()
         self._impl.set_config(
-            [h, w, c], chan, self._grid, _parse_stride(stride), max(1, int(threads)), conversion
+            [h, w, c],
+            chan,
+            self._grid,
+            _parse_stride(stride),
+            max(1, int(threads)),
+            conversion,
+            [] if self.thumb is None else list(self.thumb),
         )
         #: bands actually used, i.e. threads participating including the caller's.
         self.threads: int = self._impl.threads()
@@ -328,6 +364,23 @@ class FeatureComputer:
             return img  # already (H, W) or (H, W, C)
         return np.moveaxis(img, self._chan_axis, -1)  # zero-copy transpose to (H, W, C)
 
+    def _thumb_out(self, out: np.ndarray | None) -> np.ndarray | None:
+        """Validate the array the thumbnail is written into: ``(rows, cols, C)`` uint8,
+        C-contiguous, C the input's channel count (``(rows, cols)`` for 2-D input)."""
+        if out is None:
+            return None
+        if self.thumb is None:
+            raise ValueError("thumb_out needs a FeatureComputer built with thumb=(rows, cols)")
+        c = 1 if self._chan_axis is None else self._shape[self._chan_axis]
+        want = self.thumb if self._chan_axis is None else (*self.thumb, c)
+        if out.shape != want:
+            raise ValueError(f"thumb_out must have shape {want}, got {out.shape}")
+        if out.dtype != np.uint8:
+            raise TypeError("thumb_out must be uint8")
+        if not out.flags.c_contiguous or not out.flags.writeable:
+            raise ValueError("thumb_out must be a C-contiguous, writeable array")
+        return out
+
     def _cut(self, a: np.ndarray, widths: Sequence[tuple[str, int]], i: str) -> dict:
         """Slice one wide (..., C, W) array into its feature groups, dropping the
         size-1 channel axis for single-channel (2-D) input.
@@ -343,11 +396,15 @@ class FeatureComputer:
             o += n
         return out
 
-    def features(self, img: np.ndarray) -> Pyramid:
+    def features(self, img: np.ndarray, thumb_out: np.ndarray | None = None) -> Pyramid:
         """The whole pyramid in one shot. `maps` is one `(H, W, C*F)` float32 array per
         level, finest first and the 1-cell global level last, so `(H, W, channels)` is
         NHWC and feeds an FPN-style neck or a per-cell tree model directly. The channel
         axis is C-major over `FEATURE_NAMES` (F = 38).
+
+        With ``thumb`` set, ``thumb_out`` (a ``(rows, cols, C)`` uint8 array, C-contiguous)
+        receives the thumbnail the pass made, for reuse downstream; without it nothing is
+        written out.
 
         Every feature is per-pixel normalised, so no level carries a cell-area factor and
         one shared-weight head can read all of them. The channels do span a very wide
@@ -357,7 +414,9 @@ class FeatureComputer:
         cheap way to collect them.
         """
         # Every array arrives in its final layout, sharing ownership of this call's block.
-        maps, mom, cross, summary, hashes, rows, cols = self._impl.features(self._view(img))
+        maps, mom, cross, summary, hashes, rows, cols = self._impl.features(
+            self._view(img), self._thumb_out(thumb_out)
+        )
         return Pyramid(
             maps=maps,
             moments=mom,
@@ -367,7 +426,9 @@ class FeatureComputer:
             profiles=(rows, cols),
         )
 
-    def compute(self, img: np.ndarray) -> dict[str, np.ndarray]:
+    def compute(
+        self, img: np.ndarray, thumb_out: np.ndarray | None = None
+    ) -> dict[str, np.ndarray]:
         """Raw int64 accumulators per cell (additive; sum them freely):
             struct_i (cells_y, cells_x[, C], 4)  [Sxx, Syy, Sxy, count]
             hog_i    (cells_y, cells_x[, C], 9)  gradient-energy orientation histogram
@@ -376,10 +437,11 @@ class FeatureComputer:
             lbp_i    (cells_y, cells_x[, C], 10) LBP^riu2 bin counts (sum == pixel count)
             xchan_i  (cells_y, cells_x, P)       Sum(v_i * v_j) per channel pair, P = len(channel_pairs)
         plus the "_global" variants. The C axis is present only for multi-channel input;
-        "xchan_*" is absent when there are no channel pairs.
+        "xchan_*" is absent when there are no channel pairs. ``thumb_out`` as in
+        :meth:`features`.
         """
         widths = (("struct", _NS_RAW), ("hog", _NH), ("cnt", _NC), ("mom", _NM), ("lbp", _NL))
-        lv, cross = self._impl.raw(self._view(img))
+        lv, cross = self._impl.raw(self._view(img), self._thumb_out(thumb_out))
         out: dict[str, np.ndarray] = {}
         for i, a in zip(self._keys, lv):
             out.update(self._cut(a, widths, i))
@@ -401,6 +463,21 @@ def convert(img: np.ndarray, input_space: str = "bgr", feature_space: str = "hsv
     if conversion == _core.CONVERT_NONE:
         return np.array(img, dtype=np.uint8, order="C")
     return np.asarray(_core.convert(img, conversion))
+
+
+def resize_area(img: np.ndarray, size: int | Sequence[int], threads: int = 1) -> np.ndarray:
+    """``img`` (an ``(H, W)`` or ``(H, W, C)`` uint8 image, up to 4 channels, any strides)
+    resized to ``size`` = ``(rows, cols)`` (or one int for a square): a new array holding
+    ``cv2.resize(img, (cols, rows), interpolation=cv2.INTER_AREA)``'s bytes exactly, as
+    the pass makes its thumbnail (``FeatureComputer(thumb=...)``). Downscaling only: an
+    upscale is bilinear in OpenCV, not INTER_AREA, and is refused. ``threads`` splits the
+    rows over that many threads for this call; the output is the same at any count."""
+    if img.dtype != np.uint8:
+        raise TypeError("input must be uint8")
+    if img.ndim not in (2, 3):
+        raise ValueError(f"expected an (H, W) or (H, W, C) image, got shape {img.shape}")
+    rows, cols = _parse_thumb(size)  # type: ignore[misc]  # never None for a given size
+    return np.asarray(_core.resize_area(img, rows, cols, max(1, int(threads))))
 
 
 def cpu_count() -> int:

@@ -2,6 +2,7 @@
 
 #include <nanobind/nanobind.h>
 #include <nanobind/ndarray.h>
+#include <nanobind/stl/optional.h>
 #include <nanobind/stl/vector.h>
 
 #include <algorithm>
@@ -12,6 +13,7 @@
 #include <limits>
 #include <mutex>
 #include <new>
+#include <optional>
 #include <stdexcept>
 #include <thread>
 #include <type_traits>
@@ -968,6 +970,523 @@ void gather_row(const uint8_t *IF_RESTRICT src, int64_t cs, const int64_t *IF_RE
     for (int k = 0; k < c; ++k) out[(size_t)k * ostride + x] = src[(int64_t)x * cs + coff[k]];
 }
 
+// --- the thumbnail resize, fused into the row gather -------------------------------------------
+// A host that thumbnails a frame before the pass runs cv2.resize(INTER_AREA): a pass over the
+// frame on OpenCV's thread pool that writes the thumbnail, which the pass then reads back. Here
+// each band makes its own rows of the thumbnail (halo included) from the frame's rows as its
+// first step, in its own thread, and its row gather then reads them like any planar rows;
+// nothing leaves the band unless the caller asks for the thumbnail. The bytes are cv2.resize's
+// exactly -- the tests compare frames of many sizes -- because the arithmetic is OpenCV's
+// (imgproc/src/resize.cpp) step for step:
+//   * a destination column takes its source columns in table order (the partial cell on the
+//     left, the whole cells, the partial cell on the right) with float32 weights; each product
+//     and each running sum is rounded to float32, and there is no fused multiply-add anywhere
+//     (OpenCV compiles this for its SSE3 baseline: see the pragmas and IF_STRICT below);
+//   * a destination row is its source rows' resampled values scaled by their float32 weights
+//     and summed in order; the result is rounded half to even and clamped;
+//   * when both ratios are whole numbers OpenCV sums the block instead and rounds sum / area,
+//     half up for 2x2 on 1, 3 or 4 channels and through a float32 product otherwise; and the
+//     same size is a copy. Upscaling is not INTER_AREA at all in OpenCV (it turns bilinear),
+//     so it is refused here and a host resizes with cv2 first.
+// What makes it fast: a source row is resampled once (OpenCV does it once per destination row
+// it feeds, about twice); the horizontal pass is a fixed byte shuffle per group of G destination
+// columns, whose taps all lie in one 16-byte window of the row, one shuffle and one multiply per
+// tap slot; the vertical pass is a vector multiply-add over the row; and the work splits over
+// the bands like the rest of the pass, with the output identical at any thread count.
+struct AreaTap
+{
+  int si;
+  float alpha;
+};
+
+// OpenCV's computeResizeAreaTab, per destination index: the taps, in the order it sums them.
+std::vector<std::vector<AreaTap>> area_taps(int ssize, int dsize)
+{
+  const double scale = 1.0 / ((double)dsize / ssize); // cv::resize: 1 / inv_scale
+  std::vector<std::vector<AreaTap>> out((size_t)dsize);
+  for (int dx = 0; dx < dsize; ++dx)
+  {
+    const double fsx1 = dx * scale, fsx2 = fsx1 + scale;
+    const double cell = std::min(scale, ssize - fsx1);
+    int sx1 = (int)std::ceil(fsx1), sx2 = (int)std::floor(fsx2);
+    sx2 = std::min(sx2, ssize - 1);
+    sx1 = std::min(sx1, sx2);
+    if (sx1 - fsx1 > 1e-3) out[dx].push_back({sx1 - 1, (float)((sx1 - fsx1) / cell)});
+    for (int sx = sx1; sx < sx2; ++sx) out[dx].push_back({sx, (float)(1.0 / cell)});
+    if (fsx2 - sx2 > 1e-3)
+      out[dx].push_back({sx2, (float)(std::min(std::min(fsx2 - sx2, 1.0), cell) / cell)});
+  }
+  return out;
+}
+
+// The horizontal plan: groups of G destination columns, each with the start of the 16-byte
+// source window its taps lie in, a shuffle pattern per tap slot (0x80 picks a zero byte, whose
+// weight is 0) and G weights per slot. G is the widest of 8 (4 on 128-bit targets), 4, 2, 1
+// that fits every group in a window; when even one column's taps do not (a ratio near 16 or
+// more), G is 0 and the row goes through the scalar loop, which is the same sum in the same
+// order.
+constexpr int AREA_MAX_G = HWY_MAX_BYTES >= 32 ? 8 : 4;
+
+struct AreaHPlan
+{
+  int G = 0, slots = 0, groups = 0, dsize = 0;
+  std::vector<int> w0;          // [group]
+  std::vector<uint8_t> pattern; // [group][slot][16]
+  std::vector<float> weight;    // [group][slot][G]
+  std::vector<int> toff;        // scalar: index i's taps are taps[toff[i] .. toff[i+1])
+  std::vector<AreaTap> taps;
+};
+
+bool area_hplan_fit(const std::vector<std::vector<AreaTap>> &t, int G, AreaHPlan &p)
+{
+  const int dsize = (int)t.size();
+  p.G = G;
+  p.dsize = dsize;
+  p.groups = (dsize + G - 1) / G;
+  p.slots = 0;
+  for (const auto &taps : t) p.slots = std::max(p.slots, (int)taps.size());
+  p.w0.assign((size_t)p.groups, 0);
+  p.pattern.assign((size_t)p.groups * p.slots * 16, 0x80);
+  p.weight.assign((size_t)p.groups * p.slots * G, 0.0f);
+  for (int g = 0; g < p.groups; ++g)
+  {
+    int lo = 1 << 30, hi = -1;
+    for (int l = 0; l < G && g * G + l < dsize; ++l)
+      for (const AreaTap &tap : t[(size_t)g * G + l])
+      {
+        lo = std::min(lo, tap.si);
+        hi = std::max(hi, tap.si);
+      }
+    if (hi - lo + 1 > 16) return false;
+    p.w0[g] = lo;
+    for (int l = 0; l < G && g * G + l < dsize; ++l)
+    {
+      const auto &taps = t[(size_t)g * G + l];
+      for (int k = 0; k < (int)taps.size(); ++k)
+      {
+        p.pattern[((size_t)g * p.slots + k) * 16 + l] = (uint8_t)(taps[k].si - lo);
+        p.weight[((size_t)g * p.slots + k) * G + l] = taps[k].alpha;
+      }
+    }
+  }
+  return true;
+}
+
+void area_hplan(const std::vector<std::vector<AreaTap>> &t, AreaHPlan &p)
+{
+  for (int G = AREA_MAX_G; G >= 1; G /= 2)
+    if (area_hplan_fit(t, G, p)) return;
+  p = AreaHPlan(); // scalar
+  p.dsize = (int)t.size();
+  p.toff.assign((size_t)p.dsize + 1, 0);
+  for (int i = 0; i < p.dsize; ++i)
+  {
+    p.taps.insert(p.taps.end(), t[i].begin(), t[i].end());
+    p.toff[i + 1] = (int)p.taps.size();
+  }
+}
+
+// The float arithmetic below is OpenCV's to the last rounding, as written: no fused
+// multiply-add, no reassociation (IF_STRICT; on MSVC the precise model and, since that alone
+// may leave /fp:fast's contractions on, fp_contract off -- which has no push, so it is put back
+// on after the region, /fp:fast's default, which is what CMakeLists.txt sets).
+#if defined(_MSC_VER) && !defined(__clang__)
+#pragma float_control(precise, on, push)
+#pragma fp_contract(off)
+#endif
+// One row of one plane through the horizontal plan: dsize float32 sums of the taps, in tap order.
+template <int G>
+IF_STRICT_FN HWY_NOINLINE void area_hpass(const AreaHPlan &p, const uint8_t *IF_RESTRICT src,
+                                          float *IF_RESTRICT dst)
+{
+  IF_STRICT_BODY
+  const hn::FixedTag<uint8_t, 16> d16;
+  const hn::FixedTag<uint8_t, G> dg;
+  const hn::Rebind<int32_t, decltype(dg)> di;
+  const hn::Rebind<float, decltype(dg)> df;
+  for (int g = 0; g < p.groups; ++g)
+  {
+    const auto win = hn::LoadU(d16, src + p.w0[g]);
+    const uint8_t *IF_RESTRICT pat = p.pattern.data() + (size_t)g * p.slots * 16;
+    const float *IF_RESTRICT wgt = p.weight.data() + (size_t)g * p.slots * G;
+    auto tap = [&](int k)
+    {
+      const auto sel = hn::TableLookupBytesOr0(win, hn::LoadU(d16, pat + k * 16));
+      const auto v = hn::ConvertTo(df, hn::PromoteTo(di, hn::ResizeBitCast(dg, sel)));
+      return hn::Mul(v, hn::LoadU(df, wgt + k * G)); // rounded, like OpenCV's S * alpha
+    };
+    auto acc = tap(0); // 0 + the first product is the product
+    for (int k = 1; k < p.slots; ++k) acc = hn::Add(acc, tap(k));
+    if (g * G + G <= p.dsize)
+      hn::StoreU(acc, df, dst + g * G);
+    else
+      hn::StoreN(acc, df, dst + g * G, (size_t)(p.dsize - g * G));
+  }
+}
+
+IF_STRICT_FN HWY_NOINLINE void area_hpass_scalar(const AreaHPlan &p, const uint8_t *IF_RESTRICT src,
+                                                 float *IF_RESTRICT dst)
+{
+  IF_STRICT_BODY
+  for (int i = 0; i < p.dsize; ++i)
+  {
+    float acc = 0.0f;
+    for (int j = p.toff[i]; j < p.toff[i + 1]; ++j)
+    {
+      const float prod = (float)src[p.taps[j].si] * p.taps[j].alpha;
+      acc = acc + prod;
+    }
+    dst[i] = acc;
+  }
+}
+
+// dst = beta * a, and dst = dst + beta * a: OpenCV's inter_area::mul and muladd.
+IF_STRICT_FN HWY_NOINLINE void area_vmul(const float *IF_RESTRICT a, int n, float beta,
+                                         float *IF_RESTRICT dst)
+{
+  IF_STRICT_BODY
+  const hn::ScalableTag<float> df;
+  const auto b = hn::Set(df, beta);
+  size_t i = 0;
+  for (; i + hn::Lanes(df) <= (size_t)n; i += hn::Lanes(df))
+    hn::StoreU(hn::Mul(b, hn::LoadU(df, a + i)), df, dst + i);
+  for (; i < (size_t)n; ++i) dst[i] = beta * a[i];
+}
+
+IF_STRICT_FN HWY_NOINLINE void area_vmuladd(const float *IF_RESTRICT a, int n, float beta,
+                                            float *IF_RESTRICT dst)
+{
+  IF_STRICT_BODY
+  const hn::ScalableTag<float> df;
+  const auto b = hn::Set(df, beta);
+  size_t i = 0;
+  for (; i + hn::Lanes(df) <= (size_t)n; i += hn::Lanes(df))
+  {
+    const auto prod = hn::Mul(b, hn::LoadU(df, a + i));
+    hn::StoreU(hn::Add(hn::LoadU(df, dst + i), prod), df, dst + i);
+  }
+  for (; i < (size_t)n; ++i)
+  {
+    const float prod = beta * a[i];
+    dst[i] = dst[i] + prod;
+  }
+}
+
+// Round half to even and clamp to a byte: OpenCV's saturate_cast<uchar>(float).
+IF_STRICT_FN HWY_NOINLINE void area_round(const float *IF_RESTRICT sum, int n,
+                                          uint8_t *IF_RESTRICT out)
+{
+  IF_STRICT_BODY
+  const hn::ScalableTag<float> df;
+  const hn::Rebind<int32_t, decltype(df)> di;
+  const hn::Rebind<uint8_t, decltype(df)> du;
+  size_t i = 0;
+  for (; i + hn::Lanes(df) <= (size_t)n; i += hn::Lanes(df))
+  {
+    const auto r = hn::NearestInt(hn::LoadU(df, sum + i));
+    hn::StoreU(hn::DemoteTo(du, hn::Min(hn::Max(r, hn::Zero(di)), hn::Set(di, 255))), du, out + i);
+  }
+  for (; i < (size_t)n; ++i)
+  {
+    const int v = (int)std::nearbyint(sum[i]);
+    out[i] = (uint8_t)std::min(std::max(v, 0), 255);
+  }
+}
+
+// The whole-number path's rounding: (sum + 2) >> 2 for 2x2, else sum * (1 / area) in float32
+// rounded half to even -- OpenCV's resizeAreaFast_ on its two branches.
+IF_STRICT_FN HWY_NOINLINE void area_int_round(const int32_t *IF_RESTRICT sum, int n, float scale,
+                                              bool half_up_2x2, uint8_t *IF_RESTRICT out)
+{
+  IF_STRICT_BODY
+  const hn::ScalableTag<int32_t> di;
+  const hn::Rebind<float, decltype(di)> df;
+  const hn::Rebind<uint8_t, decltype(di)> du;
+  const auto s = hn::Set(df, scale);
+  size_t i = 0;
+  for (; i + hn::Lanes(di) <= (size_t)n; i += hn::Lanes(di))
+  {
+    const auto v = hn::LoadU(di, sum + i);
+    const auto r = half_up_2x2 ? hn::ShiftRight<2>(hn::Add(v, hn::Set(di, 2)))
+                               : hn::NearestInt(hn::Mul(hn::ConvertTo(df, v), s));
+    hn::StoreU(hn::DemoteTo(du, hn::Min(hn::Max(r, hn::Zero(di)), hn::Set(di, 255))), du, out + i);
+  }
+  for (; i < (size_t)n; ++i)
+  {
+    const int v = half_up_2x2 ? (sum[i] + 2) >> 2 : (int)std::nearbyint((float)sum[i] * scale);
+    out[i] = (uint8_t)std::min(std::max(v, 0), 255);
+  }
+}
+template void area_hpass<1>(const AreaHPlan &, const uint8_t *, float *);
+template void area_hpass<2>(const AreaHPlan &, const uint8_t *, float *);
+template void area_hpass<4>(const AreaHPlan &, const uint8_t *, float *);
+#if HWY_MAX_BYTES >= 32
+template void area_hpass<8>(const AreaHPlan &, const uint8_t *, float *);
+#endif
+#if defined(_MSC_VER) && !defined(__clang__)
+#pragma float_control(pop)
+#pragma fp_contract(on)
+#endif
+
+// The whole-number path's horizontal sums: the plan's patterns pick each column's block of
+// source bytes, summed as integers.
+template <int G>
+HWY_NOINLINE void area_hsum(const AreaHPlan &p, const uint8_t *IF_RESTRICT src,
+                            int32_t *IF_RESTRICT dst)
+{
+  const hn::FixedTag<uint8_t, 16> d16;
+  const hn::FixedTag<uint8_t, G> dg;
+  const hn::Rebind<int32_t, decltype(dg)> di;
+  for (int g = 0; g < p.groups; ++g)
+  {
+    const auto win = hn::LoadU(d16, src + p.w0[g]);
+    const uint8_t *IF_RESTRICT pat = p.pattern.data() + (size_t)g * p.slots * 16;
+    auto acc = hn::Zero(di);
+    for (int k = 0; k < p.slots; ++k)
+    {
+      const auto sel = hn::TableLookupBytesOr0(win, hn::LoadU(d16, pat + k * 16));
+      acc = hn::Add(acc, hn::PromoteTo(di, hn::ResizeBitCast(dg, sel)));
+    }
+    if (g * G + G <= p.dsize)
+      hn::StoreU(acc, di, dst + g * G);
+    else
+      hn::StoreN(acc, di, dst + g * G, (size_t)(p.dsize - g * G));
+  }
+}
+
+void area_hsum_scalar(const AreaHPlan &p, const uint8_t *IF_RESTRICT src, int32_t *IF_RESTRICT dst)
+{
+  for (int i = 0; i < p.dsize; ++i)
+  {
+    int32_t acc = 0;
+    for (int j = p.toff[i]; j < p.toff[i + 1]; ++j) acc += src[p.taps[j].si];
+    dst[i] = acc;
+  }
+}
+
+void area_iadd(const int32_t *IF_RESTRICT a, int n, int32_t *IF_RESTRICT dst)
+{
+  const hn::ScalableTag<int32_t> di;
+  size_t i = 0;
+  for (; i + hn::Lanes(di) <= (size_t)n; i += hn::Lanes(di))
+    hn::StoreU(hn::Add(hn::LoadU(di, dst + i), hn::LoadU(di, a + i)), di, dst + i);
+  for (; i < (size_t)n; ++i) dst[i] += a[i];
+}
+
+// One configured resize: the source and thumbnail sizes, which of OpenCV's three paths it
+// takes, and the plans. Read-only once set up, so every band shares it.
+struct AreaResizer
+{
+  enum Mode
+  {
+    COPY,    // the same size: cv::resize copies
+    GENERIC, // float32 taps
+    INTEGER  // whole-number ratios: block sums
+  };
+  int sh = 0, sw = 0, dh = 0, dw = 0;
+  Mode mode = COPY;
+  int ix = 1, iy = 1;    // INTEGER: the ratios
+  bool half_up = false;  // INTEGER: 2x2 on 1, 3 or 4 channels rounds half up
+  float iscale = 1.0f;   // INTEGER: 1 / (ix * iy), as OpenCV forms it
+  AreaHPlan hp;
+  std::vector<int> yoff, ysi; // GENERIC: row dy's taps are ysi/ybeta[yoff[dy] .. yoff[dy+1])
+  std::vector<float> ybeta;
+
+  // Sets up the resize of (sh, sw) to (dh, dw) with `channels` channels; throws for upscaling.
+  void setup(int sh_, int sw_, int dh_, int dw_, int channels)
+  {
+    sh = sh_, sw = sw_, dh = dh_, dw = dw_;
+    if (dh < 1 || dw < 1)
+      throw std::invalid_argument("the thumbnail needs at least one row and column");
+    if (sh < dh || sw < dw)
+      throw std::invalid_argument("resize_area downscales only, as cv2's INTER_AREA does: OpenCV "
+                                  "turns bilinear for an upscale, so resize with cv2 first");
+    hp = AreaHPlan();
+    yoff.clear(), ysi.clear(), ybeta.clear();
+    if (sh == dh && sw == dw)
+    {
+      mode = COPY;
+      return;
+    }
+    const double scale_x = 1.0 / ((double)dw / sw), scale_y = 1.0 / ((double)dh / sh);
+    const double rx = std::nearbyint(scale_x), ry = std::nearbyint(scale_y); // saturate_cast<int>
+    const double eps = std::numeric_limits<double>::epsilon(); // DBL_EPSILON, as cv::resize
+    if (std::fabs(scale_x - rx) < eps && std::fabs(scale_y - ry) < eps)
+    {
+      mode = INTEGER;
+      ix = (int)rx, iy = (int)ry;
+      half_up = ix == 2 && iy == 2 && (channels == 1 || channels == 3 || channels == 4);
+      iscale = 1.0f / (float)(ix * iy);
+      std::vector<std::vector<AreaTap>> t((size_t)dw);
+      for (int dx = 0; dx < dw; ++dx)
+        for (int k = 0; k < ix; ++k) t[dx].push_back({dx * ix + k, 1.0f});
+      area_hplan(t, hp);
+      return;
+    }
+    mode = GENERIC;
+    area_hplan(area_taps(sw, dw), hp);
+    const auto yt = area_taps(sh, dh);
+    yoff.assign((size_t)dh + 1, 0);
+    for (int dy = 0; dy < dh; ++dy)
+    {
+      for (const AreaTap &tap : yt[dy]) ysi.push_back(tap.si), ybeta.push_back(tap.alpha);
+      yoff[dy + 1] = (int)ysi.size();
+    }
+  }
+};
+
+// One band's (or thread's) working set: a de-interleaved source row, the two most recently
+// resampled source rows (a source row feeds at most the destination row it ends and the one it
+// starts, in order, so two are enough), and the destination row's sums.
+struct AreaScratch
+{
+  int planes = 0, plane_stride = 0, dw = 0;
+  std::vector<uint8_t> src;   // [plane][sw + 32]: the taps read a 16-byte window, so slack
+  std::vector<float> hrow[2]; // [plane][dw] resampled rows
+  int hsy[2] = {-1, -1};      // ... and which source rows they hold
+  std::vector<int32_t> isum, irow; // INTEGER: the block sums in flight, and one row's
+  std::vector<float> sum;          // GENERIC: the destination row in flight
+
+  void setup(const AreaResizer &r, int nplanes)
+  {
+    planes = nplanes;
+    plane_stride = r.sw + 32;
+    dw = r.dw;
+    src.assign((size_t)planes * plane_stride, 0);
+    for (auto &b : hrow) b.assign((size_t)planes * dw, 0.0f);
+    isum.assign((size_t)planes * dw, 0);
+    irow.assign((size_t)planes * dw, 0);
+    sum.assign((size_t)planes * dw, 0.0f);
+    reset();
+  }
+  void reset() { hsy[0] = hsy[1] = -1; }
+};
+
+// The GENERIC resample of source row sy on the planes the scratch holds, from the cache or afresh.
+const float *area_resampled(const AreaResizer &r, AreaScratch &s, int sy)
+{
+  for (int c = 0; c < 2; ++c)
+    if (s.hsy[c] == sy) return s.hrow[c].data();
+  const int slot = s.hsy[0] < s.hsy[1] ? 0 : 1; // the older one goes
+  float *out = s.hrow[slot].data();
+  for (int p = 0; p < s.planes; ++p)
+  {
+    const uint8_t *IF_RESTRICT src = s.src.data() + (size_t)p * s.plane_stride;
+    float *IF_RESTRICT dst = out + (size_t)p * s.dw;
+    switch (r.hp.G)
+    {
+#if HWY_MAX_BYTES >= 32
+    case 8: area_hpass<8>(r.hp, src, dst); break;
+#endif
+    case 4: area_hpass<4>(r.hp, src, dst); break;
+    case 2: area_hpass<2>(r.hp, src, dst); break;
+    case 1: area_hpass<1>(r.hp, src, dst); break;
+    default: area_hpass_scalar(r.hp, src, dst); break;
+    }
+  }
+  s.hsy[slot] = sy;
+  return out;
+}
+
+void area_hsum_row(const AreaResizer &r, const AreaScratch &s, int32_t *out)
+{
+  for (int p = 0; p < s.planes; ++p)
+  {
+    const uint8_t *IF_RESTRICT src = s.src.data() + (size_t)p * s.plane_stride;
+    int32_t *IF_RESTRICT dst = out + (size_t)p * s.dw;
+    switch (r.hp.G)
+    {
+#if HWY_MAX_BYTES >= 32
+    case 8: area_hsum<8>(r.hp, src, dst); break;
+#endif
+    case 4: area_hsum<4>(r.hp, src, dst); break;
+    case 2: area_hsum<2>(r.hp, src, dst); break;
+    case 1: area_hsum<1>(r.hp, src, dst); break;
+    default: area_hsum_scalar(r.hp, src, dst); break;
+    }
+  }
+}
+
+// Thumbnail row dy of the source image (rows rs apart, pixels cs apart, the wanted source
+// channels at bytes coff[0 .. planes) of a pixel; `packed`: the pixels are `planes` contiguous
+// bytes in channel order): `planes` planes of dw bytes, plane p at out + p * ostride.
+void area_row(const AreaResizer &r, AreaScratch &s, const uint8_t *IF_RESTRICT img, int64_t rs,
+              int64_t cs, const int64_t *IF_RESTRICT coff, bool packed, int dy,
+              uint8_t *IF_RESTRICT out, size_t ostride)
+{
+  auto load = [&](int sy)
+  { // the source row, one plane per wanted channel, in the scratch (gather_row's wide paths)
+    gather_row(img + (int64_t)sy * rs, cs, coff, s.planes, r.sw, packed, nullptr, s.src.data(),
+               (size_t)s.plane_stride);
+  };
+  const int n = s.planes * r.dw;
+  switch (r.mode)
+  {
+  case AreaResizer::COPY:
+    load(dy);
+    for (int p = 0; p < s.planes; ++p)
+      std::memcpy(out + (size_t)p * ostride, s.src.data() + (size_t)p * s.plane_stride,
+                  (size_t)r.dw);
+    return;
+  case AreaResizer::INTEGER:
+    for (int k = 0; k < r.iy; ++k)
+    {
+      load(dy * r.iy + k);
+      area_hsum_row(r, s, k == 0 ? s.isum.data() : s.irow.data());
+      if (k) area_iadd(s.irow.data(), n, s.isum.data());
+    }
+    for (int p = 0; p < s.planes; ++p)
+      area_int_round(s.isum.data() + (size_t)p * r.dw, r.dw, r.iscale, r.half_up,
+                     out + (size_t)p * ostride);
+    return;
+  case AreaResizer::GENERIC:
+    for (int j = r.yoff[dy]; j < r.yoff[dy + 1]; ++j)
+    {
+      const int sy = r.ysi[j];
+      bool cached = false;
+      for (int c = 0; c < 2; ++c) cached = cached || s.hsy[c] == sy;
+      if (!cached) load(sy);
+      const float *row = area_resampled(r, s, sy);
+      if (j == r.yoff[dy])
+        area_vmul(row, n, r.ybeta[j], s.sum.data());
+      else
+        area_vmuladd(row, n, r.ybeta[j], s.sum.data());
+    }
+    for (int p = 0; p < s.planes; ++p)
+      area_round(s.sum.data() + (size_t)p * r.dw, r.dw, out + (size_t)p * ostride);
+    return;
+  }
+}
+
+// `planes` planes of w bytes (plane p at src + p * sstride) interleaved into a row of pixels.
+void interleave_row(const uint8_t *IF_RESTRICT src, size_t sstride, int planes, int w,
+                    uint8_t *IF_RESTRICT dst)
+{
+  const hn::ScalableTag<uint8_t> d8;
+  const size_t N = hn::Lanes(d8);
+  size_t x = 0;
+  if (planes == 1)
+  {
+    std::memcpy(dst, src, (size_t)w);
+    return;
+  }
+  if (planes == 3)
+    for (; x + N <= (size_t)w; x += N)
+      hn::StoreInterleaved3(hn::LoadU(d8, src + x), hn::LoadU(d8, src + sstride + x),
+                            hn::LoadU(d8, src + 2 * sstride + x), d8, dst + x * 3);
+  else if (planes == 4)
+    for (; x + N <= (size_t)w; x += N)
+      hn::StoreInterleaved4(hn::LoadU(d8, src + x), hn::LoadU(d8, src + sstride + x),
+                            hn::LoadU(d8, src + 2 * sstride + x),
+                            hn::LoadU(d8, src + 3 * sstride + x), d8, dst + x * 4);
+  else if (planes == 2)
+    for (; x + N <= (size_t)w; x += N)
+      hn::StoreInterleaved2(hn::LoadU(d8, src + x), hn::LoadU(d8, src + sstride + x), d8,
+                            dst + x * 2);
+  for (; x < (size_t)w; ++x)
+    for (int p = 0; p < planes; ++p) dst[x * planes + p] = src[(size_t)p * sstride + x];
+}
+
 // One image row into the rolling window. With P == 1 the gathered rows are the planes.
 // With P > 1 each row is then split by column phase: phase p holds columns p, p+P, ...
 // so the sampled columns are exactly phase 0 and a tap d columns away is still a contiguous
@@ -1094,12 +1613,24 @@ struct Level
 
 class FeatureComputer
 {
-  int h_ = 0, w_ = 0, c_ = 1, sy_ = 1, sx_ = 1;
+  int h_ = 0, w_ = 0, c_ = 1, sy_ = 1, sx_ = 1; // the thumbnail's rows and columns when resize_
   bool interleaved_ = false; // source rows are already the (H,W,C) layout we want
   int conv_ = CONV_NONE;     // colour conversion fused into the row gather (see Convert)
   std::vector<int> chan_;    // the selected channels, of the converted image when conv_
   std::vector<int64_t> coff_; // per-selected-channel (per-source-channel when conv_) offset
                               // within a pixel
+  // The thumbnail resize fused into the row gather (see AreaResizer): the frame is (sh_, sw_)
+  // with csrc_ channels and every row the pass reads is made from it on the way in.
+  bool resize_ = false;
+  int sh_ = 0, sw_ = 0, csrc_ = 1;
+  AreaResizer area_;
+  std::vector<int> need_;         // the source channels a thumbnail row needs, in order
+  std::vector<int64_t> coff_src_; // ... their offsets within a frame pixel
+  std::vector<int64_t> coff_rz_;  // per selected channel (per source one under conv_): its
+                                  // plane's offset in the resized row
+  bool packed_src_ = false;       // the frame's pixels are csrc_ contiguous bytes, all wanted
+  uint8_t *thumb_out_ = nullptr;  // features(): where to write the thumbnail, if asked
+  int64_t thumb_rs_ = 0;
   std::vector<Level> levels_;
   int16_t ray_[HB - 1][2] = {}; // bin-boundary ray j as (cx, -cy): t = cx*qy - cy*qx in one pmaddwd
   int hog_card_[HB] = {};    // 1 for the axis-aligned (cardinal) orientation bins
@@ -1154,6 +1685,9 @@ class FeatureComputer
     std::vector<int> held_cy;    // belong to the band above: rolled up after the join
     std::vector<uint8_t> planes; // padded de-interleaved planes: the rolling window
     std::vector<uint8_t> lin;    // one row, channels contiguous, then the phase split's scratch
+    AreaScratch area;            // resize_: the resize's working set, and the band's rows of
+    std::vector<uint8_t> line;   // the thumbnail: from image row line0, need_ planes of w_ bytes
+    int line0 = 0;               // each, the row gather's input
     int64_t row_stride = 0;      // padded plane row stride
     int64_t phase_stride = 0;    // stride between a row's phase planes
     int filled = 0;              // rows [.., filled) of the window are loaded
@@ -1783,6 +2317,24 @@ class FeatureComputer
     Scratch &s = scr_[bi];
     int64_t *IF_RESTRICT hs = bi ? s.hsum.data() : hsum_.data();
     std::fill(s.col.begin(), s.col.end(), 0);
+    if (resize_)
+    {
+      // The band's rows of the thumbnail, its halo included, made up front from the frame's
+      // rows: one streaming pass with the resize's working set to itself, which measured
+      // faster than a row at a time between the kernel's cell rows.
+      s.area.planes = (int)need_.size();
+      s.area.reset();
+      s.line0 = std::max(0, bands_[bi].r0 - BARD_MAXLAG);
+      const int y1 = std::min(h_, bands_[bi].cy1 * (h_ / fine.ny) + BARD_MAXLAG);
+      const size_t line_bytes = (size_t)need_.size() * (size_t)w_;
+      for (int y = s.line0; y < y1; ++y)
+      {
+        uint8_t *line = s.line.data() + (size_t)(y - s.line0) * line_bytes;
+        area_row(area_, s.area, img, rs, cs, coff_src_.data(), packed_src_, y, line, (size_t)w_);
+        if (thumb_out_)
+          interleave_row(line, (size_t)w_, csrc_, w_, thumb_out_ + (int64_t)y * thumb_rs_);
+      }
+    }
     if (stream_)
     {
       std::fill(s.graw.begin(), s.graw.end(), (int64_t)0);
@@ -1833,9 +2385,15 @@ class FeatureComputer
       {
         for (; s.filled <= std::min(h_ - 1, rows.back() + BARD_MAXLAG); ++s.filled)
         {
-          deinterleave_row(img, rs, cs, coff_.data(), chan_.data(), conv_, c_, w_, s.filled,
-                           interleaved_, s.row_stride, slots_, s.fslot, phases_, s.phase_stride,
-                           s.lin.data(), s.planes.data());
+          if (resize_) // the thumbnail row the band made, read as a planar row
+            deinterleave_row(s.line.data() + (size_t)(s.filled - s.line0) * need_.size() * w_, 0,
+                             1, coff_rz_.data(), chan_.data(), conv_, c_, w_, 0, false,
+                             s.row_stride, slots_, s.fslot, phases_, s.phase_stride, s.lin.data(),
+                             s.planes.data());
+          else
+            deinterleave_row(img, rs, cs, coff_.data(), chan_.data(), conv_, c_, w_, s.filled,
+                             interleaved_, s.row_stride, slots_, s.fslot, phases_, s.phase_stride,
+                             s.lin.data(), s.planes.data());
           s.fslot = s.fslot + 1 == slots_ ? 0 : s.fslot + 1;
         }
         derived = cell_row(s, rows, (size_t)cy, rolls, hs, dst, dstx);
@@ -1992,8 +2550,11 @@ class FeatureComputer
     quit_ = false;
   }
 
-  void accumulate(const uint8_t *IF_RESTRICT img, int64_t rs, int64_t cs, int64_t chs)
+  void accumulate(const uint8_t *IF_RESTRICT img, int64_t rs, int64_t cs, int64_t chs,
+                  uint8_t *thumb_out)
   {
+    thumb_out_ = thumb_out;
+    thumb_rs_ = (int64_t)w_ * csrc_;
     const bool hashing = stream_ || !hfast_; // the hash grid sums: per pixel, or from streamed rows
     if (hashing)
     {
@@ -2002,7 +2563,33 @@ class FeatureComputer
         std::fill(scr_[b].hsum.begin(), scr_[b].hsum.end(), (int64_t)0);
     }
 
-    if (conv_ == CONV_NONE)
+    if (resize_)
+    {
+      // A thumbnail row is made of the source channels the pass needs: all of them under a
+      // conversion (it reads three) or for the thumbnail output, else the selected ones.
+      need_.clear();
+      if (conv_ != CONV_NONE || thumb_out)
+        for (int k = 0; k < csrc_; ++k) need_.push_back(k);
+      else
+      {
+        need_ = chan_;
+        std::sort(need_.begin(), need_.end());
+        need_.erase(std::unique(need_.begin(), need_.end()), need_.end());
+      }
+      for (size_t p = 0; p < need_.size(); ++p) coff_src_[p] = (int64_t)need_[p] * chs;
+      packed_src_ = chs == 1 && cs == csrc_ && (int)need_.size() == csrc_;
+      // the resized row holds need_'s planes w_ apart: where each channel the gather wants is
+      if (conv_ != CONV_NONE)
+        for (int k = 0; k < 3; ++k) coff_rz_[k] = (int64_t)k * w_;
+      else
+        for (int k = 0; k < c_; ++k)
+        {
+          const auto at = std::find(need_.begin(), need_.end(), chan_[k]) - need_.begin();
+          coff_rz_[k] = (int64_t)at * w_;
+        }
+      interleaved_ = false;
+    }
+    else if (conv_ == CONV_NONE)
     {
       interleaved_ = chs == 1 && cs == c_; // ... and the selection is every channel in order
       for (int k = 0; k < c_; ++k)
@@ -2407,7 +2994,8 @@ public:
 
   void set_config(const std::vector<int64_t> &dims, const std::vector<int> &channels,
                   const std::vector<std::vector<int>> &grids,
-                  const std::vector<int64_t> &stride, int threads, int convert)
+                  const std::vector<int64_t> &stride, int threads, int convert,
+                  const std::vector<int64_t> &thumb)
   {
     pool_stop();
     size_t block = 0; // the output block: every features() array at a 64-byte-aligned offset
@@ -2421,6 +3009,19 @@ public:
     w_ = (int)dims[1];
     chan_ = channels;
     c_ = (int)chan_.size();
+    resize_ = !thumb.empty();
+    if (resize_)
+    { // dims is the frame; the pass runs on the thumbnail it makes of it
+      sh_ = h_, sw_ = w_;
+      csrc_ = (int)dims[2];
+      h_ = (int)thumb[0], w_ = (int)thumb[1];
+      if (csrc_ > 4)
+        throw std::invalid_argument("the thumbnail resize takes up to 4 channels");
+      area_.setup(sh_, sw_, h_, w_, csrc_);
+      need_.clear();
+      coff_src_.assign((size_t)csrc_, 0);
+      coff_rz_.assign((size_t)std::max(c_, 3), 0);
+    }
     sy_ = (int)stride[0];
     sx_ = (int)stride[1];
     conv_ = convert;
@@ -2669,6 +3270,12 @@ public:
           (size_t)c_ * (size_t)slots_ * (size_t)s.row_stride + (size_t)s.row_stride + 2 * N, 0);
       // a row of gathered planes, the phase split's scratch, and the conversion's source planes
       s.lin.assign((size_t)(3 * c_ + (conv_ != CONV_NONE ? 3 : 0)) * (size_t)w_ + N, 0);
+      if (resize_)
+      {
+        s.area.setup(area_, csrc_);
+        const int rows = (bands_[b].cy1 - bands_[b].cy0) * (h_ / levels_[0].ny) + 2 * BARD_MAXLAG;
+        s.line.assign((size_t)std::min(rows, h_) * csrc_ * (size_t)w_ + N, 0);
+      }
       if (b) s.hsum.assign((size_t)HN * HN * c_, 0);
       s.row.assign((size_t)levels_[0].nx * c_ * NSUM, 0);
       if (levels_.size() > 1) s.up.assign((size_t)c_ * K_N * ((size_t)levels_[1].nx + N), 0);
@@ -2703,10 +3310,11 @@ public:
     return out;
   }
 
-  nb::list raw(const uint8_t *IF_RESTRICT img, int64_t rs, int64_t cs, int64_t chs)
+  nb::list raw(const uint8_t *IF_RESTRICT img, int64_t rs, int64_t cs, int64_t chs,
+               uint8_t *thumb_out)
   {
     stream_ = false;
-    accumulate(img, rs, cs, chs);
+    accumulate(img, rs, cs, chs, thumb_out);
     nb::list out, cross;
     for (Level &L : levels_)
     {
@@ -2729,7 +3337,8 @@ public:
 
   // Per level: the float32 `maps` rows, channel-major over NMAP, and the float64 moments
   // (moments span 0..255^4, where float32's 7 digits would cost precision).
-  nb::list features(const uint8_t *IF_RESTRICT img, int64_t rs, int64_t cs, int64_t chs)
+  nb::list features(const uint8_t *IF_RESTRICT img, int64_t rs, int64_t cs, int64_t chs,
+                    uint8_t *thumb_out)
   {
     auto *blk = static_cast<uint8_t *>(blocks_->take());
     const nb::capsule owner(blk, Blocks::give); // every array below keeps the block alive
@@ -2749,7 +3358,7 @@ public:
     at(prow_, oprow_);
     at(pcol_, opcol_);
     stream_ = true;
-    accumulate(img, rs, cs, chs);
+    accumulate(img, rs, cs, chs, thumb_out);
     derive();
     derive_hashes();
     derive_profiles();
@@ -2813,6 +3422,51 @@ nb::ndarray<nb::numpy, uint8_t> convert_image(Arr a, int conv)
   const size_t shape[3] = {h, w, 3};
   return nb::ndarray<nb::numpy, uint8_t>(buf, 3, shape, owner);
 }
+// The thumbnail output of features()/raw(): (H, W, C) or (H, W) uint8, C-contiguous, sized in
+// Python; here only checked and unwrapped.
+using ThumbArr = nb::ndarray<uint8_t, nb::c_contig, nb::device::cpu>;
+
+uint8_t *thumb_ptr(std::optional<ThumbArr> &t) { return t ? t->data() : nullptr; }
+
+// The resize on its own: cv2.resize(img, (dw, dh), INTER_AREA)'s bytes for a (H, W[, C]) uint8
+// image in any layout, over `threads` bands of rows. The same rows the pass fuses.
+nb::ndarray<nb::numpy, uint8_t> resize_image(Arr a, int dh, int dw, int threads)
+{
+  if (a.ndim() != 2 && a.ndim() != 3)
+    throw std::invalid_argument("resize_area: expected an (H, W) or (H, W, C) uint8 image");
+  const int sh = (int)a.shape(0), sw = (int)a.shape(1), C = a.ndim() == 3 ? (int)a.shape(2) : 1;
+  if (C < 1 || C > 4) throw std::invalid_argument("resize_area takes 1 to 4 channels");
+  AreaResizer r;
+  r.setup(sh, sw, dh, dw, C);
+  const int64_t rs = a.stride(0), cs = a.stride(1), chs = a.ndim() == 3 ? a.stride(2) : 0;
+  int64_t coff[4] = {0, chs, 2 * chs, 3 * chs};
+  const bool packed = a.ndim() == 3 && chs == 1 && cs == C;
+  auto *buf = new uint8_t[(size_t)dh * dw * C];
+  const nb::capsule owner(buf, [](void *p) noexcept { delete[] static_cast<uint8_t *>(p); });
+  const int nb_ = std::max(1, std::min(threads, dh));
+  auto band = [&](int t)
+  {
+    AreaScratch s;
+    s.setup(r, C);
+    std::vector<uint8_t> line((size_t)C * dw + 64);
+    for (int dy = dh * t / nb_; dy < dh * (t + 1) / nb_; ++dy)
+    {
+      area_row(r, s, a.data(), rs, cs, coff, packed, dy, line.data(), (size_t)dw);
+      interleave_row(line.data(), (size_t)dw, C, dw, buf + (size_t)dy * dw * C);
+    }
+  };
+  std::vector<std::thread> workers;
+  for (int t = 1; t < nb_; ++t) workers.emplace_back(band, t);
+  band(0);
+  for (std::thread &w : workers) w.join();
+  if (a.ndim() == 2)
+  {
+    const size_t shape[2] = {(size_t)dh, (size_t)dw};
+    return nb::ndarray<nb::numpy, uint8_t>(buf, 2, shape, owner);
+  }
+  const size_t shape[3] = {(size_t)dh, (size_t)dw, (size_t)C};
+  return nb::ndarray<nb::numpy, uint8_t>(buf, 3, shape, owner);
+}
 } // namespace
 
 NB_MODULE(imfeat_core, m)
@@ -2829,23 +3483,27 @@ NB_MODULE(imfeat_core, m)
     return (int)(n ? n : 1u);
   });
   m.def("convert", &convert_image, nb::arg("arr"), nb::arg("conversion"));
+  m.def("resize_area", &resize_image, nb::arg("arr"), nb::arg("height"), nb::arg("width"),
+        nb::arg("threads") = 1);
   nb::class_<FeatureComputer>(m, "_FeatureComputerImpl")
       .def(nb::init<>())
       .def("set_config", &FeatureComputer::set_config, nb::arg("dims"), nb::arg("channels"),
-           nb::arg("grids"), nb::arg("stride"), nb::arg("threads"), nb::arg("convert"))
+           nb::arg("grids"), nb::arg("stride"), nb::arg("threads"), nb::arg("convert"),
+           nb::arg("thumb"))
       .def("threads", &FeatureComputer::threads)
       .def("pairs", &FeatureComputer::pairs)
       .def(
           "raw",
-          [](FeatureComputer &self, Arr a) {
-            return self.raw(a.data(), a.stride(0), a.stride(1), a.ndim() > 2 ? a.stride(2) : 0);
+          [](FeatureComputer &self, Arr a, std::optional<ThumbArr> thumb) {
+            return self.raw(a.data(), a.stride(0), a.stride(1), a.ndim() > 2 ? a.stride(2) : 0,
+                            thumb_ptr(thumb));
           },
-          nb::arg("arr"))
+          nb::arg("arr"), nb::arg("thumb_out").none() = nb::none())
       .def(
           "features",
-          [](FeatureComputer &self, Arr a) {
+          [](FeatureComputer &self, Arr a, std::optional<ThumbArr> thumb) {
             return self.features(a.data(), a.stride(0), a.stride(1),
-                                 a.ndim() > 2 ? a.stride(2) : 0);
+                                 a.ndim() > 2 ? a.stride(2) : 0, thumb_ptr(thumb));
           },
-          nb::arg("arr"));
+          nb::arg("arr"), nb::arg("thumb_out").none() = nb::none());
 }

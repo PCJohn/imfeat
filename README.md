@@ -33,6 +33,11 @@ p.profiles     # (rows, cols)  float64   mean of each sampled row / column, per 
 
 f = p.maps[0].reshape(32, 32, 3, 54)       # free view: (cy, cx, channel, feature)
 energy_v = f[..., 2, imfeat.FEATURE_NAMES.index("energy")]
+
+frame = cv2.imread("frame_1080p.png")                                # (1080, 1920, 3)
+fc = imfeat.FeatureComputer(shape=frame.shape, grid=[(6, 6), (5, 5)], thumb=1024)
+p = fc.features(frame)                     # thumbnailed to 1024x1024 inside the pass,
+                                           # exactly as cv2.resize(INTER_AREA) would
 ```
 
 More detail lives in two companion documents:
@@ -61,7 +66,7 @@ but has not been re-measured since the kernel rewrite described below.
 Construct once for a fixed input shape, then call per frame. Every buffer is allocated up
 front; in steady state a frame allocates nothing.
 
-### `FeatureComputer(shape, grid, stride=None, channels=None, channel_axis=-1, threads=1, input_space="bgr", feature_space="hsv")`
+### `FeatureComputer(shape, grid, stride=None, channels=None, channel_axis=-1, threads=1, input_space="bgr", feature_space="hsv", thumb=None)`
 
 | arg | meaning |
 |---|---|
@@ -73,11 +78,15 @@ front; in steady state a frame allocates nothing.
 | `threads` | bands of cell rows processed in parallel. Default `1`. Output is bit-identical at any count; `.threads` reports what was used, `imfeat.cpu_count()` what is available |
 | `input_space` | colour space of the images passed in: `"bgr"` (OpenCV's order, the default) or `"hsv"` |
 | `feature_space` | colour space the features are computed in, `"hsv"` by default: a BGR frame gets HSV features with no `cvtColor` pass, the conversion running inside the extraction (per band, as each row is read) and giving exactly `cv2.cvtColor(img, cv2.COLOR_BGR2HSV)`'s bytes (checked on all 2^24 colours). `None`, or the input's own space, takes the channels as they are. Only 3-channel images are colour: 2-D and single-channel input is taken as it is, any other channel count needs `feature_space=None`. `.converts` says whether a conversion is on; `imfeat.convert(img)` is the conversion on its own |
+| `thumb` | `(rows, cols)`, or one int for a square: every image is resized to this first, inside the pass, exactly as `cv2.resize(img, (cols, rows), interpolation=cv2.INTER_AREA)` would (checked byte for byte on frames of many sizes). `shape` is then the frame's, the grid divides the thumbnail, and `.thumb` reports the size. Downscaling only, up to 4 channels: an upscale is bilinear in OpenCV, not `INTER_AREA`, and is refused. `imfeat.resize_area(img, size)` is the resize on its own |
 
-### `.features(img) -> Pyramid`
+### `.features(img, thumb_out=None) -> Pyramid`
 
 A namedtuple. Lists have one entry per grid level, finest first, then a 1-cell `global` level
 (whose shapes drop `(cy, cx)`). `C` = selected channels, `F = len(imfeat.FEATURE_NAMES) = 54`.
+With `thumb`, `thumb_out` (a `(rows, cols, C)` uint8 array, C-contiguous; `(rows, cols)` for
+2-D input) receives the thumbnail the pass made, for reuse downstream; without it nothing is
+written out.
 
 | field | shape per level | dtype | contents |
 |---|---|---|---|
@@ -106,7 +115,7 @@ The returned arrays are views of one pooled block that they keep alive: they sta
 writable) across later calls and after the computer is gone, and the block is reused once the
 last of them is dropped.
 
-### `.compute(img) -> dict`
+### `.compute(img, thumb_out=None) -> dict`
 
 The raw **int64 sums** before any nonlinear step, keyed `{group}_{level}`: `struct_i`
 `[Sxx, Syy, Sxy, count]`, `mom_i` `[S1..S4]`, `hog_i`, `cnt_i`, `lbp_i`, and `xchan_i`
@@ -119,6 +128,16 @@ ps   = raw["mom_0"][8:16, 4:12].sum(axis=(0, 1))            # (C, 4) power sums 
 n    = raw["struct_0"][8:16, 4:12, :, 3].sum(axis=(0, 1))   # (C,)   its sample count
 mean = ps[:, 0] / n
 ```
+
+### `imfeat.resize_area(img, size, threads=1)` and `imfeat.convert(img, input_space="bgr", feature_space="hsv")`
+
+The two operations the pass fuses, on their own. `resize_area` returns `img` (an `(H, W)` or
+`(H, W, C)` uint8 image, up to 4 channels, any strides) resized to `size` = `(rows, cols)` or
+one int, with `cv2.resize(img, (cols, rows), interpolation=cv2.INTER_AREA)`'s bytes exactly:
+OpenCV's float32 taps for a general ratio, its block sums for whole-number ratios, a copy for
+the same size; an upscale is refused (bilinear in OpenCV). `threads` splits the rows over
+that many threads for the call. `convert` is the BGR → HSV conversion, `cv2.cvtColor`'s
+bytes.
 
 ---
 
@@ -245,19 +264,29 @@ Threads (`features()` min, Xeon / laptop):
   are meant to be shared), so below that the wake-up plus the serial tail (summary, coarse
   levels, hashes) rivals the work saved, and whether two threads beat one is up to the
   machine: at 256² they do on the laptop above and do not on the Xeon. Measure first.
+* **Hand the pass the frame, not a thumbnail.** `thumb=` resizes inside the pass, per band,
+  with the same bytes as `cv2.resize(INTER_AREA)` and none of its cost: on the development VM
+  a 1080p frame to a 1024 px thumbnail costs 3.9 ms inside the pass on one thread and 2.1 on
+  two, against `cv2.resize`'s 13.5 ms on one thread and 6.6 on its own two, plus a write and
+  a read of the thumbnail (`pytest -s tests/test_bench.py -k resize`). The kernel alone takes
+  0.31× `cv2.resize`'s time per thread.
 
 ---
 
 ## Exactness and testing
 
-The suite has 747 tests:
+The suite has 822 tests:
 
 * **Oracles.** Integer sums are compared *exactly* with numpy / OpenCV implementations, over
   geometries chosen to reach every kernel path (cells narrower and wider than a vector, masked
   sampling meshes, odd strides, rows that overrun a block, tiny images). Floats are compared
   within the oracles' tolerances, hashes with `imagehash`. The fused BGR → HSV conversion is
   compared with `cv2.cvtColor` on all 2^24 colours, through the vector path and the scalar
-  tail, and the pass on a BGR image with the pass on its converted copy, byte for byte.
+  tail, and the pass on a BGR image with the pass on its converted copy, byte for byte. The
+  fused thumbnail resize is compared with `cv2.resize(INTER_AREA)` on frames of twelve sizes,
+  six kinds of content, four channel counts, any layout and 1 to 3 threads, and the pass on a
+  frame with the pass on cv2's thumbnail, byte for byte, at every stride, thread count and
+  channel selection.
 * **Invariants.** Multi-channel equals per-channel; a pyramid equals separate single-level
   computers bit for bit; output is bit-identical across 1, 2, 3, 4 and 8 threads; results
   survive later calls and outlive their computer.

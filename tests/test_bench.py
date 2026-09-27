@@ -303,3 +303,86 @@ def test_colour_conversion(threads):
         f"  conversion inside the pass: {inside['min']:.3f} ms (min) {inside['p50']:.3f} (p50);"
         f" fused saves {saved['min']:.3f} ms (min) {saved['p50']:.3f} (p50) over cvtColor + pass"
     )
+
+
+def test_resize_kernel():
+    """The thumbnail resize on its own against cv2.resize(INTER_AREA): the same bytes
+    (asserted; test_resize.py has the full check), then the time of the two on one thread,
+    of imfeat's on two, and of cv2's as a host would call it, on OpenCV's own thread pool."""
+    cv2 = pytest.importorskip("cv2")
+    src, n = (1080, 1920), 1024
+    bgr = frame((*src, 3))
+    small = cv2.resize(bgr, (n, n), interpolation=cv2.INTER_AREA)
+    assert np.array_equal(imfeat.resize_area(bgr, n), small)
+    cv_threads = cv2.getNumThreads()
+    head(
+        f"INTER_AREA resize alone: {src[1]}x{src[0]}x3 -> {n}x{n}"
+        f" (ms; cv2 default {cv_threads} threads)"
+    )
+    try:
+        cv2.setNumThreads(1)
+        one = interleaved(
+            {
+                "cv2.resize, 1 thread": lambda: cv2.resize(
+                    bgr, (n, n), interpolation=cv2.INTER_AREA
+                ),
+                "imfeat.resize_area, 1 thread": lambda: imfeat.resize_area(bgr, n),
+                "imfeat.resize_area, 2 threads": lambda: imfeat.resize_area(bgr, n, threads=2),
+            }
+        )
+    finally:
+        cv2.setNumThreads(cv_threads)
+    many = interleaved(
+        {
+            f"cv2.resize, {cv_threads} threads": lambda: cv2.resize(
+                bgr, (n, n), interpolation=cv2.INTER_AREA
+            )
+        }
+    )
+    print(f"  {'':30s} {STATS_HEAD}")
+    for name, st in {**one, **many}.items():
+        print(f"  {name:30s} {stats_row(st)}")
+    ratio = one["imfeat.resize_area, 1 thread"]["min"] / one["cv2.resize, 1 thread"]["min"]
+    print(f"  per thread, imfeat's resize takes {ratio:.2f}x cv2's time")
+
+
+@pytest.mark.parametrize("threads", [1, 2, 4])
+def test_resize_in_pass(threads):
+    """A 1080p BGR frame to HSV features on a 1024 px thumbnail: the resize fused into the
+    pass, against cv2.resize (on OpenCV's own threads, as a host would call it) followed by
+    the pass on its output. Timed round-robin, so the differences mean something: fused minus
+    the pass on the thumbnail is what the resize costs inside the pass."""
+    cv2 = pytest.importorskip("cv2")
+    src, n, k = (1080, 1920), 1024, 6
+    bgr = frame((*src, 3))
+    small = cv2.resize(bgr, (n, n), interpolation=cv2.INTER_AREA)
+    on_thumb = imfeat.FeatureComputer(small.shape, grid=pyramid(k), threads=threads)
+    on_frame = imfeat.FeatureComputer(bgr.shape, grid=pyramid(k), threads=threads, thumb=n)
+    out = np.empty((n, n, 3), np.uint8)
+    cv_threads = cv2.getNumThreads()
+    head(
+        f"resize + HSV features: {src[1]}x{src[0]}x3 -> {n}x{n} finest-{1 << k} stride=1,"
+        f" threads={on_frame.threads} (ms; cv2.resize on cv2's {cv_threads} threads)"
+    )
+    rows = interleaved(
+        {
+            "cv2.resize": lambda: cv2.resize(bgr, (n, n), interpolation=cv2.INTER_AREA),
+            "pass on the thumbnail": lambda: on_thumb.features(small),
+            "cv2.resize + pass": lambda: on_thumb.features(
+                cv2.resize(bgr, (n, n), interpolation=cv2.INTER_AREA)
+            ),
+            "fused pass on the frame": lambda: on_frame.features(bgr),
+            "fused + thumb_out": lambda: on_frame.features(bgr, thumb_out=out),
+        }
+    )
+    print(f"  {'':24s} {STATS_HEAD}")
+    for name, st in rows.items():
+        print(f"  {name:24s} {stats_row(st)}")
+    fused, alone = rows["fused pass on the frame"], rows["pass on the thumbnail"]
+    both = rows["cv2.resize + pass"]
+    inside = {c: fused[c] - alone[c] for c in ("min", "p50")}
+    saved = {c: both[c] - fused[c] for c in ("min", "p50")}
+    print(
+        f"  resize inside the pass: {inside['min']:.3f} ms (min) {inside['p50']:.3f} (p50);"
+        f" fused saves {saved['min']:.3f} ms (min) {saved['p50']:.3f} (p50) over cv2.resize + pass"
+    )

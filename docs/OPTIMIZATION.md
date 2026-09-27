@@ -101,6 +101,7 @@ Chronologically. Times are single-thread `features()`; instruction counts are pe
 | 4 | Nine texture features and the projection profiles added | a cost: +20% |
 | 5 | Per-cell stage reworked (details below) | instructions 6.37 M → 5.23 M (−18%); Xeon 0.58 → 0.42 ms (−28%); laptop 0.45 → 0.35 ms (−22%) |
 | 6 | BGR → HSV conversion fused into the row gather (details below) | development VM (AVX-512), 1024×1024×3 stride 1, one thread: `cvtColor` + pass 11.45 → 10.27 ms; the conversion costs 0.6 ms inside the pass, against `cvtColor`'s 1.4 ms plus a write and a read of the image. Its kernel went from 0.96 to 0.84 ns per pixel on the AVX-512 build and 1.8 to 1.2 on the AVX2 one between the first and the second version |
+| 7 | The `INTER_AREA` thumbnail resize fused into the pass (details below) | development VM, 1920×1080×3 → 1024×1024, finest-64 stride 1: `cv2.resize` + pass 17.4 → 14.4 ms on one thread and 13.0 → 8.3 ms on two; the resize costs 3.9 ms inside the pass on one thread and 2.1 on two, against `cv2.resize`'s 13.5 ms on one thread and 6.6 on its two, plus a write and a read of the thumbnail. On its own the kernel takes 0.31× `cv2.resize`'s time per thread |
 
 **Step 1, the kernel.** Besides the change of lane, three algebraic rewrites turn every sum
 into a plain vector add:
@@ -171,6 +172,52 @@ options say (the `optimize` attribute does not reach through Highway's target pr
 CMake flags turn that off (`-mno-recip`, `-fno-reciprocal-math`), which is worth a few
 percent; the result would be exact either way, since that estimate is within the fix-up's
 tolerance, and the all-colours test says so on every build.
+
+**Step 7, the thumbnail resize.** The hosts thumbnail every frame with
+`cv2.resize(INTER_AREA)` before the pass, and on a 1080p frame that costs more than the pass
+itself: for any ratio that is not a whole number OpenCV takes its generic path
+(`ResizeArea_Invoker` in `imgproc/src/resize.cpp`), a scalar loop over a per-tap index table
+with float32 weights that resamples each source row once for every destination row it feeds,
+threaded over rows on OpenCV's pool. Its arithmetic is nonetheless fully specified, so it can
+be reproduced bit for bit: per destination column the taps come in table order (the partial
+cell on the left, the whole cells, the partial cell on the right), each product and each
+running sum rounded to float32 with no fused multiply-add (OpenCV compiles the file for its
+SSE3 baseline); rows are scaled by their float32 weights and summed in order; the result is
+rounded half to even and clamped. Whole-number ratios take a block-sum path (half up for 2×2
+on 1, 3 or 4 channels, a float32 product otherwise) and the same size is a copy; an upscale
+is not `INTER_AREA` in OpenCV at all (it turns bilinear) and is refused. A numpy model of the
+generic path was written first and matched `cv2.resize` on every size tried, on the Linux
+wheel and on the Windows one, before any C++.
+
+The kernel (`area_row` and around it in `core.cpp`):
+
+* *A source row is resampled once.* A row feeds at most the destination row it ends and the
+  one it starts, in order, so a two-row cache halves the horizontal work against OpenCV.
+* *The horizontal pass is a fixed shuffle.* The taps of G destination columns lie in one
+  16-byte window of the source row (G = 8 for 1080p's ratio, 4 for 4K's), so a group is one
+  window load and, per tap slot, one byte shuffle, one widen, one convert, one multiply and
+  one add, with the slot's weights in a vector; a column with fewer taps than the slots gets a
+  zero byte at weight 0, which adds +0.0 and changes nothing. Ratios so large that a single
+  column's taps do not fit a window fall back to a scalar loop that sums in the same order.
+* *The vertical pass* is a vector multiply then multiply-adds over the row, and the rounding
+  is one `NearestInt`.
+* *Per band, up front.* Each band makes its rows of the thumbnail (halo included) from the
+  frame before its pass, in its own thread, and the row gather then reads them as planar
+  rows; nothing leaves the band unless the caller asks for the thumbnail (`thumb_out`). Making
+  each row just before the pass needed it, between cell rows, measured 1.5–2 ms slower on the
+  development VM (5.9 against 4.3 ms inside the pass on one thread; 2.7 against 1.2 on two):
+  the resize's working set and the kernel's evicted each other, and the frame's rows were no
+  longer streamed. The thumbnail is 3 MB; a band's share of it stays in its cache.
+
+Two compiler traps, both caught by the exactness tests, which include an odd size
+(1917×1079) that they turn out to be sensitive to. Under `-ffast-math` GCC and clang fuse a
+multiply and an add into one rounding, and clang also regroups a chain of sums: twelve pixels
+of one frame came out one off with contraction on, one pixel with clang's reassociation on.
+GCC honours the per-function `optimize` attributes the kernels carry (`IF_STRICT`), clang
+decides by where the inlined vector ops were written, so clang builds turn contraction and
+reassociation off for the whole file (`-ffp-contract=off -fno-associative-math`), which also
+made its build pass the four thread tests it used to fail; MSVC gets `float_control(precise)`
+and `fp_contract(off)` around the kernels.
 
 ## What did not work
 
@@ -247,11 +294,14 @@ it accumulator loads and stores.
 
 ## Verifying
 
-* The repository's tests, extended from 599 to 747: oracle tests for the bar detector (numpy)
+* The repository's tests, extended from 599 to 822: oracle tests for the bar detector (numpy)
   and for the texture sums (exact), over block geometries chosen to reach every kernel path;
   output lifetime; profiles; threads 1, 2, 3, 4 and 8; the colour conversion against
   `cv2.cvtColor` on every BGR value, through the vector path and the scalar tail, and the
-  fused pass against the pass on the converted image, byte for byte.
+  fused pass against the pass on the converted image, byte for byte; the thumbnail resize
+  against `cv2.resize(INTER_AREA)` on frames of twelve sizes, six kinds of content, four
+  channel counts, any layout and 1 to 3 threads, and the pass on a frame against the pass on
+  cv2's thumbnail, byte for byte, at every stride, thread count and channel selection.
 * A bit-identity harness: 14,328 output arrays (6 shapes × 4 channel counts × 5 grids ×
   6 strides × 2 kinds of image, at 1, 2 and 3 threads) hashed per build and compared with the
   previous build after every change, on AVX2, AVX-512 and SSE4 builds.

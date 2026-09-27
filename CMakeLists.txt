@@ -15,10 +15,15 @@ else()
   # -ffast-math lets GCC and clang replace a vector division by an estimate and a Newton
   # step. The colour conversion divides once per pixel and wants the real thing (see
   # hsv_recip in core.cpp); its result is exact either way, the division is just cheaper.
+  # It also lets them fuse a multiply and an add into one rounding, and regroup a chain of
+  # sums. The thumbnail resize can have neither (it reproduces cv2.resize, which has
+  # none): GCC honours the per-function attributes the resize kernels carry, clang decides
+  # by where the inlined vector ops were written and does not, so clang builds turn both
+  # off throughout (the tests compare every build against cv2, and would say).
   if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|i.86")
     add_compile_options(-mno-recip)
   elseif(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-    add_compile_options(-fno-reciprocal-math)
+    add_compile_options(-fno-reciprocal-math -ffp-contract=off -fno-associative-math)
   endif()
 endif()
 
