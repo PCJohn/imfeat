@@ -9,6 +9,7 @@ conversion's own cost is ``test_colour_conversion``.
 from __future__ import annotations
 
 import platform
+import time
 
 import numpy as np
 import pytest
@@ -215,23 +216,90 @@ def test_latency(n, k, c, stride):
     assert st["p50"] < 6.0 * (n / 256) ** 2
 
 
+def interleaved(fns, reps=100, warm=10):
+    """Per-call ms stats for several callables, timed round-robin so that a change of clock
+    or load during the run hits all of them alike: rows of one table can be compared."""
+    for fn in fns.values():
+        for _ in range(warm):
+            fn()
+    t = {name: np.empty(reps) for name in fns}
+    for i in range(reps):
+        for name, fn in fns.items():
+            t0 = time.perf_counter()
+            fn()
+            t[name][i] = time.perf_counter() - t0
+    out = {}
+    for name, v in t.items():
+        v *= 1e3
+        p50, p90, p99 = np.percentile(v, [50, 90, 99])
+        out[name] = {
+            "min": v.min(), "mean": v.mean(), "std": v.std(), "p50": p50, "p90": p90, "p99": p99
+        }
+    return out
+
+
+def test_colour_conversion_kernel():
+    """The conversion on its own against cv2.cvtColor: the same bytes (asserted), and the time
+    per pixel of the two kernels on one thread each, then cvtColor as a host would call it,
+    on OpenCV's own thread pool."""
+    cv2 = pytest.importorskip("cv2")
+    n = 1024
+    bgr = frame((n, n, 3))
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    assert np.array_equal(imfeat.convert(bgr), hsv)  # bit-exact on this build (test_color.py
+    cv_threads = cv2.getNumThreads()  # has the full check, over every colour)
+    head(f"BGR -> HSV alone: {n}x{n}x3 to a new image (ms; cv2 default {cv_threads} threads)")
+    try:
+        cv2.setNumThreads(1)
+        one = interleaved(
+            {
+                "cv2.cvtColor, 1 thread": lambda: cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV),
+                "imfeat.convert, 1 thread": lambda: imfeat.convert(bgr),
+            }
+        )
+    finally:
+        cv2.setNumThreads(cv_threads)
+    many = interleaved(
+        {f"cv2.cvtColor, {cv_threads} threads": lambda: cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)}
+    )
+    print(f"  {'':28s} {STATS_HEAD}   ns/px (min)")
+    for name, st in {**one, **many}.items():
+        print(f"  {name:28s} {stats_row(st)}   {1e6 * st['min'] / (n * n):6.3f}")
+    ratio = one["imfeat.convert, 1 thread"]["min"] / one["cv2.cvtColor, 1 thread"]["min"]
+    print(f"  per thread, imfeat's kernel takes {ratio:.2f}x cv2's time")
+
+
 @pytest.mark.parametrize("threads", [1, 2, 4])
 def test_colour_conversion(threads):
-    """A BGR frame to HSV features: the conversion fused into the pass against OpenCV's
-    cvtColor followed by the pass on its output (the two give the same bytes)."""
+    """A BGR frame to HSV features: the conversion fused into the pass, against cvtColor (on
+    OpenCV's own threads, as a host would call it) followed by the pass on its output. The
+    rows are timed round-robin, so their differences mean something: fused minus the pass on
+    HSV is what the conversion costs inside the pass."""
     cv2 = pytest.importorskip("cv2")
     n, k = 1024, 6
     bgr = frame((n, n, 3))
     hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
     fused = imfeat.FeatureComputer(bgr.shape, grid=pyramid(k), threads=threads)
     asis = imfeat.FeatureComputer(bgr.shape, grid=pyramid(k), threads=threads, feature_space=None)
-    head(f"BGR -> HSV features: {n}x{n}x3 finest-{1 << k} stride=1, threads={fused.threads} (ms)")
-    rows = [
-        ("cv2.cvtColor", lambda: cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)),
-        ("pass on HSV", lambda: asis.features(hsv)),
-        ("cvtColor + pass", lambda: asis.features(cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV))),
-        ("fused pass on BGR", lambda: fused.features(bgr)),
-    ]
+    cv_threads = cv2.getNumThreads()
+    head(
+        f"BGR -> HSV features: {n}x{n}x3 finest-{1 << k} stride=1, threads={fused.threads}"
+        f" (ms; cvtColor on cv2's {cv_threads} threads)"
+    )
+    rows = interleaved(
+        {
+            "cv2.cvtColor": lambda: cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV),
+            "pass on HSV": lambda: asis.features(hsv),
+            "cvtColor + pass": lambda: asis.features(cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)),
+            "fused pass on BGR": lambda: fused.features(bgr),
+        }
+    )
     print(f"  {'':18s} {STATS_HEAD}")
-    for name, fn in rows:
-        print(f"  {name:18s} {stats_row(latency(fn, reps=100, warm=10))}")
+    for name, st in rows.items():
+        print(f"  {name:18s} {stats_row(st)}")
+    inside = {c: rows["fused pass on BGR"][c] - rows["pass on HSV"][c] for c in ("min", "p50")}
+    saved = {c: rows["cvtColor + pass"][c] - rows["fused pass on BGR"][c] for c in ("min", "p50")}
+    print(
+        f"  conversion inside the pass: {inside['min']:.3f} ms (min) {inside['p50']:.3f} (p50);"
+        f" fused saves {saved['min']:.3f} ms (min) {saved['p50']:.3f} (p50) over cvtColor + pass"
+    )
