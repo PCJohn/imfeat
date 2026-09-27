@@ -78,7 +78,7 @@ front; in steady state a frame allocates nothing.
 | `threads` | bands of cell rows processed in parallel. Default `1`. Output is bit-identical at any count; `.threads` reports what was used, `imfeat.cpu_count()` what is available |
 | `input_space` | colour space of the images passed in: `"bgr"` (OpenCV's order, the default) or `"hsv"` |
 | `feature_space` | colour space the features are computed in, `"hsv"` by default: a BGR frame gets HSV features with no `cvtColor` pass, the conversion running inside the extraction (per band, as each row is read) and giving exactly `cv2.cvtColor(img, cv2.COLOR_BGR2HSV)`'s bytes (checked on all 2^24 colours). `None`, or the input's own space, takes the channels as they are. Only 3-channel images are colour: 2-D and single-channel input is taken as it is, any other channel count needs `feature_space=None`. `.converts` says whether a conversion is on; `imfeat.convert(img)` is the conversion on its own |
-| `thumb` | `(rows, cols)`, or one int for a square: every image is resized to this first, inside the pass, exactly as `cv2.resize(img, (cols, rows), interpolation=cv2.INTER_AREA)` would (checked byte for byte on frames of many sizes). `shape` is then the frame's, the grid divides the thumbnail, and `.thumb` reports the size. Downscaling only, up to 4 channels: an upscale is bilinear in OpenCV, not `INTER_AREA`, and is refused. Or a **policy name**, and the size follows `shape`: `"pow2"` is the largest power of two not above the shorter side, square (720p → 512, 1080p and 1440p → 1024, 4K → 2048), so it never upscales and a power-of-two grid always divides it; `.thumb` is the size it settled on, `.thumb_policy` the name, `imfeat.thumb_size(shape, "pow2")` the same sum on its own. `imfeat.resize_area(img, size)` is the resize on its own |
+| `thumb` | `(rows, cols)`, or one int for a square: every image is resized to this first, inside the pass, exactly as `cv2.resize(img, (cols, rows), interpolation=cv2.INTER_AREA)` would (checked byte for byte on frames of many sizes). `shape` is then the frame's, the grid divides the thumbnail, and `.thumb` reports the size. Downscaling only, up to 4 channels: an upscale is bilinear in OpenCV, not `INTER_AREA`, and is refused. Or a **policy name**, and the size follows `shape`: `"pow2"` is the largest power of two not above the shorter side, square (720p → 512, 1080p and 1440p → 1024, 4K → 2048); `"pow2-cover"` keeps the frame's shape with that shorter side (720p → 512×896, 1080p → 1024×1792); `"pow2-fit"` keeps it with the longer side as the power of two (720p and 1080p → 1024×576, 4K → 2048×1152). None upscales, and a grid of up to 64 cells divides them all (`THUMB_POLICIES` has the rules); the pass is fastest at a power-of-two *width*, which the square and, on a landscape frame, `"pow2-fit"` have. A thumbnail the frame's own size is the frame: nothing is resized. `.thumb` is the size settled on, `.thumb_policy` the name, `imfeat.thumb_size(shape, "pow2-fit")` the same sum on its own. `imfeat.resize_area(img, size)` is the resize on its own |
 
 ### `.features(img, thumb_out=None) -> Pyramid`
 
@@ -142,9 +142,10 @@ splits the rows over that many threads for the call. `convert` is the BGR → HS
 ### `imfeat.thumb_size(shape, thumb, channel_axis=-1) -> (rows, cols) | None`
 
 What `thumb` means for a frame of `shape`, i.e. what `FeatureComputer(shape, ..., thumb=thumb).thumb`
-will be: a pair or int as given, a policy name (`imfeat.THUMB_POLICIES`, so far `"pow2"`) as
-its rule applied to the frame's `(H, W)`, `None` as `None`. Integer arithmetic on the shape,
-nothing is read. A computer is built for one frame shape, so a host that serves several keeps
+will be: a pair or int as given, a policy name (`imfeat.THUMB_POLICIES`: `"pow2"`,
+`"pow2-cover"`, `"pow2-fit"`) as its rule applied to the frame's `(H, W)`, `None` as `None`.
+Integer arithmetic on the shape, nothing is read; the side an aspect policy scales is rounded
+to a multiple of `imfeat.THUMB_QUANTUM` (64), never above the frame's side. A computer is built for one frame shape, so a host that serves several keeps
 one per shape; with a policy the thumbnail size follows the shape as well, and this is how the
 host picks the computer, or sizes the buffer it hands to `thumb_out`, before building one.
 
@@ -289,12 +290,21 @@ Threads (`features()` min, Xeon / laptop):
   takes 2.4× as long as at 1024 (39.8 against 16.3 ms on one thread, 19.9 against 8.4 on
   two), so a host that wants a ceiling takes `min(imfeat.thumb_size(shape, "pow2")[0], 1024)`
   and passes that number (`pytest -s tests/test_bench.py -k policy`).
+* **Keep the frame's shape with the width a power of two.** The two aspect policies differ
+  in cost far more than in pixels, because the pass wants cells a power of two wide (they
+  tile the vector blocks, with the sampling stride folded into column phases; any other width
+  walks one masked block per cell, and at a stride most of its lanes idle). On a landscape
+  frame `"pow2-fit"` keeps the width a power of two and `"pow2-cover"` does not: on the
+  development VM, two threads, a 1080p frame at stride 4 costs 3.7 ms as the 1024 px square,
+  2.5 ms as `"pow2-fit"`'s 1024×576 and 9.4 ms as `"pow2-cover"`'s 1792×1024 (stride 1: 9.2,
+  6.1 and 15.2); a 720p frame at stride 2, 2.9 ms as the 512 px square, 3.1 as 1024×576 and
+  6.5 as 896×512. On a portrait frame the two swap roles.
 
 ---
 
 ## Exactness and testing
 
-The suite has 838 tests:
+The suite has 853 tests:
 
 * **Oracles.** Integer sums are compared *exactly* with numpy / OpenCV implementations, over
   geometries chosen to reach every kernel path (cells narrower and wider than a vector, masked
@@ -305,7 +315,8 @@ The suite has 838 tests:
   fused thumbnail resize is compared with `cv2.resize(INTER_AREA)` on frames of twelve sizes,
   six kinds of content, four channel counts, any layout and 1 to 3 threads, and the pass on a
   frame with the pass on cv2's thumbnail, byte for byte, at every stride, thread count and
-  channel selection, and with the size chosen by policy as with the size given.
+  channel selection, and with the size chosen by each policy as with the size given, a
+  thumbnail the frame's own size included.
 * **Invariants.** Multi-channel equals per-channel; a pyramid equals separate single-level
   computers bit for bit; output is bit-identical across 1, 2, 3, 4 and 8 threads; results
   survive later calls and outlive their computer.

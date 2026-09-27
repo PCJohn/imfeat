@@ -390,52 +390,54 @@ def test_resize_in_pass(threads):
 
 @pytest.mark.parametrize("threads", [1, 2, 4])
 def test_resize_policy(threads):
-    """``thumb="pow2"`` against a fixed 1024 px thumbnail, frame by frame: HSV features on a
-    720p, a 1080p and a 4K frame at the size the policy picks for it (512, 1024, 2048), fused,
-    against the fixed size on the same frame -- fused too where it downscales, and on the 720p
-    frame cv2's bilinear upscale (an upscale is not INTER_AREA) followed by the pass, as a host
-    does today. Timed round-robin per frame. The policy itself costs nothing per frame: the
-    size is settled when the computer is built, so each pair differs only in the size the pass
-    runs at. 'build' is that one-off construction, what a host pays when the frame shape
-    changes (it keeps one computer per shape)."""
+    """The thumbnail policies against a fixed 1024 px thumbnail, frame by frame: HSV features
+    on a 720p, a 1080p and a 4K frame at the size each policy picks for it, fused, against the
+    fixed size on the same frame -- fused too where it downscales, and on the 720p frame cv2's
+    bilinear upscale (an upscale is not INTER_AREA) followed by the pass, as a host does today.
+    Timed round-robin per frame. A policy costs nothing per frame: the size is settled when
+    the computer is built, so the rows differ only in the size the pass runs at ("pow2-cover"
+    keeps the frame's shape at the "pow2" height, so it has more pixels; "pow2-fit" keeps it at
+    the "pow2" width, so fewer) -- and in its cell width: a power of two (the square, and
+    "pow2-fit" on these landscape frames) tiles the vector blocks, anything else ("pow2-cover"
+    here) walks a masked block per cell and costs more per pixel. 'build' is the one-off
+    construction, what a host pays when the frame shape changes (it keeps one computer per
+    shape); 'Mpx' the thumbnail's pixels."""
     cv2 = pytest.importorskip("cv2")
     fixed, k = 1024, 6
     cv_threads = cv2.getNumThreads()
     head(
-        f'thumb="pow2" vs a fixed {fixed} px thumbnail: HSV features, finest-{1 << k} stride=1,'
-        f" threads={threads} (ms; cv2.resize on cv2's {cv_threads} threads)"
+        f"thumbnail policies vs a fixed {fixed} px thumbnail: HSV features, finest-{1 << k}"
+        f" stride=1, threads={threads} (ms; cv2.resize on cv2's {cv_threads} threads)"
     )
-    print(f"  {'':52s} {STATS_HEAD}   build")
+    print(f"  {'':52s} {STATS_HEAD}   build   Mpx")
     for src in ((720, 1280), (1080, 1920), (2160, 3840)):
         bgr = frame((*src, 3))
-        n = imfeat.thumb_size(bgr.shape, "pow2")[0]
         kw = dict(grid=pyramid(k), threads=threads)
-        build = {
-            "pow2": latency(lambda: imfeat.FeatureComputer(bgr.shape, thumb="pow2", **kw), 5, 1),
-        }
-        pow2 = imfeat.FeatureComputer(bgr.shape, thumb="pow2", **kw)
-        assert pow2.thumb == (n, n) and pow2.thumb_policy == "pow2"
         if min(src) >= fixed:  # the fixed size downscales: fused, as today
-            build["fixed"] = latency(
-                lambda: imfeat.FeatureComputer(bgr.shape, thumb=fixed, **kw), 5, 1
-            )
+            build = [latency(lambda: imfeat.FeatureComputer(bgr.shape, thumb=fixed, **kw), 5, 1)]
             on_frame = imfeat.FeatureComputer(bgr.shape, thumb=fixed, **kw)
-            today = {f"fixed {fixed}: fused pass": lambda: on_frame.features(bgr)}
+            fns = {f"fixed {fixed}: fused pass": lambda: on_frame.features(bgr)}
         else:  # the fixed size upscales: cv2 (bilinear) then the pass on its output
-            build["fixed"] = latency(lambda: imfeat.FeatureComputer((fixed, fixed, 3), **kw), 5, 1)
+            build = [latency(lambda: imfeat.FeatureComputer((fixed, fixed, 3), **kw), 5, 1)]
             on_thumb = imfeat.FeatureComputer((fixed, fixed, 3), **kw)
-            today = {
+            fns = {
                 f"fixed {fixed}: cv2.resize up (bilinear) + pass": lambda: on_thumb.features(
                     cv2.resize(bgr, (fixed, fixed))
                 )
             }
-        same = " (the same size)" if n == fixed else ""
-        rows = interleaved(
-            {**today, f"pow2 -> {n}: fused pass{same}": lambda: pow2.features(bgr)},
-            reps=40,
-            warm=5,
-        )
-        for (name, st), which in zip(rows.items(), ("fixed", "pow2")):
+        pixels = [fixed * fixed]
+        for policy in imfeat.THUMB_POLICIES:
+            build.append(
+                latency(lambda: imfeat.FeatureComputer(bgr.shape, thumb=policy, **kw), 5, 1)
+            )
+            fc = imfeat.FeatureComputer(bgr.shape, thumb=policy, **kw)
+            rows_, cols = fc.thumb
+            assert fc.thumb == imfeat.thumb_size(bgr.shape, policy) and fc.thumb_policy == policy
+            same = " (the same size)" if fc.thumb == (fixed, fixed) else ""
+            fns[f"{policy} -> {cols}x{rows_}: fused pass{same}"] = lambda fc=fc: fc.features(bgr)
+            pixels.append(rows_ * cols)
+        rows = interleaved(fns, reps=40, warm=5)
+        for (name, st), b, px in zip(rows.items(), build, pixels):
             label = f"{src[1]}x{src[0]:<5d} {name}"
-            print(f"  {label:52s} {stats_row(st)}   {build[which]['min']:5.1f}")
-        assert pow2.features(bgr).maps[0].shape == (1 << k, 1 << k, 3 * len(imfeat.FEATURE_NAMES))
+            print(f"  {label:52s} {stats_row(st)}   {b['min']:5.1f}  {px / 1e6:5.2f}")
+        assert fc.features(bgr).maps[0].shape == (1 << k, 1 << k, 3 * len(imfeat.FEATURE_NAMES))

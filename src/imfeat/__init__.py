@@ -24,7 +24,8 @@ in HSV, the conversion running inside the pass (``input_space`` / ``feature_spac
 ``thumb`` the image is a frame the pass thumbnails on the way in, exactly as
 ``cv2.resize(..., INTER_AREA)`` would, so a host hands over the frame itself; the size is a
 fixed one or a policy the frame's shape decides (``"pow2"``: the largest power of two that
-fits the shorter side, square, never an upscale).
+fits the shorter side, square; ``"pow2-cover"`` and ``"pow2-fit"`` keep the frame's shape,
+with the shorter or the longer side as that power of two).
 
     import imfeat
 
@@ -66,6 +67,7 @@ __all__ = [
     "MOMENTS",
     "SUMMARY_STATS",
     "THUMB_POLICIES",
+    "THUMB_QUANTUM",
     "FeatureComputer",
     "Pyramid",
     "convert",
@@ -86,10 +88,31 @@ COLOR_SPACES = ("bgr", "hsv")
 
 #: Thumbnail policies `thumb` takes by name, each a rule from the frame's (H, W) to the
 #: thumbnail's (rows, cols), so the size follows the frame rather than being fixed up front.
-#: "pow2": square, the largest power of two not above the shorter side -- a 720p frame
-#: becomes 512x512, 1080p and 1440p 1024x1024, 4K 2048x2048 -- so it never upscales and the
-#: finest grid, itself a power of two, always divides it. ``thumb_size`` resolves a policy.
-THUMB_POLICIES = ("pow2",)
+#: None upscales, and a power-of-two grid of up to 64 cells per axis divides every size they
+#: make (of a frame at least 64 px short). ``thumb_size`` resolves a policy.
+#:
+#: "pow2": square, the largest power of two not above the shorter side: a 720p frame becomes
+#: 512x512, 1080p and 1440p 1024x1024, 4K 2048x2048. The aspect ratio goes.
+#: "pow2-cover": the shorter side as "pow2", the longer side scaled by the same factor and
+#: rounded to a multiple of 64 (THUMB_QUANTUM), so the picture keeps its shape and covers the
+#: "pow2" square: 720p 512x896, 1080p 1024x1792, 4K 2048x3648. Up to the aspect ratio times
+#: the square's pixels.
+#: "pow2-fit": the mirror image, the longer side to its largest power of two and the shorter
+#: side scaled and rounded, so the picture keeps its shape and fits inside the square "pow2"
+#: would make of the longer side: 720p 576x1024, 1080p 576x1024, 4K 1152x2048. Fewer pixels
+#: than that square, at less resolution than "pow2" gives the shorter side.
+#:
+#: The pass is fastest when the thumbnail's WIDTH is a power of two: its cells are then a
+#: power of two wide and tile the vector blocks, sampling stride folded in. Any other cell
+#: width is walked one masked block per cell, and a stride leaves most of the block's lanes
+#: idle (a 28 px cell at stride 4 uses 7 lanes of 32). On a landscape frame "pow2" and
+#: "pow2-fit" have such a width and "pow2-cover" does not, so "pow2-cover" costs 2-3x what
+#: its pixel count says; on a portrait frame the two aspect policies swap roles.
+THUMB_POLICIES = ("pow2", "pow2-cover", "pow2-fit")
+#: The side a policy scales to the aspect ratio is rounded to a multiple of this (never above
+#: the frame's side, never below it), so grids of up to this many cells divide it. Also the
+#: unit of the aspect error those policies make: under 1.6 % at 720p, 1080p and 4K.
+THUMB_QUANTUM = 64
 
 # Raw central moments of the pixel values ("mom_i" / "mom_global"), float64.
 MOMENTS = ("mean", "var", "m3", "m4")
@@ -240,16 +263,42 @@ def _spatial(shape: Sequence[int], channel_axis: int) -> tuple[int, int, int, in
     return dims[spatial[0]], dims[spatial[1]], dims[cax], cax
 
 
+def _scaled_side(policy: str, side: int, n: int, ref: int, q: int) -> int:
+    """``side * n / ref`` (the side scaled as the other one was, to ``n`` from ``ref``) rounded
+    to the nearest multiple of ``q``, kept at or below ``side``: a policy never upscales."""
+    x = (2 * side * n + ref * q) // (2 * ref * q) * q  # round half up, in integers
+    x = min(x, side // q * q)
+    if x < q:
+        raise ValueError(
+            f"thumb policy {policy!r} cannot keep {q} px on the {side} px side of this frame"
+        )
+    return x
+
+
+def _policy_size(policy: str, h: int, w: int) -> tuple[int, int]:
+    """(rows, cols) the policy makes of an (h, w) frame; see THUMB_POLICIES."""
+    short, long = min(h, w), max(h, w)
+    if policy == "pow2":
+        n = 1 << (short.bit_length() - 1)  # the largest power of two <= the shorter side
+        return n, n
+    if policy == "pow2-cover":
+        n = 1 << (short.bit_length() - 1)
+        sides = n, _scaled_side(policy, long, n, short, min(THUMB_QUANTUM, n))
+    elif policy == "pow2-fit":
+        n = 1 << (long.bit_length() - 1)  # the largest power of two <= the longer side
+        sides = _scaled_side(policy, short, n, long, min(THUMB_QUANTUM, n)), n
+    else:
+        raise ValueError(f"unknown thumb policy {policy!r}; known: {', '.join(THUMB_POLICIES)}")
+    return sides if h <= w else sides[::-1]  # (short, long) in the frame's orientation
+
+
 def _resolve_thumb(thumb: ThumbSpec | None, h: int, w: int) -> tuple[int, int] | None:
     """-> (rows, cols), or None: a pair as given, one int as a square, a policy name as its
     rule applied to the frame's (h, w)."""
     if thumb is None:
         return None
     if isinstance(thumb, str):
-        if thumb == "pow2":
-            n = 1 << (min(h, w).bit_length() - 1)  # the largest power of two <= the shorter side
-            return n, n
-        raise ValueError(f"unknown thumb policy {thumb!r}; known: {', '.join(THUMB_POLICIES)}")
+        return _policy_size(thumb, h, w)
     if isinstance(thumb, (int, np.integer)):
         rows = cols = int(thumb)
     else:
@@ -333,11 +382,17 @@ class FeatureComputer:
                    grid divides the thumbnail, and ``features(frame, thumb_out=buf)``
                    also writes the thumbnail for reuse. Or a policy name, and the size
                    follows ``shape``: ``"pow2"`` is the largest power of two not above the
-                   shorter side, square (a 720p frame: 512, 1080p: 1024, 4K: 2048), so it
-                   never upscales and a power-of-two grid always divides it. It is settled
-                   here, once, from ``shape`` (``thumb_size`` does the same sum on its
-                   own); ``.thumb`` is the size in use and ``.thumb_policy`` the name.
-                   See ``resize_area``.
+                   shorter side, square (a 720p frame: 512, 1080p: 1024, 4K: 2048);
+                   ``"pow2-cover"`` keeps the frame's shape, that same shorter side with
+                   the longer one scaled to match (720p: 512x896, 1080p: 1024x1792);
+                   ``"pow2-fit"`` keeps it too, with the longer side as the power of two
+                   (720p and 1080p: 576x1024). None upscales, and a power-of-two grid of up
+                   to 64 cells divides them all (``THUMB_POLICIES`` has the rules, and which
+                   of them the pass is fast at: those with a power-of-two width). It is
+                   settled here, once, from ``shape`` (``thumb_size`` does the same sum on
+                   its own); ``.thumb`` is the size in use and ``.thumb_policy`` the name.
+                   A thumbnail the frame's own size (a policy can land there) is the frame:
+                   nothing is resized, and ``thumb_out`` gets a copy. See ``resize_area``.
     input_space  : the colour space of the images passed in: "bgr" (OpenCV's order,
                    the default) or "hsv". See ``COLOR_SPACES``.
     feature_space: the colour space the features are computed in, "hsv" by default:
@@ -380,6 +435,9 @@ class FeatureComputer:
         self.thumb: tuple[int, int] | None = _resolve_thumb(thumb, h, w)
         #: the policy ``thumb`` named, if it named one (see ``THUMB_POLICIES``), else None.
         self.thumb_policy: str | None = thumb if isinstance(thumb, str) else None
+        # A thumbnail the frame's own size (a policy can land there) is the frame: the pass
+        # reads the frame as it is, and thumb_out gets a copy from here.
+        self._identity = self.thumb == (h, w)
         self._grid = _parse_grid(grid)
         self._keys = [str(i) for i in range(len(self._grid))] + ["global"]
         self._impl = _core._FeatureComputerImpl()
@@ -390,7 +448,7 @@ class FeatureComputer:
             _parse_stride(stride),
             max(1, int(threads)),
             conversion,
-            [] if self.thumb is None else list(self.thumb),
+            [] if self.thumb is None or self._identity else list(self.thumb),
         )
         #: bands actually used, i.e. threads participating including the caller's.
         self.threads: int = self._impl.threads()
@@ -426,6 +484,17 @@ class FeatureComputer:
             raise ValueError("thumb_out must be a C-contiguous, writeable array")
         return out
 
+    def _inputs(
+        self, img: np.ndarray, thumb_out: np.ndarray | None
+    ) -> tuple[np.ndarray, np.ndarray | None]:
+        """The image view and the thumbnail buffer the core takes: none when the thumbnail
+        is the frame itself, which is copied into the buffer here instead."""
+        view, out = self._view(img), self._thumb_out(thumb_out)
+        if out is not None and self._identity:
+            np.copyto(out, view)
+            out = None
+        return view, out
+
     def _cut(self, a: np.ndarray, widths: Sequence[tuple[str, int]], i: str) -> dict:
         """Slice one wide (..., C, W) array into its feature groups, dropping the
         size-1 channel axis for single-channel (2-D) input.
@@ -460,7 +529,7 @@ class FeatureComputer:
         """
         # Every array arrives in its final layout, sharing ownership of this call's block.
         maps, mom, cross, summary, hashes, rows, cols = self._impl.features(
-            self._view(img), self._thumb_out(thumb_out)
+            *self._inputs(img, thumb_out)
         )
         return Pyramid(
             maps=maps,
@@ -486,7 +555,7 @@ class FeatureComputer:
         :meth:`features`.
         """
         widths = (("struct", _NS_RAW), ("hog", _NH), ("cnt", _NC), ("mom", _NM), ("lbp", _NL))
-        lv, cross = self._impl.raw(self._view(img), self._thumb_out(thumb_out))
+        lv, cross = self._impl.raw(*self._inputs(img, thumb_out))
         out: dict[str, np.ndarray] = {}
         for i, a in zip(self._keys, lv):
             out.update(self._cut(a, widths, i))

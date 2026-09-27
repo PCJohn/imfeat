@@ -235,6 +235,29 @@ goes the other way, 39.8 ms at 2048 against 16.3 at a fixed 1024 on one thread (
 the same read of the frame. The one-off build of a computer measured 0.7-3 ms on the laptop,
 5 ms for the 4K-to-2048 one.
 
+*Keeping the frame's shape.* Two more policies keep the aspect ratio, and differ only in
+which side becomes the power of two: `"pow2-cover"` the shorter side (1080p → 1024×1792, the
+`"pow2"` square covered), `"pow2-fit"` the longer (1080p → 1024×576, fitting inside the
+square). The other side follows at the same scale, rounded to a multiple of 64 and never
+above the frame's own (`THUMB_QUANTUM`; the aspect error is under 1.6 % at 720p, 1080p and 4K,
+and zero for 16:9 and 4:3 frames under `"pow2-fit"`). A policy can land on the frame's own
+size (1024×1920 under `"pow2-cover"`, 768×1024 under `"pow2-fit"`), and then nothing is
+resized: the pass reads the frame and `thumb_out` gets a copy from Python, which spares the
+kernel's copy mode its memcpy of the frame into every band's line buffer (6 MB at 1024×1920:
+one to three milliseconds on one development-VM thread, within noise at two).
+
+The two aspect policies differ in cost far more than in pixels, and the reason is the pass,
+not the resize: its blocks span whole cells only when a cell is a power of two wide (step 4
+above, with the sampling stride folded into column phases); any other width is walked one
+masked block per cell, and a stride then leaves most of the block's lanes idle -- a 28 px cell
+at stride 4 uses 7 lanes of 32. `"pow2"` and, on a landscape frame, `"pow2-fit"` keep the
+width a power of two; `"pow2-cover"` cannot, since the shorter side is the power of two and
+the aspect ratio is not. On the development VM with two threads, a 1080p frame at stride 4
+costs 3.7 ms as the 1024 px square, 2.5 ms as 1024×576 and 9.4 ms as 1792×1024 (at stride 1:
+9.2, 6.1 and 15.2); a 720p frame at stride 2, 2.9 ms as the 512 px square, 3.1 ms as 1024×576
+and 6.5 ms as 896×512. So the aspect-keeping choice that is also faster than a fixed 1024 px
+square is `"pow2-fit"`, on landscape frames; on portrait frames the two swap roles.
+
 ## What did not work
 
 * **Transposing cell sums into slots with SIMD** — slower, twice. The eventual answer was not
@@ -310,7 +333,7 @@ it accumulator loads and stores.
 
 ## Verifying
 
-* The repository's tests, extended from 599 to 838: oracle tests for the bar detector (numpy)
+* The repository's tests, extended from 599 to 853: oracle tests for the bar detector (numpy)
   and for the texture sums (exact), over block geometries chosen to reach every kernel path;
   output lifetime; profiles; threads 1, 2, 3, 4 and 8; the colour conversion against
   `cv2.cvtColor` on every BGR value, through the vector path and the scalar tail, and the
@@ -318,7 +341,8 @@ it accumulator loads and stores.
   against `cv2.resize(INTER_AREA)` on frames of twelve sizes, six kinds of content, four
   channel counts, any layout and 1 to 3 threads, and the pass on a frame against the pass on
   cv2's thumbnail, byte for byte, at every stride, thread count and channel selection, and
-  with the thumbnail size chosen by policy (`"pow2"`) as with the size given.
+  with the thumbnail size chosen by each policy (`"pow2"`, `"pow2-cover"`, `"pow2-fit"`) as
+  with the size given, a thumbnail the frame's own size included.
 * A bit-identity harness: 14,328 output arrays (6 shapes × 4 channel counts × 5 grids ×
   6 strides × 2 kinds of image, at 1, 2 and 3 threads) hashed per build and compared with the
   previous build after every change, on AVX2, AVX-512 and SSE4 builds.
