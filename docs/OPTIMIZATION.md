@@ -219,6 +219,20 @@ reassociation off for the whole file (`-ffp-contract=off -fno-associative-math`)
 made its build pass the four thread tests it used to fail; MSVC gets `float_control(precise)`
 and `fp_contract(off)` around the kernels.
 
+*The size can follow the frame.* A fixed thumbnail upscales any frame smaller than it, and an
+upscale is not `INTER_AREA`, so the hosts fell back to `cv2.resize` (bilinear) for those.
+`thumb="pow2"` instead takes the largest power of two the shorter side holds, square: 720p
+becomes 512 px, 1080p and 1440p 1024, 4K 2048. The rule is a bit length on the shape and runs
+once, when the computer is built (the whole build is under a millisecond here), because every
+plan in the computer -- bands, halos, the resize taps, the scratch, the output block -- is
+sized from that one (frame, thumbnail) pair; a host that serves several frame shapes keeps one
+computer per shape, as before, and `thumb_size(shape, "pow2")` tells it the size without
+building. On the development VM a 720p frame costs 4.7 ms as a fused 512 px pass on one thread
+and 3.4 on two, against 10.7 and 5.7 for the bilinear upscale to 1024 and the pass on it; a
+4K frame goes the other way, 38 ms at 2048 against 18 at a fixed 1024 on one thread (20
+against 10 on two), since the pass is now four times the pixels on top of the same read of
+the frame.
+
 ## What did not work
 
 * **Transposing cell sums into slots with SIMD** — slower, twice. The eventual answer was not
@@ -294,14 +308,15 @@ it accumulator loads and stores.
 
 ## Verifying
 
-* The repository's tests, extended from 599 to 822: oracle tests for the bar detector (numpy)
+* The repository's tests, extended from 599 to 838: oracle tests for the bar detector (numpy)
   and for the texture sums (exact), over block geometries chosen to reach every kernel path;
   output lifetime; profiles; threads 1, 2, 3, 4 and 8; the colour conversion against
   `cv2.cvtColor` on every BGR value, through the vector path and the scalar tail, and the
   fused pass against the pass on the converted image, byte for byte; the thumbnail resize
   against `cv2.resize(INTER_AREA)` on frames of twelve sizes, six kinds of content, four
   channel counts, any layout and 1 to 3 threads, and the pass on a frame against the pass on
-  cv2's thumbnail, byte for byte, at every stride, thread count and channel selection.
+  cv2's thumbnail, byte for byte, at every stride, thread count and channel selection, and
+  with the thumbnail size chosen by policy (`"pow2"`) as with the size given.
 * A bit-identity harness: 14,328 output arrays (6 shapes × 4 channel counts × 5 grids ×
   6 strides × 2 kinds of image, at 1, 2 and 3 threads) hashed per build and compared with the
   previous build after every change, on AVX2, AVX-512 and SSE4 builds.

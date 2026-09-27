@@ -149,6 +149,111 @@ def test_resize_area_arguments():
         imfeat.resize_area(img, (8, 8, 8))
     with pytest.raises(ValueError, match="at least one"):
         imfeat.resize_area(img, (0, 8))
+    with pytest.raises(ValueError, match="unknown thumb policy"):
+        imfeat.resize_area(img, "nearest")
+
+
+# ---------------- a policy in place of the size ------------------------------------------------
+# (H, W) -> the square "pow2" picks: the largest power of two not above the shorter side.
+POW2 = [
+    ((720, 1280), 512),
+    ((1080, 1920), 1024),
+    ((1440, 2560), 1024),
+    ((2160, 3840), 2048),
+    ((1024, 1920), 1024),  # the shorter side is a power of two: rows copied, columns resampled
+    ((1023, 1023), 512),
+    ((600, 800), 512),
+    ((480, 640), 256),
+    ((64, 64), 64),
+    ((3, 5), 2),
+    ((1, 1), 1),
+]
+
+
+def test_thumb_size():
+    """The rule, on the shape alone, in every layout ``FeatureComputer`` takes."""
+    assert imfeat.THUMB_POLICIES == ("pow2",)
+    for (h, w), n in POW2:
+        assert imfeat.thumb_size((h, w), "pow2") == (n, n)
+        assert imfeat.thumb_size((h, w, 3), "pow2") == (n, n)
+        assert imfeat.thumb_size((w, h, 1), "pow2") == (n, n)  # the shorter side either way
+        assert imfeat.thumb_size((3, h, w), "pow2", channel_axis=0) == (n, n)
+        assert imfeat.thumb_size((h, 4, w), "pow2", channel_axis=1) == (n, n)
+    # a fixed size passes through, whatever the frame
+    assert imfeat.thumb_size((720, 1280, 3), 1024) == THUMB
+    assert imfeat.thumb_size((720, 1280, 3), np.int64(1024)) == THUMB
+    assert imfeat.thumb_size((720, 1280, 3), (256, 1024)) == (256, 1024)
+    assert imfeat.thumb_size((720, 1280, 3), None) is None
+    with pytest.raises(ValueError, match="unknown thumb policy 'pow4'; known: pow2"):
+        imfeat.thumb_size((720, 1280, 3), "pow4")
+    with pytest.raises(ValueError, match="at least 2 dims"):
+        imfeat.thumb_size((720,), "pow2")
+    with pytest.raises(ValueError, match="exactly 2 spatial axes"):
+        imfeat.thumb_size((2, 720, 1280, 3), "pow2")
+
+
+@pytest.mark.parametrize(("src", "n"), POW2[:5], ids=[f"{s[1]}x{s[0]}" for s, _ in POW2[:5]])
+def test_resize_area_by_policy(src, n):
+    img = content("structured", (*src, 3))
+    want = cv_resize(img, (n, n))
+    assert np.array_equal(imfeat.resize_area(img, "pow2"), want)
+    gray = content("coarse", src, seed=2)
+    assert np.array_equal(imfeat.resize_area(gray, "pow2", threads=2), cv_resize(gray, (n, n)))
+
+
+@pytest.mark.parametrize(("src", "n"), POW2[:5], ids=[f"{s[1]}x{s[0]}" for s, _ in POW2[:5]])
+def test_pass_resizes_by_policy(src, n):
+    """``thumb="pow2"`` is ``thumb=(n, n)`` for the n the rule picks: the same bytes as the pass
+    on cv2's thumbnail of that size, the thumbnail itself through ``thumb_out``, and the size
+    on ``.thumb`` for the host to read."""
+    frame = content("random", (*src, 3), seed=5)
+    small = cv_resize(frame, (n, n))
+    grid = [(5, 5), (4, 4)]  # 32 divides every n here
+    on_thumb = imfeat.FeatureComputer(shape=small.shape, grid=grid, stride=2, threads=2)
+    by_policy = imfeat.FeatureComputer(
+        shape=frame.shape, grid=grid, stride=2, threads=2, thumb="pow2"
+    )
+    fixed = imfeat.FeatureComputer(shape=frame.shape, grid=grid, stride=2, threads=2, thumb=n)
+    assert by_policy.thumb == (n, n) == fixed.thumb == imfeat.thumb_size(frame.shape, "pow2")
+    assert by_policy.thumb_policy == "pow2" and fixed.thumb_policy is None
+    out = np.empty((*by_policy.thumb, 3), np.uint8)
+    assert_same_outputs(by_policy.features(frame, thumb_out=out), on_thumb.features(small))
+    assert np.array_equal(out, small)
+    assert_same_outputs(by_policy.features(frame), fixed.features(frame))
+
+
+def test_pass_by_policy_other_layouts():
+    gray = content("random", (600, 800), seed=6)  # 2-D: 512
+    small = cv_resize(gray, (512, 512))
+    on_thumb = imfeat.FeatureComputer(shape=small.shape, grid=GRID, threads=2)
+    on_frame = imfeat.FeatureComputer(shape=gray.shape, grid=GRID, threads=2, thumb="pow2")
+    assert on_frame.thumb == (512, 512)
+    out = np.empty((512, 512), np.uint8)
+    assert_same_outputs(on_frame.features(gray, thumb_out=out), on_thumb.features(small))
+    assert np.array_equal(out, small)
+
+    bgr = content("structured", (1080, 1920, 3), seed=7)
+    planar = np.ascontiguousarray(np.moveaxis(bgr, -1, 0))  # (3, H, W): the axes, not the layout
+    small = cv_resize(bgr, THUMB)
+    on_thumb = imfeat.FeatureComputer(shape=small.shape, grid=GRID, threads=2)
+    on_frame = imfeat.FeatureComputer(
+        shape=planar.shape, grid=GRID, threads=2, channel_axis=0, thumb="pow2"
+    )
+    assert on_frame.thumb == THUMB
+    assert_same_outputs(on_frame.features(planar), on_thumb.features(small))
+
+
+def test_policy_arguments():
+    with pytest.raises(ValueError, match="unknown thumb policy"):
+        imfeat.FeatureComputer(shape=(720, 1280, 3), grid=GRID, thumb="POW2")
+    with pytest.raises(ValueError, match="finest grid must divide"):
+        imfeat.FeatureComputer(shape=(40, 50, 3), grid=GRID, thumb="pow2")  # 32 px, 64 cells
+    with pytest.raises(ValueError, match="up to 4 channels"):
+        imfeat.FeatureComputer(shape=(64, 64, 5), grid=[(2, 2)], thumb="pow2", feature_space=None)
+    fc = imfeat.FeatureComputer(shape=(64, 64, 3), grid=GRID, thumb="pow2")  # a power of two
+    assert fc.thumb == (64, 64)  # is its own thumbnail: a copy, not an upscale
+    with pytest.raises(ValueError, match="must have shape"):
+        fc.features(np.zeros((64, 64, 3), np.uint8), thumb_out=np.empty((32, 32, 3), np.uint8))
 
 
 # ---------------- the pass on a frame, against the pass on cv2's thumbnail ---------------------

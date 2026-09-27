@@ -22,7 +22,9 @@ Input is one uint8 image: 2-D ``(H, W)``, or multi-channel in OpenCV order
 is colour: by default it is taken as BGR (OpenCV's order) and the features are computed
 in HSV, the conversion running inside the pass (``input_space`` / ``feature_space``). With
 ``thumb`` the image is a frame the pass thumbnails on the way in, exactly as
-``cv2.resize(..., INTER_AREA)`` would, so a host hands over the frame itself.
+``cv2.resize(..., INTER_AREA)`` would, so a host hands over the frame itself; the size is a
+fixed one or a policy the frame's shape decides (``"pow2"``: the largest power of two that
+fits the shorter side, square, never an upscale).
 
     import imfeat
 
@@ -63,19 +65,31 @@ __all__ = [
     "LBP_FEATURES",
     "MOMENTS",
     "SUMMARY_STATS",
+    "THUMB_POLICIES",
     "FeatureComputer",
     "Pyramid",
     "convert",
     "cpu_count",
     "resize_area",
+    "thumb_size",
 ]
 __version__ = "0.1.0"
 
 # Grid spec accepted by FeatureComputer: k, (ky, kx), or a list of either.
 GridSpec = Union[int, Sequence[int], Sequence[Sequence[int]]]
+# Thumbnail spec accepted by FeatureComputer and resize_area: (rows, cols), one int for a
+# square, or the name of a policy (THUMB_POLICIES) that derives the size from the frame's.
+ThumbSpec = Union[int, Sequence[int], str]
 
 #: Colour spaces of 3-channel images, as `input_space` / `feature_space` name them.
 COLOR_SPACES = ("bgr", "hsv")
+
+#: Thumbnail policies `thumb` takes by name, each a rule from the frame's (H, W) to the
+#: thumbnail's (rows, cols), so the size follows the frame rather than being fixed up front.
+#: "pow2": square, the largest power of two not above the shorter side -- a 720p frame
+#: becomes 512x512, 1080p and 1440p 1024x1024, 4K 2048x2048 -- so it never upscales and the
+#: finest grid, itself a power of two, always divides it. ``thumb_size`` resolves a policy.
+THUMB_POLICIES = ("pow2",)
 
 # Raw central moments of the pixel values ("mom_i" / "mom_global"), float64.
 MOMENTS = ("mean", "var", "m3", "m4")
@@ -211,20 +225,54 @@ def _parse_stride(stride: int | Sequence[int] | None) -> list[int]:
     return [int(stride[0]), int(stride[1])]
 
 
-def _parse_thumb(thumb: int | Sequence[int] | None) -> tuple[int, int] | None:
-    """-> (rows, cols), or None. Accepts one int for a square thumbnail."""
+def _spatial(shape: Sequence[int], channel_axis: int) -> tuple[int, int, int, int | None]:
+    """-> (H, W, C, channel axis) of a frame of `shape`; C = 1 and no axis for 2-D."""
+    dims = tuple(int(s) for s in shape)
+    ndim = len(dims)
+    if ndim < 2:
+        raise ValueError("shape must have at least 2 dims (H, W)")
+    if ndim == 2:
+        return dims[0], dims[1], 1, None
+    cax = channel_axis % ndim
+    spatial = [ax for ax in range(ndim) if ax != cax]
+    if len(spatial) != 2:
+        raise ValueError("multi-channel input must have exactly 2 spatial axes")
+    return dims[spatial[0]], dims[spatial[1]], dims[cax], cax
+
+
+def _resolve_thumb(thumb: ThumbSpec | None, h: int, w: int) -> tuple[int, int] | None:
+    """-> (rows, cols), or None: a pair as given, one int as a square, a policy name as its
+    rule applied to the frame's (h, w)."""
     if thumb is None:
         return None
-    if isinstance(thumb, int):
-        rows = cols = thumb
+    if isinstance(thumb, str):
+        if thumb == "pow2":
+            n = 1 << (min(h, w).bit_length() - 1)  # the largest power of two <= the shorter side
+            return n, n
+        raise ValueError(f"unknown thumb policy {thumb!r}; known: {', '.join(THUMB_POLICIES)}")
+    if isinstance(thumb, (int, np.integer)):
+        rows = cols = int(thumb)
     else:
         t = list(thumb)
         if len(t) != 2:
-            raise ValueError("thumb must be (rows, cols) or one int")
+            raise ValueError("thumb must be (rows, cols), one int, or a policy name")
         rows, cols = int(t[0]), int(t[1])
     if rows < 1 or cols < 1:
         raise ValueError("thumb must have at least one row and one column")
     return rows, cols
+
+
+def thumb_size(
+    shape: Sequence[int], thumb: ThumbSpec | None, channel_axis: int = -1
+) -> tuple[int, int] | None:
+    """The ``(rows, cols)`` that ``thumb`` means for a frame of ``shape``, i.e. what
+    ``FeatureComputer(shape, ..., thumb=thumb).thumb`` will be: a pair as given, one int as a
+    square, a policy name (``THUMB_POLICIES``) as its rule applied to the frame's ``(H, W)``
+    (``channel_axis`` as for ``FeatureComputer``), ``None`` as ``None``. Plain integer
+    arithmetic on the shape, nothing is read: a host that keeps one computer per frame shape
+    can pick the computer, or size the buffer it hands to ``thumb_out``, from this alone."""
+    h, w, _, _ = _spatial(shape, channel_axis)
+    return _resolve_thumb(thumb, h, w)
 
 
 # (input, feature) -> the core's conversion, for the pairs that differ. Each is a row kernel
@@ -283,7 +331,13 @@ class FeatureComputer:
                    (downscaling only, up to 4 channels: an upscale is not INTER_AREA in
                    OpenCV, so resize with cv2 first). ``shape`` is then the frame's, the
                    grid divides the thumbnail, and ``features(frame, thumb_out=buf)``
-                   also writes the thumbnail for reuse. See ``resize_area``.
+                   also writes the thumbnail for reuse. Or a policy name, and the size
+                   follows ``shape``: ``"pow2"`` is the largest power of two not above the
+                   shorter side, square (a 720p frame: 512, 1080p: 1024, 4K: 2048), so it
+                   never upscales and a power-of-two grid always divides it. It is settled
+                   here, once, from ``shape`` (``thumb_size`` does the same sum on its
+                   own); ``.thumb`` is the size in use and ``.thumb_policy`` the name.
+                   See ``resize_area``.
     input_space  : the colour space of the images passed in: "bgr" (OpenCV's order,
                    the default) or "hsv". See ``COLOR_SPACES``.
     feature_space: the colour space the features are computed in, "hsv" by default:
@@ -310,31 +364,22 @@ class FeatureComputer:
         threads: int = 1,
         input_space: str = "bgr",
         feature_space: str | None = "hsv",
-        thumb: int | Sequence[int] | None = None,
+        thumb: ThumbSpec | None = None,
     ) -> None:
-        shape = tuple(int(s) for s in shape)
-        ndim = len(shape)
-        if ndim < 2:
-            raise ValueError("shape must have at least 2 dims (H, W)")
-        self._shape = shape
-        if ndim == 2:
-            self._chan_axis = None  # single channel: no channel axis in output
-            h, w, c = shape[0], shape[1], 1
-        else:
-            cax = channel_axis % ndim
-            spatial = [ax for ax in range(ndim) if ax != cax]
-            if len(spatial) != 2:
-                raise ValueError("multi-channel input must have exactly 2 spatial axes")
-            self._chan_axis = cax
-            h, w, c = shape[spatial[0]], shape[spatial[1]], shape[cax]
+        self._shape = tuple(int(s) for s in shape)
+        # single channel (2-D): no channel axis in the output
+        h, w, c, self._chan_axis = _spatial(self._shape, channel_axis)
         chan = list(range(c)) if channels is None else [int(x) for x in channels]
         if not chan or any(not 0 <= x < c for x in chan):
             raise ValueError(f"channels must be a non-empty subset of range({c})")
         conversion = _conversion(input_space, feature_space, c)
         #: whether the pass converts the input's colour space (False: channels as given).
         self.converts: bool = conversion != _core.CONVERT_NONE
-        #: the ``(rows, cols)`` the pass resizes every image to first, or None.
-        self.thumb: tuple[int, int] | None = _parse_thumb(thumb)
+        #: the ``(rows, cols)`` the pass resizes every image to first, or None. Settled here
+        #: for good: a policy is applied to ``shape`` once, at no cost per image.
+        self.thumb: tuple[int, int] | None = _resolve_thumb(thumb, h, w)
+        #: the policy ``thumb`` named, if it named one (see ``THUMB_POLICIES``), else None.
+        self.thumb_policy: str | None = thumb if isinstance(thumb, str) else None
         self._grid = _parse_grid(grid)
         self._keys = [str(i) for i in range(len(self._grid))] + ["global"]
         self._impl = _core._FeatureComputerImpl()
@@ -370,7 +415,7 @@ class FeatureComputer:
         if out is None:
             return None
         if self.thumb is None:
-            raise ValueError("thumb_out needs a FeatureComputer built with thumb=(rows, cols)")
+            raise ValueError("thumb_out needs a FeatureComputer built with thumb=")
         c = 1 if self._chan_axis is None else self._shape[self._chan_axis]
         want = self.thumb if self._chan_axis is None else (*self.thumb, c)
         if out.shape != want:
@@ -465,9 +510,10 @@ def convert(img: np.ndarray, input_space: str = "bgr", feature_space: str = "hsv
     return np.asarray(_core.convert(img, conversion))
 
 
-def resize_area(img: np.ndarray, size: int | Sequence[int], threads: int = 1) -> np.ndarray:
+def resize_area(img: np.ndarray, size: ThumbSpec, threads: int = 1) -> np.ndarray:
     """``img`` (an ``(H, W)`` or ``(H, W, C)`` uint8 image, up to 4 channels, any strides)
-    resized to ``size`` = ``(rows, cols)`` (or one int for a square): a new array holding
+    resized to ``size`` = ``(rows, cols)`` (or one int for a square, or a policy name such
+    as ``"pow2"``, see ``thumb_size``): a new array holding
     ``cv2.resize(img, (cols, rows), interpolation=cv2.INTER_AREA)``'s bytes exactly, as
     the pass makes its thumbnail (``FeatureComputer(thumb=...)``). Downscaling only: an
     upscale is bilinear in OpenCV, not INTER_AREA, and is refused. ``threads`` splits the
@@ -476,7 +522,10 @@ def resize_area(img: np.ndarray, size: int | Sequence[int], threads: int = 1) ->
         raise TypeError("input must be uint8")
     if img.ndim not in (2, 3):
         raise ValueError(f"expected an (H, W) or (H, W, C) image, got shape {img.shape}")
-    rows, cols = _parse_thumb(size)  # type: ignore[misc]  # never None for a given size
+    resolved = _resolve_thumb(size, img.shape[0], img.shape[1])
+    if resolved is None:
+        raise ValueError("size must be (rows, cols), one int, or a policy name")
+    rows, cols = resolved
     return np.asarray(_core.resize_area(img, rows, cols, max(1, int(threads))))
 
 

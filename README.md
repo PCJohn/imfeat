@@ -78,7 +78,7 @@ front; in steady state a frame allocates nothing.
 | `threads` | bands of cell rows processed in parallel. Default `1`. Output is bit-identical at any count; `.threads` reports what was used, `imfeat.cpu_count()` what is available |
 | `input_space` | colour space of the images passed in: `"bgr"` (OpenCV's order, the default) or `"hsv"` |
 | `feature_space` | colour space the features are computed in, `"hsv"` by default: a BGR frame gets HSV features with no `cvtColor` pass, the conversion running inside the extraction (per band, as each row is read) and giving exactly `cv2.cvtColor(img, cv2.COLOR_BGR2HSV)`'s bytes (checked on all 2^24 colours). `None`, or the input's own space, takes the channels as they are. Only 3-channel images are colour: 2-D and single-channel input is taken as it is, any other channel count needs `feature_space=None`. `.converts` says whether a conversion is on; `imfeat.convert(img)` is the conversion on its own |
-| `thumb` | `(rows, cols)`, or one int for a square: every image is resized to this first, inside the pass, exactly as `cv2.resize(img, (cols, rows), interpolation=cv2.INTER_AREA)` would (checked byte for byte on frames of many sizes). `shape` is then the frame's, the grid divides the thumbnail, and `.thumb` reports the size. Downscaling only, up to 4 channels: an upscale is bilinear in OpenCV, not `INTER_AREA`, and is refused. `imfeat.resize_area(img, size)` is the resize on its own |
+| `thumb` | `(rows, cols)`, or one int for a square: every image is resized to this first, inside the pass, exactly as `cv2.resize(img, (cols, rows), interpolation=cv2.INTER_AREA)` would (checked byte for byte on frames of many sizes). `shape` is then the frame's, the grid divides the thumbnail, and `.thumb` reports the size. Downscaling only, up to 4 channels: an upscale is bilinear in OpenCV, not `INTER_AREA`, and is refused. Or a **policy name**, and the size follows `shape`: `"pow2"` is the largest power of two not above the shorter side, square (720p → 512, 1080p and 1440p → 1024, 4K → 2048), so it never upscales and a power-of-two grid always divides it; `.thumb` is the size it settled on, `.thumb_policy` the name, `imfeat.thumb_size(shape, "pow2")` the same sum on its own. `imfeat.resize_area(img, size)` is the resize on its own |
 
 ### `.features(img, thumb_out=None) -> Pyramid`
 
@@ -132,12 +132,21 @@ mean = ps[:, 0] / n
 ### `imfeat.resize_area(img, size, threads=1)` and `imfeat.convert(img, input_space="bgr", feature_space="hsv")`
 
 The two operations the pass fuses, on their own. `resize_area` returns `img` (an `(H, W)` or
-`(H, W, C)` uint8 image, up to 4 channels, any strides) resized to `size` = `(rows, cols)` or
-one int, with `cv2.resize(img, (cols, rows), interpolation=cv2.INTER_AREA)`'s bytes exactly:
-OpenCV's float32 taps for a general ratio, its block sums for whole-number ratios, a copy for
-the same size; an upscale is refused (bilinear in OpenCV). `threads` splits the rows over
-that many threads for the call. `convert` is the BGR → HSV conversion, `cv2.cvtColor`'s
-bytes.
+`(H, W, C)` uint8 image, up to 4 channels, any strides) resized to `size` = `(rows, cols)`,
+one int, or a policy name, with `cv2.resize(img, (cols, rows), interpolation=cv2.INTER_AREA)`'s
+bytes exactly: OpenCV's float32 taps for a general ratio, its block sums for whole-number
+ratios, a copy for the same size; an upscale is refused (bilinear in OpenCV). `threads`
+splits the rows over that many threads for the call. `convert` is the BGR → HSV conversion,
+`cv2.cvtColor`'s bytes.
+
+### `imfeat.thumb_size(shape, thumb, channel_axis=-1) -> (rows, cols) | None`
+
+What `thumb` means for a frame of `shape`, i.e. what `FeatureComputer(shape, ..., thumb=thumb).thumb`
+will be: a pair or int as given, a policy name (`imfeat.THUMB_POLICIES`, so far `"pow2"`) as
+its rule applied to the frame's `(H, W)`, `None` as `None`. Integer arithmetic on the shape,
+nothing is read. A computer is built for one frame shape, so a host that serves several keeps
+one per shape; with a policy the thumbnail size follows the shape as well, and this is how the
+host picks the computer, or sizes the buffer it hands to `thumb_out`, before building one.
 
 ---
 
@@ -270,12 +279,21 @@ Threads (`features()` min, Xeon / laptop):
   two, against `cv2.resize`'s 13.5 ms on one thread and 6.6 on its own two, plus a write and
   a read of the thumbnail (`pytest -s tests/test_bench.py -k resize`). The kernel alone takes
   0.31× `cv2.resize`'s time per thread.
+* **Let the thumbnail follow the frame.** `thumb="pow2"` picks the largest power of two the
+  shorter side holds, so a frame smaller than a fixed thumbnail is never upscaled to it: on
+  the development VM a 720p frame costs 4.7 ms as a fused 512 px pass on one thread (3.4 ms on
+  two) against 10.7 ms (5.7) for `cv2.resize`'s bilinear upscale to 1024 px and the pass on
+  that; a 1080p frame is 1024 px either way, and the same time. The rule runs once, when the
+  computer is built (under a millisecond, including everything else the build does), never
+  per frame. It cuts both ways: a 4K frame becomes 2048 px and its pass twice as long as at
+  1024, so a host that wants a ceiling takes `min(imfeat.thumb_size(shape, "pow2")[0], 1024)`
+  and passes that number (`pytest -s tests/test_bench.py -k policy`).
 
 ---
 
 ## Exactness and testing
 
-The suite has 822 tests:
+The suite has 838 tests:
 
 * **Oracles.** Integer sums are compared *exactly* with numpy / OpenCV implementations, over
   geometries chosen to reach every kernel path (cells narrower and wider than a vector, masked
@@ -286,7 +304,7 @@ The suite has 822 tests:
   fused thumbnail resize is compared with `cv2.resize(INTER_AREA)` on frames of twelve sizes,
   six kinds of content, four channel counts, any layout and 1 to 3 threads, and the pass on a
   frame with the pass on cv2's thumbnail, byte for byte, at every stride, thread count and
-  channel selection.
+  channel selection, and with the size chosen by policy as with the size given.
 * **Invariants.** Multi-channel equals per-channel; a pyramid equals separate single-level
   computers bit for bit; output is bit-identical across 1, 2, 3, 4 and 8 threads; results
   survive later calls and outlive their computer.
