@@ -223,15 +223,17 @@ and `fp_contract(off)` around the kernels.
 upscale is not `INTER_AREA`, so the hosts fell back to `cv2.resize` (bilinear) for those.
 `thumb="pow2"` instead takes the largest power of two the shorter side holds, square: 720p
 becomes 512 px, 1080p and 1440p 1024, 4K 2048. The rule is a bit length on the shape and runs
-once, when the computer is built (the whole build is under a millisecond here), because every
+once, when the computer is built (the whole build is a millisecond or two), because every
 plan in the computer -- bands, halos, the resize taps, the scratch, the output block -- is
 sized from that one (frame, thumbnail) pair; a host that serves several frame shapes keeps one
 computer per shape, as before, and `thumb_size(shape, "pow2")` tells it the size without
-building. On the development VM a 720p frame costs 4.7 ms as a fused 512 px pass on one thread
-and 3.4 on two, against 10.7 and 5.7 for the bilinear upscale to 1024 and the pass on it; a
-4K frame goes the other way, 38 ms at 2048 against 18 at a fixed 1024 on one thread (20
-against 10 on two), since the pass is now four times the pixels on top of the same read of
-the frame.
+building. On the laptop a 720p frame costs 4.0 ms as a fused 512 px pass on one thread, 2.2 on
+two and 2.1 on four, against 9.6, 5.3 and 4.3 for the bilinear upscale to 1024 and the pass on
+it (the development VM: 4.7 and 3.4 against 10.7 and 5.7 on one and two threads); a 4K frame
+goes the other way, 39.8 ms at 2048 against 16.3 at a fixed 1024 on one thread (19.9 against
+8.4 on two, 11.5 against 4.9 on four), since the pass is now four times the pixels on top of
+the same read of the frame. The one-off build of a computer measured 0.7-3 ms on the laptop,
+5 ms for the 4K-to-2048 one.
 
 ## What did not work
 

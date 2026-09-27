@@ -281,12 +281,13 @@ Threads (`features()` min, Xeon / laptop):
   0.31× `cv2.resize`'s time per thread.
 * **Let the thumbnail follow the frame.** `thumb="pow2"` picks the largest power of two the
   shorter side holds, so a frame smaller than a fixed thumbnail is never upscaled to it: on
-  the development VM a 720p frame costs 4.7 ms as a fused 512 px pass on one thread (3.4 ms on
-  two) against 10.7 ms (5.7) for `cv2.resize`'s bilinear upscale to 1024 px and the pass on
-  that; a 1080p frame is 1024 px either way, and the same time. The rule runs once, when the
-  computer is built (under a millisecond, including everything else the build does), never
-  per frame. It cuts both ways: a 4K frame becomes 2048 px and its pass twice as long as at
-  1024, so a host that wants a ceiling takes `min(imfeat.thumb_size(shape, "pow2")[0], 1024)`
+  the laptop a 720p frame costs 4.0 ms as a fused 512 px pass on one thread (2.2 ms on two,
+  2.1 on four) against 9.6 ms (5.3, 4.3) for `cv2.resize`'s bilinear upscale to 1024 px and
+  the pass on that; a 1080p frame is 1024 px either way, and the same time. The rule runs
+  once, when the computer is built (a millisecond or two, including everything else the
+  build does), never per frame. It cuts both ways: a 4K frame becomes 2048 px and its pass
+  takes 2.4× as long as at 1024 (39.8 against 16.3 ms on one thread, 19.9 against 8.4 on
+  two), so a host that wants a ceiling takes `min(imfeat.thumb_size(shape, "pow2")[0], 1024)`
   and passes that number (`pytest -s tests/test_bench.py -k policy`).
 
 ---
