@@ -24,8 +24,8 @@ in HSV, the conversion running inside the pass (``input_space`` / ``feature_spac
 ``thumb`` the image is a frame the pass thumbnails on the way in, exactly as
 ``cv2.resize(..., INTER_AREA)`` would, so a host hands over the frame itself; the size is a
 fixed one or a policy the frame's shape decides (``"pow2"``: the largest power of two that
-fits the shorter side, square; ``"pow2-cover"`` and ``"pow2-fit"`` keep the frame's shape,
-with the shorter or the longer side as that power of two).
+fits the shorter side, square; ``"pow2-cover"`` and ``"pow2-fit"`` keep the frame's shape
+around or inside that square, as closely as the grid allows).
 
     import imfeat
 
@@ -88,19 +88,27 @@ COLOR_SPACES = ("bgr", "hsv")
 
 #: Thumbnail policies `thumb` takes by name, each a rule from the frame's (H, W) to the
 #: thumbnail's (rows, cols), so the size follows the frame rather than being fixed up front.
-#: None upscales, and a power-of-two grid of up to 64 cells per axis divides every size they
-#: make (of a frame at least 64 px short). ``thumb_size`` resolves a policy.
+#: All three start from the same square, the largest power of two not above the shorter
+#: side; none upscales, and a power-of-two grid of up to 64 cells per axis divides every
+#: size they make (of a frame at least 64 px short). ``thumb_size`` resolves a policy.
 #:
-#: "pow2": square, the largest power of two not above the shorter side: a 720p frame becomes
-#: 512x512, 1080p and 1440p 1024x1024, 4K 2048x2048. The aspect ratio goes.
-#: "pow2-cover": the shorter side as "pow2", the longer side scaled by the same factor and
-#: rounded to a multiple of 64 (THUMB_QUANTUM), so the picture keeps its shape and covers the
-#: "pow2" square: 720p 512x896, 1080p 1024x1792, 4K 2048x3648. Up to the aspect ratio times
-#: the square's pixels.
-#: "pow2-fit": the mirror image, the longer side to its largest power of two and the shorter
-#: side scaled and rounded, so the picture keeps its shape and fits inside the square "pow2"
-#: would make of the longer side: 720p 576x1024, 1080p 576x1024, 4K 1152x2048. Fewer pixels
-#: than that square, at less resolution than "pow2" gives the shorter side.
+#: "pow2": that square itself: a 720p frame becomes 512x512, 1080p and 1440p 1024x1024, 4K
+#: 2048x2048. The aspect ratio goes.
+#: "pow2-cover": the frame's shape around the square: the shorter side as "pow2", the longer
+#: side scaled by the same factor: 720p 512x896, 1080p 1024x1792, 4K 2048x3648. Up to the
+#: aspect ratio times the square's pixels.
+#: "pow2-fit": the frame's shape inside the square: the longer side as "pow2", the shorter
+#: side scaled by the same factor: 720p 512x320, 1080p and 1440p 1024x576, 4K 2048x1152.
+#: Never more pixels than the square (the aspect ratio's share of them), so never dearer.
+#:
+#: Neither aspect policy keeps the shape exactly: the scaled side is rounded to a multiple
+#: of 64 (THUMB_QUANTUM), which the grid needs, so it is kept as closely as that allows. At
+#: widths of 1024 and 2048 a 16:9 frame comes out exact and 4:3 does from 256 up, but a
+#: 16:9 frame at width 512 wants 288 rows, which is no multiple of 64, and gets 320: a 1.6:1
+#: picture, a 10 % squash where the square's is 78 %. The error is at most half a quantum
+#: on the scaled side, and grows as the thumbnail shrinks; a side that would round to
+#: nothing becomes one quantum, so a banner far thinner than the grain ends up the square
+#: under "pow2-fit" (never an upscale: the quantum is at most the shorter side's power of two).
 #:
 #: The pass is fastest when the thumbnail's WIDTH is a power of two: its cells are then a
 #: power of two wide and tile the vector blocks, sampling stride folded in. Any other cell
@@ -111,7 +119,7 @@ COLOR_SPACES = ("bgr", "hsv")
 THUMB_POLICIES = ("pow2", "pow2-cover", "pow2-fit")
 #: The side a policy scales to the aspect ratio is rounded to a multiple of this (never above
 #: the frame's side, never below it), so grids of up to this many cells divide it. Also the
-#: unit of the aspect error those policies make: under 1.6 % at 720p, 1080p and 4K.
+#: unit of the aspect error those policies make: half of it at most on that side.
 THUMB_QUANTUM = 64
 
 # Raw central moments of the pixel values ("mom_i" / "mom_global"), float64.
@@ -263,30 +271,26 @@ def _spatial(shape: Sequence[int], channel_axis: int) -> tuple[int, int, int, in
     return dims[spatial[0]], dims[spatial[1]], dims[cax], cax
 
 
-def _scaled_side(policy: str, side: int, n: int, ref: int, q: int) -> int:
+def _scaled_side(side: int, n: int, ref: int, q: int) -> int:
     """``side * n / ref`` (the side scaled as the other one was, to ``n`` from ``ref``) rounded
-    to the nearest multiple of ``q``, kept at or below ``side``: a policy never upscales."""
+    to the nearest multiple of ``q``, kept at or below ``side`` (a policy never upscales) and
+    at least ``q``: a side too thin for the grain becomes one quantum, and the shape gives way
+    (a banner under "pow2-fit" ends up the square)."""
     x = (2 * side * n + ref * q) // (2 * ref * q) * q  # round half up, in integers
-    x = min(x, side // q * q)
-    if x < q:
-        raise ValueError(
-            f"thumb policy {policy!r} cannot keep {q} px on the {side} px side of this frame"
-        )
-    return x
+    return max(q, min(x, side // q * q))
 
 
 def _policy_size(policy: str, h: int, w: int) -> tuple[int, int]:
     """(rows, cols) the policy makes of an (h, w) frame; see THUMB_POLICIES."""
     short, long = min(h, w), max(h, w)
+    n = 1 << (short.bit_length() - 1)  # the largest power of two <= the shorter side
+    q = min(THUMB_QUANTUM, n)
     if policy == "pow2":
-        n = 1 << (short.bit_length() - 1)  # the largest power of two <= the shorter side
         return n, n
-    if policy == "pow2-cover":
-        n = 1 << (short.bit_length() - 1)
-        sides = n, _scaled_side(policy, long, n, short, min(THUMB_QUANTUM, n))
-    elif policy == "pow2-fit":
-        n = 1 << (long.bit_length() - 1)  # the largest power of two <= the longer side
-        sides = _scaled_side(policy, short, n, long, min(THUMB_QUANTUM, n)), n
+    if policy == "pow2-cover":  # the shorter side is n, the longer follows the shape
+        sides = n, _scaled_side(long, n, short, q)
+    elif policy == "pow2-fit":  # the longer side is n, the shorter follows the shape
+        sides = _scaled_side(short, n, long, q), n
     else:
         raise ValueError(f"unknown thumb policy {policy!r}; known: {', '.join(THUMB_POLICIES)}")
     return sides if h <= w else sides[::-1]  # (short, long) in the frame's orientation
@@ -383,12 +387,16 @@ class FeatureComputer:
                    also writes the thumbnail for reuse. Or a policy name, and the size
                    follows ``shape``: ``"pow2"`` is the largest power of two not above the
                    shorter side, square (a 720p frame: 512, 1080p: 1024, 4K: 2048);
-                   ``"pow2-cover"`` keeps the frame's shape, that same shorter side with
-                   the longer one scaled to match (720p: 512x896, 1080p: 1024x1792);
-                   ``"pow2-fit"`` keeps it too, with the longer side as the power of two
-                   (720p and 1080p: 576x1024). None upscales, and a power-of-two grid of up
-                   to 64 cells divides them all (``THUMB_POLICIES`` has the rules, and which
-                   of them the pass is fast at: those with a power-of-two width). It is
+                   ``"pow2-cover"`` keeps the frame's shape around that square, the
+                   shorter side the power of two and the longer one scaled to match
+                   (720p: 512x896, 1080p: 1024x1792); ``"pow2-fit"`` keeps it inside the
+                   square, the longer side the power of two and the shorter one scaled
+                   (720p: 512x320, 1080p: 1024x576) -- never more pixels than the square.
+                   Neither keeps the shape exactly: the scaled side is rounded to a
+                   multiple of 64 for the grid, so the shape is kept as closely as that
+                   allows. None upscales, and a power-of-two grid of up to 64 cells
+                   divides them all (``THUMB_POLICIES`` has the rules, and which of them
+                   the pass is fast at: those with a power-of-two width). It is
                    settled here, once, from ``shape`` (``thumb_size`` does the same sum on
                    its own); ``.thumb`` is the size in use and ``.thumb_policy`` the name.
                    A thumbnail the frame's own size (a policy can land there) is the frame:

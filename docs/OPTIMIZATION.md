@@ -235,16 +235,25 @@ goes the other way, 39.8 ms at 2048 against 16.3 at a fixed 1024 on one thread (
 the same read of the frame. The one-off build of a computer measured 0.7-3 ms on the laptop,
 5 ms for the 4K-to-2048 one.
 
-*Keeping the frame's shape.* Two more policies keep the aspect ratio, and differ only in
-which side becomes the power of two: `"pow2-cover"` the shorter side (1080p → 1024×1792, the
-`"pow2"` square covered), `"pow2-fit"` the longer (1080p → 1024×576, fitting inside the
-square). The other side follows at the same scale, rounded to a multiple of 64 and never
-above the frame's own (`THUMB_QUANTUM`; the aspect error is under 1.6 % at 720p, 1080p and 4K,
-and zero for 16:9 and 4:3 frames under `"pow2-fit"`). A policy can land on the frame's own
-size (1024×1920 under `"pow2-cover"`, 768×1024 under `"pow2-fit"`), and then nothing is
-resized: the pass reads the frame and `thumb_out` gets a copy from Python, which spares the
-kernel's copy mode its memcpy of the frame into every band's line buffer (6 MB at 1024×1920:
-one to three milliseconds on one development-VM thread, within noise at two).
+*Keeping the frame's shape.* Two more policies keep the aspect ratio, both from the same
+square as `"pow2"`, and differ in which side becomes its power of two: `"pow2-cover"` the
+shorter side (1080p → 1024×1792, the square covered), `"pow2-fit"` the longer (1080p →
+1024×576, the shape fitted inside the square, so never more pixels than it). The other side
+follows at the same scale, rounded to a multiple of 64 and never above the frame's own
+(`THUMB_QUANTUM`), and that rounding is why neither keeps the shape exactly: a 16:9 frame is
+exact at widths 1024 and 2048 (576 and 1152 rows), but at width 512 it wants 288 rows, no
+multiple of 64, and gets 320 -- a 1.6:1 picture, a 10 % squash where the square's is 78 %; a
+side too thin for the grain becomes one quantum, so a banner ends up the square under
+`"pow2-fit"`. The shape is kept as closely as the grid allows, no closer. (`"pow2-fit"` first
+took the *longer* side's own power of two, 1024×576 for 720p as well: exact 16:9, but 2.25×
+the square's pixels whenever the longer side sits an octave above the shorter, so it was the
+faster rule at 1080p and the slower at 720p and 1440p; anchoring both aspect policies on the
+same square made it cheaper than the square everywhere, at the cost of the rounding above.)
+A policy can land on the frame's own size (1024×1920 under `"pow2-cover"`, a power-of-two
+square under `"pow2-fit"`), and then nothing is resized: the pass reads the frame and
+`thumb_out` gets a copy from Python, which spares the kernel's copy mode its memcpy of the
+frame into every band's line buffer (6 MB at 1024×1920: one to three milliseconds on one
+development-VM thread, within noise at two).
 
 The two aspect policies differ in cost far more than in pixels, and the reason is the pass,
 not the resize: its blocks span whole cells only when a cell is a power of two wide (step 4
@@ -254,9 +263,9 @@ at stride 4 uses 7 lanes of 32. `"pow2"` and, on a landscape frame, `"pow2-fit"`
 width a power of two; `"pow2-cover"` cannot, since the shorter side is the power of two and
 the aspect ratio is not. On the development VM with two threads, a 1080p frame at stride 4
 costs 3.7 ms as the 1024 px square, 2.5 ms as 1024×576 and 9.4 ms as 1792×1024 (at stride 1:
-9.2, 6.1 and 15.2); a 720p frame at stride 2, 2.9 ms as the 512 px square, 3.1 ms as 1024×576
-and 6.5 ms as 896×512. So the aspect-keeping choice that is also faster than a fixed 1024 px
-square is `"pow2-fit"`, on landscape frames; on portrait frames the two swap roles.
+9.2, 6.1 and 15.2); a 720p frame at stride 2, 2.3 ms as the 512 px square, 2.2 ms as 512×320
+and 6.8 ms as 896×512. So `"pow2-fit"` keeps the shape and costs at most what the square
+does, on landscape frames; on portrait frames the two aspect policies swap roles.
 
 ## What did not work
 

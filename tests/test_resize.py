@@ -154,25 +154,27 @@ def test_resize_area_arguments():
 
 
 # ---------------- a policy in place of the size ------------------------------------------------
-# (H, W) -> what the policies pick. "pow2": the largest power of two not above the shorter
-# side, square. "pow2-cover": that side, and the longer one scaled to match, to the nearest
-# multiple of 64 not above the frame's. "pow2-fit": the longer side to its power of two, the
-# shorter scaled to match, the same way.
+# (H, W) -> what the policies pick, all from the same square: the largest power of two not
+# above the shorter side. "pow2": the square. "pow2-cover": the shorter side as the square's,
+# the longer one scaled to match, to the nearest multiple of 64 not above the frame's.
+# "pow2-fit": the longer side as the square's, the shorter one scaled to match, the same way,
+# and at least one quantum: a side too thin for the grain gives the shape up (a banner).
 POLICY_SIZES = [
     # frame            pow2          pow2-cover   pow2-fit
-    ((720, 1280), ((512, 512), (512, 896), (576, 1024))),
+    ((720, 1280), ((512, 512), (512, 896), (320, 512))),  # 288 rows wanted: no multiple of 64
     ((1080, 1920), ((1024, 1024), (1024, 1792), (576, 1024))),
-    ((1440, 2560), ((1024, 1024), (1024, 1792), (1152, 2048))),
+    ((1440, 2560), ((1024, 1024), (1024, 1792), (576, 1024))),
     ((2160, 3840), ((2048, 2048), (2048, 3648), (1152, 2048))),
     ((1024, 1920), ((1024, 1024), (1024, 1920), (576, 1024))),  # a power-of-two side: kept
-    ((768, 1024), ((512, 512), (512, 704), (768, 1024))),  # 4:3, the longer side a power of two
+    ((768, 1024), ((512, 512), (512, 704), (384, 512))),  # 4:3: exact from 256 up
     ((1023, 1023), ((512, 512), (512, 512), (512, 512))),
     ((600, 800), ((512, 512), (512, 704), (384, 512))),
-    ((480, 640), ((256, 256), (256, 320), (384, 512))),
+    ((480, 640), ((256, 256), (256, 320), (192, 256))),
     ((1024, 2016), ((1024, 1024), (1024, 1984), (512, 1024))),  # 2016 rounds up to 2048: clamped
+    ((100, 3000), ((64, 64), (64, 1920), (64, 64))),  # a banner: fit gives the shape up
     ((64, 64), ((64, 64), (64, 64), (64, 64))),
-    ((30, 50), ((16, 16), (16, 32), None)),  # the quantum is 16 here; fit: 32 rows > 30
-    ((3, 5), ((2, 2), (2, 4), None)),
+    ((30, 50), ((16, 16), (16, 32), (16, 16))),  # the quantum is 16 here
+    ((3, 5), ((2, 2), (2, 4), (2, 2))),
     ((1, 1), ((1, 1), (1, 1), (1, 1))),
 ]
 POLICIES = ("pow2", "pow2-cover", "pow2-fit")
@@ -185,11 +187,9 @@ def test_thumb_size():
     frame gets the landscape answer transposed."""
     assert imfeat.THUMB_POLICIES == POLICIES and imfeat.THUMB_QUANTUM == 64
     for (h, w), sizes in POLICY_SIZES:
+        square = sizes[0]
+        assert sizes[2][0] * sizes[2][1] <= square[0] * square[1] <= sizes[1][0] * sizes[1][1]
         for policy, size in zip(POLICIES, sizes):
-            if size is None:
-                with pytest.raises(ValueError, match="cannot keep"):
-                    imfeat.thumb_size((h, w), policy)
-                continue
             assert imfeat.thumb_size((h, w), policy) == size, (h, w, policy)
             assert imfeat.thumb_size((h, w, 3), policy) == size
             assert imfeat.thumb_size((w, h, 1), policy) == size[::-1]  # portrait
@@ -198,12 +198,13 @@ def test_thumb_size():
             r, c = size
             assert r <= h and c <= w  # never an upscale
             assert r % min(64, r) == 0 and c % min(64, c) == 0  # a 64-cell grid divides
-    # the two aspect policies keep the frame's shape to within the 64 px rounding
-    for (h, w), sizes in POLICY_SIZES:
-        for size in sizes[1:]:
-            if size is not None and min(size) >= 64:
+    # the two aspect policies keep the frame's shape to within the rounding of the scaled
+    # side (half a quantum, 32 px), until that side would round to nothing
+    for (h, w), (_square, cover, fit) in POLICY_SIZES:
+        for size, scaled in ((cover, max(cover)), (fit, min(fit))):
+            if scaled > 64:
                 r, c = size
-                assert abs(c / r - w / h) / (w / h) < 64 / max(size)
+                assert abs(c / r - w / h) / (w / h) <= 32 / (scaled - 32), (h, w, size)
     # a fixed size passes through, whatever the frame
     assert imfeat.thumb_size((720, 1280, 3), 1024) == THUMB
     assert imfeat.thumb_size((720, 1280, 3), np.int64(1024)) == THUMB
@@ -290,7 +291,7 @@ def test_thumbnail_the_frames_own_size():
     then reads the frame as it is, and ``thumb_out`` is a copy of it."""
     for frame, policy in (
         (content("random", (1024, 1920, 3), seed=9), "pow2-cover"),
-        (content("structured", (768, 1024, 3), seed=9), "pow2-fit"),
+        (content("structured", (256, 256, 3), seed=9), "pow2-fit"),  # a square: fit keeps it
         (content("random", (512, 512), seed=9), "pow2"),
     ):
         plain = imfeat.FeatureComputer(shape=frame.shape, grid=GRID, threads=2)
@@ -306,9 +307,9 @@ def test_thumbnail_the_frames_own_size():
             assert np.array_equal(out, frame)
             for k, v in plain.compute(frame).items():
                 assert np.array_equal(v, raw[k]), k
-    planar = np.ascontiguousarray(np.moveaxis(content("random", (768, 1024, 3), seed=10), -1, 0))
-    fc = imfeat.FeatureComputer(shape=planar.shape, grid=GRID, channel_axis=0, thumb="pow2-fit")
-    out = np.empty((768, 1024, 3), np.uint8)
+    planar = np.ascontiguousarray(np.moveaxis(content("random", (1024, 1920, 3), seed=10), -1, 0))
+    fc = imfeat.FeatureComputer(shape=planar.shape, grid=GRID, channel_axis=0, thumb="pow2-cover")
+    out = np.empty((1024, 1920, 3), np.uint8)
     fc.features(planar, thumb_out=out)
     assert np.array_equal(out, np.moveaxis(planar, 0, -1))  # the copy is in (H, W, C) order
 
@@ -320,10 +321,9 @@ def test_policy_arguments():
         imfeat.FeatureComputer(shape=(40, 50, 3), grid=GRID, thumb="pow2")  # 32 px, 64 cells
     with pytest.raises(ValueError, match="up to 4 channels"):
         imfeat.FeatureComputer(shape=(100, 100, 5), grid=[(2, 2)], thumb="pow2", feature_space=None)
-    with pytest.raises(ValueError, match="cannot keep 64 px"):
-        imfeat.FeatureComputer(shape=(20, 1000, 3), grid=[(2, 2)], thumb="pow2-fit")
-    with pytest.raises(ValueError, match="cannot keep"):
-        imfeat.resize_area(np.zeros((20, 1000, 3), np.uint8), "pow2-fit")
+    banner = imfeat.FeatureComputer(shape=(20, 1000, 3), grid=[(2, 2)], thumb="pow2-fit")
+    assert banner.thumb == (16, 16)  # too thin for the grain: the shape gives way
+    assert imfeat.resize_area(np.zeros((20, 1000, 3), np.uint8), "pow2-fit").shape == (16, 16, 3)
     fc = imfeat.FeatureComputer(shape=(64, 64, 3), grid=GRID, thumb="pow2")  # a power of two
     assert fc.thumb == (64, 64)  # is its own thumbnail
     with pytest.raises(ValueError, match="must have shape"):
