@@ -12,6 +12,14 @@ if(MSVC)
   add_compile_options(/O2 /arch:AVX2 /fp:fast)
 else()
   add_compile_options(-O3 -march=native -ffast-math)
+  # -ffast-math lets GCC and clang replace a vector division by an estimate and a Newton
+  # step. The colour conversion divides once per pixel and wants the real thing (see
+  # hsv_recip in core.cpp); its result is exact either way, the division is just cheaper.
+  if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|i.86")
+    add_compile_options(-mno-recip)
+  elseif(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    add_compile_options(-fno-reciprocal-math)
+  endif()
 endif()
 
 find_package(Python 3.9 COMPONENTS Interpreter Development.Module REQUIRED)

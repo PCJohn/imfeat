@@ -689,75 +689,155 @@ inline void hsv_pixel(int b, int g, int r, uint8_t *IF_RESTRICT hsv)
   hsv[2] = (uint8_t)v;
 }
 
-// round(NUM / x) per lane, x in [1, 255]: a float quotient, then the integer remainder makes
-// it exact -- the float only has to land within one of the answer, which any division does.
-template <int32_t NUM>
-HWY_INLINE V32 hsv_round_div(V32 x)
+// Even and odd lanes of a vector as the next wider type, and back. The even lanes are the low
+// halves and the odd ones the high halves, so a split is a mask or a shift and a merge a shift
+// and an or: no shuffles, whose port is the scarce one on Intel cores, and the order of the
+// lanes takes care of itself. A merge of signed lanes masks the even ones' sign extension.
+HWY_INLINE V16 even8(V8 v) { return hn::And(hn::BitCast(d16, v), hn::Set(d16, 0x00FF)); }
+HWY_INLINE V16 odd8(V8 v) { return hn::BitCast(d16, hn::ShiftRight<8>(hn::BitCast(du16, v))); }
+HWY_INLINE V32 even16u(V16 v) { return hn::And(hn::BitCast(d32, v), hn::Set(d32, 0xFFFF)); }
+HWY_INLINE V32 even16(V16 v) { return hn::ShiftRight<16>(hn::ShiftLeft<16>(hn::BitCast(d32, v))); }
+HWY_INLINE V32 odd16(V16 v) { return hn::ShiftRight<16>(hn::BitCast(d32, v)); }
+HWY_INLINE V16 merge16(V32 even, V32 odd)
 {
-  const hn::Repartition<float, D8> df;
-  V32 q = hn::NearestInt(hn::Div(hn::Set(df, (float)NUM), hn::ConvertTo(df, x)));
-  const V32 r2 = hn::ShiftLeft<1>(hn::Sub(hn::Set(d32, NUM), hn::Mul(q, x))); // 2 * remainder
-  q = hn::Sub(q, hn::VecFromMask(d32, hn::Gt(r2, x)));         // remainder > x/2: one more
-  q = hn::Add(q, hn::VecFromMask(d32, hn::Lt(r2, hn::Neg(x)))); // < -x/2: one less
-  return q;
+  return hn::BitCast(d16, hn::Or(hn::And(even, hn::Set(d32, 0xFFFF)), hn::ShiftLeft<16>(odd)));
+}
+HWY_INLINE V8 merge8(V16 even, V16 odd) // lanes in [0, 255]
+{
+  return hn::BitCast(d8, hn::Or(even, hn::ShiftLeft<8>(odd)));
 }
 
-// One block of pixels to hsv[0..2]; the H and S planes only when asked for (the unasked ones
-// hold V). The same integers as hsv_pixel: v and diff stay bytes, h6 is 16-bit, the two
-// fixed-point products are 32-bit; the tables come from hsv_round_div instead of a gather.
-template <bool kH, bool kS>
-HWY_INLINE void hsv_block(V8 b, V8 g, V8 r, V8 *IF_RESTRICT hsv)
+using DF = hn::Repartition<float, D8>;
+using VF = hn::VFromD<DF>;
+
+// The float arithmetic below is exact where it needs to be and within a tolerance elsewhere,
+// as written: IF_STRICT keeps -ffast-math from rewriting it (see moments_tail).
+#if defined(_MSC_VER) && !defined(__clang__)
+#pragma float_control(precise, on, push)
+#endif
+// 1 / p for p in [1, 2^16]. A division: one instruction, correctly rounded, and the divider
+// it occupies for a few cycles runs beside the arithmetic ports that are the busy ones here.
+// GCC and clang both replace a vector division by a hardware estimate plus one Newton step
+// under -ffast-math, whatever the function's own options say; CMakeLists.txt turns that off
+// (-mno-recip, -fno-reciprocal-math), but hsv_table would still be exact with it on -- that
+// estimate is within 2^-22 or so, and the table only needs its guess within 1/2.
+HWY_INLINE VF hsv_recip(VF p)
 {
-  const V8 v = hn::Max(hn::Max(b, g), r), diff = hn::Sub(v, hn::Min(hn::Min(b, g), r));
-  hsv[0] = hsv[1] = hsv[2] = v;
+  IF_STRICT_BODY
+  const DF df;
+  return hn::Div(hn::Set(df, 1.0f), p);
+}
+
+// (NUM / x) rounded, for x in [1, 255], from a float guess g of the quotient within 1/2 of it
+// (hsv_lanes' guesses are within 1/8): floor(g) is the answer or one less, and the remainder
+// NUM - floor(g) * x says which (it is above x/2 exactly when one less). The remainder needs
+// an exact NUM - q * x: an fma where there is one (the product has up to 28 bits, the
+// difference at most 9), 32-bit integers otherwise. The rounded value returns as a float,
+// which the fixed-point product wants.
+template <int32_t NUM>
+HWY_INLINE VF hsv_table(VF g, VF x, V32 xi)
+{
+  IF_STRICT_BODY
+  const DF df;
+  VF q = hn::Floor(g);
+#if HWY_NATIVE_FMA
+  (void)xi;
+  const VF rem = hn::NegMulAdd(q, x, hn::Set(df, (float)NUM));
+  return hn::Add(q, hn::IfThenElseZero(hn::Gt(hn::Add(rem, rem), x), hn::Set(df, 1.0f)));
+#else
+  (void)x;
+  V32 qi = hn::ConvertInRangeTo(d32, q);
+  const V32 rem = hn::Sub(hn::Set(d32, NUM), hn::Mul(qi, xi));
+  qi = hn::Sub(qi, hn::VecFromMask(d32, hn::Gt(hn::Add(rem, rem), xi))); // - (-1) where true
+  return hn::ConvertTo(df, qi);
+#endif
+}
+
+// Eight (or more) pixels' s and h -- OpenCV's integers, in float arithmetic that is exact at
+// every step where it has to be: v, diff and h6 are small integers; sdiv[v] and hdiv[diff] come
+// out of hsv_table exactly; each fixed-point product is below 2^21, so it and its + 2^11 are
+// exact; and the final >> 12 is the integer shift, which floors like OpenCV's. Both table
+// values share one reciprocal, 1 / (v * diff): sdiv = SNUM * diff * r, hdiv = HNUM * v * r,
+// where SNUM * diff and HNUM * v are exact (they are 2^12 * 255 * diff and 2^13 * 15 * v), so
+// each guess carries the reciprocal's rounding and one of its own: within 2^-23 relative, or
+// 1/8 of a unit at the largest table value. When diff is 0 (v too, or a grey)
+// the products that use the tables are 0, so the tables may be anything finite: the
+// reciprocal is taken of max(v * diff, 1).
+template <bool kH, bool kS>
+HWY_INLINE void hsv_lanes(V32 v, V32 diff, V32 h6, V32 &s, V32 &h)
+{
+  IF_STRICT_BODY
+  const DF df;
+  const VF vf = hn::ConvertTo(df, v), dfv = hn::ConvertTo(df, diff);
+  const VF half_ = hn::Set(df, (float)HSV_HALF);
+  const VF r = hsv_recip(hn::Max(hn::Mul(vf, dfv), hn::Set(df, 1.0f)));
+  if (kS)
+  {
+    const VF guess = hn::Mul(hn::Mul(hn::Set(df, (float)HSV_SNUM), dfv), r);
+    const VF sdiv = hsv_table<HSV_SNUM>(guess, vf, v);
+    s = hn::ShiftRight<HSV_SHIFT>(hn::ConvertInRangeTo(d32, hn::MulAdd(dfv, sdiv, half_)));
+  }
+  if (kH)
+  {
+    const VF guess = hn::Mul(hn::Mul(hn::Set(df, (float)HSV_HNUM), vf), r);
+    const VF hdiv = hsv_table<HSV_HNUM>(guess, dfv, diff);
+    const VF t = hn::MulAdd(hn::ConvertTo(df, h6), hdiv, half_);
+    h = hn::ShiftRight<HSV_SHIFT>(hn::ConvertInRangeTo(d32, t));
+  }
+}
+
+// One block of pixels: v, and the H and S planes when asked for. v and diff are taken in
+// bytes, the hue numerator h6 in 16-bit lanes, and the rest in hsv_lanes, on the even and odd
+// lanes of each level in turn.
+template <bool kH, bool kS>
+HWY_INLINE void hsv_block(V8 b, V8 g, V8 r, V8 &h, V8 &s, V8 &v)
+{
+  v = hn::Max(hn::Max(b, g), r);
+  const V8 diff = hn::Sub(v, hn::Min(hn::Min(b, g), r));
   if (!kH && !kS) return;
   V16 h16[2], s16[2];
   for (int half = 0; half < 2; ++half)
   {
-    auto wide = [&](V8 a)
-    { return half ? hn::PromoteUpperTo(d16, a) : hn::PromoteLowerTo(d16, a); };
-    const V16 b1 = wide(b), g1 = wide(g), r1 = wide(r), v1 = wide(v), d1 = wide(diff);
-    const V16 h6 = hn::IfThenElse(
-        hn::Eq(v1, r1), hn::Sub(g1, b1),
-        hn::IfThenElse(hn::Eq(v1, g1), hn::Add(hn::Sub(b1, r1), hn::ShiftLeft<1>(d1)),
-                       hn::Add(hn::Sub(r1, g1), hn::ShiftLeft<2>(d1))));
-    V32 h32[2], s32[2];
+    auto lanes = [&](V8 a) { return half ? odd8(a) : even8(a); };
+    const V16 v1 = lanes(v), d1 = lanes(diff);
+    V16 h6 = hn::Zero(d16);
+    if (kH)
+    {
+      const V16 b1 = lanes(b), g1 = lanes(g), r1 = lanes(r);
+      const V16 d2 = hn::Add(d1, d1);
+      h6 = hn::IfThenElse(hn::Eq(v1, r1), hn::Sub(g1, b1),
+                          hn::IfThenElse(hn::Eq(v1, g1), hn::Add(hn::Sub(b1, r1), d2),
+                                         hn::Add(hn::Sub(r1, g1), hn::Add(d2, d2))));
+    }
+    V32 s32[2], h32[2];
     for (int q = 0; q < 2; ++q)
     {
-      auto wider = [&](V16 a)
-      { return q ? hn::PromoteUpperTo(d32, a) : hn::PromoteLowerTo(d32, a); };
-      const V32 d2 = wider(d1), zero = hn::Zero(d32), one = hn::Set(d32, 1),
-                half_ = hn::Set(d32, HSV_HALF);
-      if (kS)
-      {
-        const V32 v2 = wider(v1);
-        const V32 sdiv =
-            hn::IfThenElseZero(hn::Gt(v2, zero), hsv_round_div<HSV_SNUM>(hn::Max(v2, one)));
-        s32[q] = hn::ShiftRight<HSV_SHIFT>(hn::Add(hn::Mul(d2, sdiv), half_));
-      }
-      if (kH)
-      {
-        const V32 hdiv =
-            hn::IfThenElseZero(hn::Gt(d2, zero), hsv_round_div<HSV_HNUM>(hn::Max(d2, one)));
-        const V32 h = hn::ShiftRight<HSV_SHIFT>(hn::Add(hn::Mul(wider(h6), hdiv), half_));
-        h32[q] = hn::Add(h, hn::IfThenElseZero(hn::Lt(h, zero), hn::Set(d32, HSV_HRANGE)));
-      }
+      const V32 v2 = q ? odd16(v1) : even16u(v1), d2 = q ? odd16(d1) : even16u(d1);
+      const V32 h2 = kH ? (q ? odd16(h6) : even16(h6)) : hn::Zero(d32);
+      hsv_lanes<kH, kS>(v2, d2, h2, s32[q], h32[q]);
     }
-    if (kS) s16[half] = hn::OrderedDemote2To(d16, s32[0], s32[1]);
-    if (kH) h16[half] = hn::OrderedDemote2To(d16, h32[0], h32[1]);
+    if (kS) s16[half] = merge16(s32[0], s32[1]);
+    if (kH) // h is in [-30, 150]: + 180 where negative
+    {
+      const V16 hh = merge16(h32[0], h32[1]);
+      h16[half] = hn::Add(hh, hn::And(hn::BroadcastSignBit(hh), hn::Set(d16, HSV_HRANGE)));
+    }
   }
-  if (kS) hsv[1] = hn::OrderedDemote2To(d8, s16[0], s16[1]);
-  if (kH) hsv[0] = hn::OrderedDemote2To(d8, h16[0], h16[1]);
+  if (kS) s = merge8(s16[0], s16[1]);
+  if (kH) h = merge8(h16[0], h16[1]);
 }
 
 // One row: the selected HSV channels (chan[0..c), each to out + k*ostride, as gather_row lays
 // them out) from the three source channels at bytes coff[0..2] of each pixel. `packed`: the
 // pixels are 3 contiguous bytes in B, G, R order. `tmp` holds 3*w bytes for the strided case.
 template <bool kH, bool kS>
-void hsv_row(const uint8_t *IF_RESTRICT src, int64_t cs, const int64_t *IF_RESTRICT coff,
-             const int *IF_RESTRICT chan, int c, int w, bool packed, uint8_t *IF_RESTRICT tmp,
-             uint8_t *IF_RESTRICT out, size_t ostride)
+IF_STRICT_FN HWY_NOINLINE void hsv_row(const uint8_t *IF_RESTRICT src, int64_t cs,
+                                       const int64_t *IF_RESTRICT coff,
+                                       const int *IF_RESTRICT chan, int c, int w, bool packed,
+                                       uint8_t *IF_RESTRICT tmp, uint8_t *IF_RESTRICT out,
+                                       size_t ostride)
 {
+  IF_STRICT_BODY
   const size_t N = hn::Lanes(d8);
   const uint8_t *p[3];
   int64_t ps = 1; // p[k] + x * ps is channel k of pixel x
@@ -776,10 +856,9 @@ void hsv_row(const uint8_t *IF_RESTRICT src, int64_t cs, const int64_t *IF_RESTR
       p[k] = plane;
     }
   size_t x = 0;
-  V8 hsv[3];
   for (; x + N <= (size_t)w; x += N)
   {
-    V8 b, g, r;
+    V8 b, g, r, h, s, v;
     if (packed)
       hn::LoadInterleaved3(d8, src + x * 3, b, g, r);
     else
@@ -788,8 +867,9 @@ void hsv_row(const uint8_t *IF_RESTRICT src, int64_t cs, const int64_t *IF_RESTR
       g = hn::LoadU(d8, p[1] + x);
       r = hn::LoadU(d8, p[2] + x);
     }
-    hsv_block<kH, kS>(b, g, r, hsv);
-    for (int k = 0; k < c; ++k) hn::StoreU(hsv[chan[k]], d8, out + (size_t)k * ostride + x);
+    hsv_block<kH, kS>(b, g, r, h, s, v);
+    for (int k = 0; k < c; ++k)
+      hn::StoreU(chan[k] == 0 ? h : chan[k] == 1 ? s : v, d8, out + (size_t)k * ostride + x);
   }
   for (; x < (size_t)w; ++x)
   {
@@ -798,6 +878,19 @@ void hsv_row(const uint8_t *IF_RESTRICT src, int64_t cs, const int64_t *IF_RESTR
     for (int k = 0; k < c; ++k) out[(size_t)k * ostride + x] = px[chan[k]];
   }
 }
+
+// The instantiations, here so that they are compiled under the options above.
+#define IMFEAT_HSV_ROW_ARGS                                                                        \
+  (const uint8_t *, int64_t, const int64_t *, const int *, int, int, bool, uint8_t *, uint8_t *,  \
+   size_t)
+template void hsv_row<true, true> IMFEAT_HSV_ROW_ARGS;
+template void hsv_row<true, false> IMFEAT_HSV_ROW_ARGS;
+template void hsv_row<false, true> IMFEAT_HSV_ROW_ARGS;
+template void hsv_row<false, false> IMFEAT_HSV_ROW_ARGS;
+#undef IMFEAT_HSV_ROW_ARGS
+#if defined(_MSC_VER) && !defined(__clang__)
+#pragma float_control(pop)
+#endif
 
 // gather_row's counterpart under a conversion: the selected feature-space channels of one row,
 // converted from the source channels at coff[0..2], channel k of `chan` at out + k*ostride.

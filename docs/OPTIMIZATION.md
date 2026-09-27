@@ -100,7 +100,7 @@ Chronologically. Times are single-thread `features()`; instruction counts are pe
 | 3 | Finest level streamed instead of stored; outputs derived into pooled blocks; HOG / LBP normalised in SIMD; summary folded in batches | development VM: 0.55 → 0.37 ms at 256×256×3 stride 2 |
 | 4 | Nine texture features and the projection profiles added | a cost: +20% |
 | 5 | Per-cell stage reworked (details below) | instructions 6.37 M → 5.23 M (−18%); Xeon 0.58 → 0.42 ms (−28%); laptop 0.45 → 0.35 ms (−22%) |
-| 6 | BGR → HSV conversion fused into the row gather (details below) | development VM, 1024×1024×3 stride 1: `cvtColor` + pass 11.7 → 10.7 ms at one thread (the conversion costs 0.7 ms inside the pass against `cvtColor`'s 1.4 ms plus a write and a read of the image), 8.6 → 5.9 ms median at two |
+| 6 | BGR → HSV conversion fused into the row gather (details below) | development VM (AVX-512), 1024×1024×3 stride 1, one thread: `cvtColor` + pass 11.45 → 10.27 ms; the conversion costs 0.6 ms inside the pass, against `cvtColor`'s 1.4 ms plus a write and a read of the image. Its kernel went from 0.96 to 0.84 ns per pixel on the AVX-512 build and 1.8 to 1.2 on the AVX2 one between the first and the second version |
 
 **Step 1, the kernel.** Besides the change of lane, three algebraic rewrites turn every sum
 into a plain vector add:
@@ -142,16 +142,35 @@ run `cv2.cvtColor` first: a pass that writes a second image and reads it back. T
 now happens where each row is de-interleaved, in every band's thread, so it costs no memory
 traffic and threads like the rest. The output is exactly OpenCV's 8-bit integer formula
 (`RGB2HSV_b`, hue in `[0, 180)`), checked against `cv2.cvtColor` on all 2^24 colours on the
-AVX-512, AVX2, SSE4 and SSSE3 builds. What made it cheap is not gathering: OpenCV's formula
-takes two per-pixel table values, `round(255·2¹²/v)` and `round(30·2¹²/diff)`, and a 256-entry
-gather per lane is slow on every x86 generation. Instead each value is a float division
-(exact IEEE division on x86 and AArch64, one `vdivps` per vector) rounded to the nearest
-integer and then *corrected by its integer remainder*: `2r > x` adds one, `2r < −x` takes one
-away, which makes the value exact by construction whatever the float did, provided it landed
-within one. Neither table has a half-way case (the numerators carry more factors of two than
-any divisor below 256), so "nearest" needs no tie rule. Everything else stays in bytes (`v`,
-`diff`), 16-bit lanes (the signed hue numerator) and 32-bit lanes (the two fixed-point
-products), and the H and S planes are only computed when a selected channel asks for them.
+AVX-512, AVX2, SSE4 and SSSE3 builds, with GCC and clang. What made it cheap is not gathering:
+OpenCV's formula takes two per-pixel table values, `round(255·2¹²/v)` and `round(30·2¹²/diff)`,
+and a 256-entry gather per lane is slow on every x86 generation. Instead:
+
+* *One reciprocal per pixel serves both tables.* `1/(v·diff)` is one division; `255·2¹²·diff`
+  and `30·2¹²·v` are exact in float (their odd parts have 16 and 12 bits), so a multiply each
+  gives both quotients to within 2^-23, or an eighth of a unit at the largest table value.
+* *An exact fix-up with one compare.* `floor(guess)` is the rounded quotient or one less, and
+  the remainder `N − floor(guess)·x` decides: above `x/2` means one less. The remainder is an
+  fma, exact because the difference is small although the product is not; without fma it is
+  computed in 32-bit integers. Neither table has a half-way case (the numerators carry more
+  factors of two than any divisor below 256), so "rounded" needs no tie rule. The first version
+  divided twice per pixel and corrected in both directions; this one costs about two thirds
+  of it.
+* *No shuffles between lane widths.* Bytes go to 16-bit lanes and 16-bit to 32-bit as even and
+  odd lanes (a mask or a shift) and come back with a shift and an or, so the shuffle port,
+  the busiest one on Intel cores, is left to the 3-channel de-interleave. On this VM's AVX2
+  build that measured 6% faster than promoting and demoting.
+* *The rest is exact by inspection.* `v` and `diff` stay bytes and the signed hue numerator
+  16-bit; each fixed-point product is below 2^21, so it and its `+ 2¹¹` are exact in float;
+  the final `>> 12` is the integer shift, which floors like OpenCV's; and the H and S planes
+  are only computed when a selected channel asks for them.
+
+One thing to know about the division: under `-ffast-math`, GCC and clang both replace a vector
+division by a hardware estimate plus one Newton step, whatever the enclosing function's own
+options say (the `optimize` attribute does not reach through Highway's target pragmas). The
+CMake flags turn that off (`-mno-recip`, `-fno-reciprocal-math`), which is worth a few
+percent; the result would be exact either way, since that estimate is within the fix-up's
+tolerance, and the all-colours test says so on every build.
 
 ## What did not work
 
