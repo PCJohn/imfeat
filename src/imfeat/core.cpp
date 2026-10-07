@@ -97,9 +97,9 @@ constexpr int SG4 = LBP0 + LBPB; // 29: sum of |grad|^4 = (gx^2+gy^2)^2, for gra
 // than a contrast one.
 constexpr int BARD_LAGS[] = {1, 2, 4};
 constexpr int BARD_NL = (int)(sizeof(BARD_LAGS) / sizeof(BARD_LAGS[0]));
-constexpr int BARD_SPAN = 2;   // a lag-d test reaches +/- d, so it spans 2d
-constexpr int BARD_TAU = 8;    // 8/255 gate: below this the response is sensor noise
-constexpr int BARD_MAXLAG = 4; // == BARD_LAGS[BARD_NL - 1]; sizes the plane halo
+constexpr int BARD_SPAN = 2;                 // a lag-d test reaches +/- d, so it spans 2d
+constexpr int BARD_TAU = 8;                  // 8/255 gate: below this the response is sensor noise
+constexpr int BARD_MAXLAG = 4;               // == BARD_LAGS[BARD_NL - 1]; sizes the plane halo
 constexpr int BARD0 = SG4 + 1;               // 30: gated-pixel count ("cover")
 constexpr int BARD_S0 = BARD0 + 1;           // 31: per-lag gated response mass
 constexpr int BARD_DARK = BARD_S0 + BARD_NL; // 34: max-over-lags dark mass
@@ -133,8 +133,8 @@ constexpr int BARD_NMAP = 3 + BARD_NL; // dense maps: cover, resp*NL, dark, ligh
 // inside L1/L2.
 constexpr int PAD_L = 8;
 constexpr int PAD_R = 8;
-constexpr int PHASES_MAX = 8;    // most column phases the planes are split into
-constexpr int NF_S = 5;          // tensor-derived float channels
+constexpr int PHASES_MAX = 8; // most column phases the planes are split into
+constexpr int NF_S = 5;       // tensor-derived float channels
 // Model-ready nonlinear descriptors, all DERIVED from the sums above (no new
 // accumulators): standardized skew/kurtosis, two structure-tensor ratios, and two
 // HOG histogram-shape summaries. Nonlinear (ratios/products/argmax-free peakedness)
@@ -165,13 +165,13 @@ constexpr int NMAP = NF + NMOM;
 // add/pixel/channel, no extra traversal): aHash/wHash threshold an 8x8 mean grid
 // (HBLK x HBLK block-pool of it) by its mean/median; pHash takes the low-freq 8x8 of a
 // 2D DCT-II of the full 32x32 mean grid. Independent of the feature pyramid grid.
-constexpr int HN = 32;        // hash mean-grid resolution (== pHash DCT input side)
-constexpr int HS = 8;         // hash side: HS*HS = 64 bits
+constexpr int HN = 32; // hash mean-grid resolution (== pHash DCT input side)
+constexpr int HS = 8;  // hash side: HS*HS = 64 bits
+constexpr int HS2 = HS * HS;
 constexpr int NHASH = 3;      // aHash, wHash, pHash
 constexpr int HBLK = HN / HS; // 4: aHash/wHash pool HBLK x HBLK cells of the HN grid
 constexpr int64_t RAYSCALE = 1 << 14;
 constexpr double PI = 3.14159265358979323846;
-
 
 inline int clampi(int v, int hi) { return v < 0 ? 0 : (v > hi ? hi : v); }
 
@@ -259,7 +259,7 @@ HWY_INLINE void bard(const uint8_t *const *t, size_t x, V8 c, const V8 *IF_RESTR
 {
   static_assert(BARD_LAGS[0] == 1, "lag 1's taps are the 3x3 neighbours kernel() already holds");
   V8 dmax = hn::Zero(d8), lmax = hn::Zero(d8), resp[BARD_NL];
-  for (int j = 0; j < BARD_NL; ++j)
+  for (size_t j = 0; j < BARD_NL; ++j)
   {
     V8 dk = hn::Zero(d8), lt = hn::Zero(d8);
     if ((hok >> j) & 1)
@@ -269,7 +269,7 @@ HWY_INLINE void bard(const uint8_t *const *t, size_t x, V8 c, const V8 *IF_RESTR
       V8 lo = hn::Min(l, r), hi = hn::Max(l, r);
       if (valid)
       {
-        const V8 vm = hn::LoadU(d8, valid + (size_t)j * vstride + x);
+        const V8 vm = hn::LoadU(d8, valid + j * vstride + x);
         lo = hn::And(lo, vm);
         hi = hn::Or(hi, hn::Not(vm));
       }
@@ -337,9 +337,9 @@ HWY_INLINE void kernel(const uint8_t *const *p, size_t x, const uint8_t *IF_REST
                                      hn::VecFromMask(d8, hn::Eq(code, hn::Set(d8, (uint8_t)-j))));
 
   const V8 m8 = MASKED ? hn::LoadU(d8, mask) : hn::Set(d8, 255);
-  const V8 near[4] = {bL, bR, aM,
-                      eM}; // left, right, up, down: where lag 1's rows are in the image,
-  bard<ROW0>(p + 9, x, c, near, m8, valid, vstride, hok, vok, A); // the 3x3 rows are not replicas
+  // left, right, up, down: where lag 1's rows are in the image; the 3x3 rows are not replicas
+  const V8 near[4] = {bL, bR, aM, eM};
+  bard<ROW0>(p + 9, x, c, near, m8, valid, vstride, hok, vok, A);
   for (int h = 0; h < 2; ++h) // the int16 half blocks
   {
     auto wide = [&](V8 v)
@@ -632,7 +632,7 @@ void split_phases(const uint8_t *IF_RESTRICT src, size_t n, int P, size_t phs,
 // memory traffic and threads like the rest. The outputs are cv2.cvtColor's bytes exactly: the
 // tests compare every one of the 2^24 colours. Adding a conversion means a Convert code, a row
 // kernel like hsv_row, a case in convert_row, and an entry in the Python table.
-enum Convert
+enum Convert : uint8_t
 {
   CONV_NONE = 0,
   CONV_BGR2HSV = 1 // OpenCV's 8-bit BGR -> HSV, hue in [0, 180)
@@ -728,7 +728,7 @@ HWY_INLINE VF hsv_table(VF g, VF x, V32 xi)
 {
   IF_STRICT_BODY
   const DF df;
-  VF q = hn::Floor(g);
+  const VF q = hn::Floor(g);
 #if HWY_NATIVE_FMA
   (void)xi;
   const VF rem = hn::NegMulAdd(q, x, hn::Set(df, (float)NUM));
@@ -821,10 +821,9 @@ HWY_INLINE void hsv_block(V8 b, V8 g, V8 r, V8 &h, V8 &s, V8 &v)
 // pixels are 3 contiguous bytes in B, G, R order. `tmp` holds 3*w bytes for the strided case.
 template <bool kH, bool kS>
 IF_STRICT_FN HWY_NOINLINE void hsv_row(const uint8_t *IF_RESTRICT src, int64_t cs,
-                                       const int64_t *IF_RESTRICT coff,
-                                       const int *IF_RESTRICT chan, int c, int w, bool packed,
-                                       uint8_t *IF_RESTRICT tmp, uint8_t *IF_RESTRICT out,
-                                       size_t ostride)
+                                       const int64_t *IF_RESTRICT coff, const int *IF_RESTRICT chan,
+                                       int c, int w, bool packed, uint8_t *IF_RESTRICT tmp,
+                                       uint8_t *IF_RESTRICT out, size_t ostride)
 {
   IF_STRICT_BODY
   const size_t N = hn::Lanes(d8);
@@ -870,7 +869,7 @@ IF_STRICT_FN HWY_NOINLINE void hsv_row(const uint8_t *IF_RESTRICT src, int64_t c
 
 // The instantiations, here so that they are compiled under the options above.
 #define IMFEAT_HSV_ROW_ARGS                                                                        \
-  (const uint8_t *, int64_t, const int64_t *, const int *, int, int, bool, uint8_t *, uint8_t *,  \
+  (const uint8_t *, int64_t, const int64_t *, const int *, int, int, bool, uint8_t *, uint8_t *,   \
    size_t)
 template void hsv_row<true, true> IMFEAT_HSV_ROW_ARGS;
 template void hsv_row<true, false> IMFEAT_HSV_ROW_ARGS;
@@ -901,8 +900,7 @@ void convert_row(int conv, const uint8_t *IF_RESTRICT src, int64_t cs,
     else
       hsv_row<false, false>(src, cs, coff, chan, c, w, packed, tmp, out, ostride);
     return;
-  default:
-    throw std::invalid_argument("unknown colour conversion");
+  default: throw std::invalid_argument("unknown colour conversion");
   }
 }
 
@@ -1087,27 +1085,27 @@ IF_STRICT_FN HWY_NOINLINE void area_hpass(const AreaHPlan &p, const uint8_t *IF_
                                           float *IF_RESTRICT dst)
 {
   IF_STRICT_BODY
-  const hn::FixedTag<uint8_t, 16> d16;
+  const hn::FixedTag<uint8_t, 16> dwin;
   const hn::FixedTag<uint8_t, G> dg;
   const hn::Rebind<int32_t, decltype(dg)> di;
   const hn::Rebind<float, decltype(dg)> df;
-  for (int g = 0; g < p.groups; ++g)
+  for (size_t g = 0; g < (size_t)p.groups; ++g)
   {
-    const auto win = hn::LoadU(d16, src + p.w0[g]);
-    const uint8_t *IF_RESTRICT pat = p.pattern.data() + (size_t)g * p.slots * 16;
-    const float *IF_RESTRICT wgt = p.weight.data() + (size_t)g * p.slots * G;
-    auto tap = [&](int k)
+    const auto win = hn::LoadU(dwin, src + p.w0[g]);
+    const uint8_t *IF_RESTRICT pat = p.pattern.data() + g * p.slots * 16;
+    const float *IF_RESTRICT wgt = p.weight.data() + g * p.slots * G;
+    auto tap = [&](size_t k)
     {
-      const auto sel = hn::TableLookupBytesOr0(win, hn::LoadU(d16, pat + k * 16));
+      const auto sel = hn::TableLookupBytesOr0(win, hn::LoadU(dwin, pat + k * 16));
       const auto v = hn::ConvertTo(df, hn::PromoteTo(di, hn::ResizeBitCast(dg, sel)));
       return hn::Mul(v, hn::LoadU(df, wgt + k * G)); // rounded, like OpenCV's S * alpha
     };
     auto acc = tap(0); // 0 + the first product is the product
-    for (int k = 1; k < p.slots; ++k) acc = hn::Add(acc, tap(k));
-    if (g * G + G <= p.dsize)
+    for (size_t k = 1; k < (size_t)p.slots; ++k) acc = hn::Add(acc, tap(k));
+    if (g * G + G <= (size_t)p.dsize)
       hn::StoreU(acc, df, dst + g * G);
     else
-      hn::StoreN(acc, df, dst + g * G, (size_t)(p.dsize - g * G));
+      hn::StoreN(acc, df, dst + g * G, (size_t)p.dsize - g * G);
   }
 }
 
@@ -1221,23 +1219,23 @@ template <int G>
 HWY_NOINLINE void area_hsum(const AreaHPlan &p, const uint8_t *IF_RESTRICT src,
                             int32_t *IF_RESTRICT dst)
 {
-  const hn::FixedTag<uint8_t, 16> d16;
+  const hn::FixedTag<uint8_t, 16> dwin;
   const hn::FixedTag<uint8_t, G> dg;
   const hn::Rebind<int32_t, decltype(dg)> di;
-  for (int g = 0; g < p.groups; ++g)
+  for (size_t g = 0; g < (size_t)p.groups; ++g)
   {
-    const auto win = hn::LoadU(d16, src + p.w0[g]);
-    const uint8_t *IF_RESTRICT pat = p.pattern.data() + (size_t)g * p.slots * 16;
+    const auto win = hn::LoadU(dwin, src + p.w0[g]);
+    const uint8_t *IF_RESTRICT pat = p.pattern.data() + g * p.slots * 16;
     auto acc = hn::Zero(di);
-    for (int k = 0; k < p.slots; ++k)
+    for (size_t k = 0; k < (size_t)p.slots; ++k)
     {
-      const auto sel = hn::TableLookupBytesOr0(win, hn::LoadU(d16, pat + k * 16));
+      const auto sel = hn::TableLookupBytesOr0(win, hn::LoadU(dwin, pat + k * 16));
       acc = hn::Add(acc, hn::PromoteTo(di, hn::ResizeBitCast(dg, sel)));
     }
-    if (g * G + G <= p.dsize)
+    if (g * G + G <= (size_t)p.dsize)
       hn::StoreU(acc, di, dst + g * G);
     else
-      hn::StoreN(acc, di, dst + g * G, (size_t)(p.dsize - g * G));
+      hn::StoreN(acc, di, dst + g * G, (size_t)p.dsize - g * G);
   }
 }
 
@@ -1264,7 +1262,7 @@ void area_iadd(const int32_t *IF_RESTRICT a, int n, int32_t *IF_RESTRICT dst)
 // takes, and the plans. Read-only once set up, so every band shares it.
 struct AreaResizer
 {
-  enum Mode
+  enum Mode : uint8_t
   {
     COPY,    // the same size: cv::resize copies
     GENERIC, // float32 taps
@@ -1272,9 +1270,9 @@ struct AreaResizer
   };
   int sh = 0, sw = 0, dh = 0, dw = 0;
   Mode mode = COPY;
-  int ix = 1, iy = 1;    // INTEGER: the ratios
-  bool half_up = false;  // INTEGER: 2x2 on 1, 3 or 4 channels rounds half up
-  float iscale = 1.0f;   // INTEGER: 1 / (ix * iy), as OpenCV forms it
+  int ix = 1, iy = 1;   // INTEGER: the ratios
+  bool half_up = false; // INTEGER: 2x2 on 1, 3 or 4 channels rounds half up
+  float iscale = 1.0f;  // INTEGER: 1 / (ix * iy), as OpenCV forms it
   AreaHPlan hp;
   std::vector<int> yoff, ysi; // GENERIC: row dy's taps are ysi/ybeta[yoff[dy] .. yoff[dy+1])
   std::vector<float> ybeta;
@@ -1328,9 +1326,9 @@ struct AreaResizer
 struct AreaScratch
 {
   int planes = 0, plane_stride = 0, dw = 0;
-  std::vector<uint8_t> src;   // [plane][sw + 32]: the taps read a 16-byte window, so slack
-  std::vector<float> hrow[2]; // [plane][dw] resampled rows
-  int hsy[2] = {-1, -1};      // ... and which source rows they hold
+  std::vector<uint8_t> src;        // [plane][sw + 32]: the taps read a 16-byte window, so slack
+  std::vector<float> hrow[2];      // [plane][dw] resampled rows
+  int hsy[2] = {-1, -1};           // ... and which source rows they hold
   std::vector<int32_t> isum, irow; // INTEGER: the block sums in flight, and one row's
   std::vector<float> sum;          // GENERIC: the destination row in flight
 
@@ -1401,8 +1399,9 @@ void area_row(const AreaResizer &r, AreaScratch &s, const uint8_t *IF_RESTRICT i
               int64_t cs, const int64_t *IF_RESTRICT coff, bool packed, int dy,
               uint8_t *IF_RESTRICT out, size_t ostride)
 {
+  // the source row, one plane per wanted channel, in the scratch (gather_row's wide paths)
   auto load = [&](int sy)
-  { // the source row, one plane per wanted channel, in the scratch (gather_row's wide paths)
+  {
     gather_row(img + (int64_t)sy * rs, cs, coff, s.planes, r.sw, packed, nullptr, s.src.data(),
                (size_t)s.plane_stride);
   };
@@ -1449,7 +1448,6 @@ void area_row(const AreaResizer &r, AreaScratch &s, const uint8_t *IF_RESTRICT i
 void interleave_row(const uint8_t *IF_RESTRICT src, size_t sstride, int planes, int w,
                     uint8_t *IF_RESTRICT dst)
 {
-  const hn::ScalableTag<uint8_t> d8;
   const size_t N = hn::Lanes(d8);
   size_t x = 0;
   if (planes == 1)
@@ -1481,8 +1479,8 @@ void interleave_row(const uint8_t *IF_RESTRICT src, size_t sstride, int planes, 
 // kernel()'s 3x3 taps need no border logic: column -1 is lane -1 of the last phase, and
 // column w (reachable only when P == 1) is lane w.
 void deinterleave_row(const uint8_t *IF_RESTRICT img, int64_t rs, int64_t cs,
-                      const int64_t *IF_RESTRICT coff, const int *IF_RESTRICT chan, int conv,
-                      int c, int w, int y, bool packed, int64_t prs, int slots, int slot, int P,
+                      const int64_t *IF_RESTRICT coff, const int *IF_RESTRICT chan, int conv, int c,
+                      int w, int y, bool packed, int64_t prs, int slots, int slot, int P,
                       int64_t phs, uint8_t *IF_RESTRICT tmp, uint8_t *IF_RESTRICT dst)
 {
   const uint8_t *IF_RESTRICT src = img + (int64_t)y * rs;
@@ -1544,7 +1542,7 @@ struct Blocks
 
   void *take()
   {
-    std::lock_guard<std::mutex> lock(mu);
+    const std::lock_guard<std::mutex> lock(mu);
     ++out;
     if (!idle.empty())
     {
@@ -1563,7 +1561,7 @@ struct Blocks
     Blocks *b = *static_cast<Blocks **>(header(p));
     bool last;
     {
-      std::lock_guard<std::mutex> lock(b->mu);
+      const std::lock_guard<std::mutex> lock(b->mu);
       if (b->retired || b->idle.size() >= KEEP)
         drop(p);
       else
@@ -1576,7 +1574,7 @@ struct Blocks
   {
     bool last;
     {
-      std::lock_guard<std::mutex> lock(mu);
+      const std::lock_guard<std::mutex> lock(mu);
       for (void *p : idle) drop(p);
       idle.clear();
       retired = true;
@@ -1601,9 +1599,9 @@ struct Level
 class FeatureComputer
 {
   int h_ = 0, w_ = 0, c_ = 1, sy_ = 1, sx_ = 1; // the thumbnail's rows and columns when resize_
-  bool interleaved_ = false; // source rows are already the (H,W,C) layout we want
-  int conv_ = CONV_NONE;     // colour conversion fused into the row gather (see Convert)
-  std::vector<int> chan_;    // the selected channels, of the converted image when conv_
+  bool interleaved_ = false;  // source rows are already the (H,W,C) layout we want
+  int conv_ = CONV_NONE;      // colour conversion fused into the row gather (see Convert)
+  std::vector<int> chan_;     // the selected channels, of the converted image when conv_
   std::vector<int64_t> coff_; // per-selected-channel (per-source-channel when conv_) offset
                               // within a pixel
   // The thumbnail resize fused into the row gather (see AreaResizer): the frame is (sh_, sw_)
@@ -1620,13 +1618,13 @@ class FeatureComputer
   int64_t thumb_rs_ = 0;
   std::vector<Level> levels_;
   int16_t ray_[HB - 1][2] = {}; // bin-boundary ray j as (cx, -cy): t = cx*qy - cy*qx in one pmaddwd
-  int hog_card_[HB] = {};    // 1 for the axis-aligned (cardinal) orientation bins
+  int hog_card_[HB] = {};       // 1 for the axis-aligned (cardinal) orientation bins
   std::vector<uint8_t> bvalid_; // per lag: 255 where both +/-d column taps are in range
   size_t bvalid_stride_ = 0;
-  int phases_ = 1;           // column phases the planes are split into (1 = not split)
-  int slots_ = 9;            // rolling plane window rows (see the window comment)
-  int bard_lagmask_ = 0;     // bit j set iff bard lag j fits the image (see bard())
-  int group_ = 1;            // channels a block carries together: c_ up to GMAX, else 1
+  int phases_ = 1;       // column phases the planes are split into (1 = not split)
+  int slots_ = 9;        // rolling plane window rows (see the window comment)
+  int bard_lagmask_ = 0; // bit j set iff bard lag j fits the image (see bard())
+  int group_ = 1;        // channels a block carries together: c_ up to GMAX, else 1
 
   // How kernel() blocks map to cells, in LANES of phase 0 (a cell is cw_ of them, every
   // step_-th one sampled). A block either spans whole cells (multi_: cw_ divides it) or starts
@@ -1647,19 +1645,19 @@ class FeatureComputer
   {
     std::vector<Acc> acc;              // [channel] block accumulators
     std::vector<const uint8_t *> rows; // [sampled row][channel][KPTR] kernel() lane bases
-    std::vector<int> rslot; // the window slot of each sampled row of the cell row in hand
-    int fslot = 0;          // ... of the next row to fill
-    std::vector<int> vok;              // [sampled row] bard lags whose rows are inside the image
-    std::vector<int> rws;              // the cell row's sampled rows
-    std::vector<int64_t> cells;  // [channel][K_N][cell]: the cell row's sums
-    std::vector<int64_t> hsum;   // private hash partial; bands >0 only
+    std::vector<int> rslot;         // the window slot of each sampled row of the cell row in hand
+    int fslot = 0;                  // ... of the next row to fill
+    std::vector<int> vok;           // [sampled row] bard lags whose rows are inside the image
+    std::vector<int> rws;           // the cell row's sampled rows
+    std::vector<int64_t> cells;     // [channel][K_N][cell]: the cell row's sums
+    std::vector<int64_t> hsum;      // private hash partial; bands >0 only
     std::vector<int64_t> row, graw; // features(): the cell row in flight, and the band's share
                                     // of the global sums
     std::vector<int64_t>
         up;           // features(): the level-1 cell row in flight, as kernel sums like `cells`
     int64_t up_n = 0; // ... and its sample count per cell so far
-    std::vector<int64_t> held; // ... and its first rows, when their parents belong to the
-    std::vector<int> held_cy;  // band above: rolled up after the join
+    std::vector<int64_t> held;   // ... and its first rows, when their parents belong to the
+    std::vector<int> held_cy;    // band above: rolled up after the join
     std::vector<uint8_t> planes; // padded de-interleaved planes: the rolling window
     std::vector<uint8_t> lin;    // one row, channels contiguous, then the phase split's scratch
     AreaScratch area;            // resize_: the resize's working set, and the band's rows of
@@ -1681,7 +1679,7 @@ class FeatureComputer
     int r0;       // the band's first sampled image row
     int cy0, cy1; // the finest cell rows they land in, [cy0, cy1)
   };
-  enum Job
+  enum Job : uint8_t
   {
     JOB_ACC,
     JOB_DERIVE
@@ -1701,15 +1699,15 @@ class FeatureComputer
   bool quit_ = false;
 
   // Perceptual-hash state (see HN/HS). Filled in the accumulate pass, derived at the end.
-  std::vector<int64_t> hsum_;             // HN*HN*c_ : Sum(v) per hash cell per channel
-  std::vector<int64_t> hcnt_;             // HN*HN : sampled-pixel count per cell (fixed per config)
+  std::vector<int64_t> hsum_;        // HN*HN*c_ : Sum(v) per hash cell per channel
+  std::vector<int64_t> hcnt_;        // HN*HN : sampled-pixel count per cell (fixed per config)
   std::vector<double> hcntd_, hden_; // ... as doubles, and with 1 for 0: what the means divide by
-  std::vector<int> hrow_, hcol_;          // row -> hash row (h_), col -> hash col (w_)
+  std::vector<int> hrow_, hcol_;     // row -> hash row (h_), col -> hash col (w_)
   std::vector<int> hrbeg_, hrend_, hrhc_; // per-run column range [beg,end) and its hash col
   std::vector<double> dctb_;              // HS*HN : DCT-II basis rows (scipy type-2, norm=None)
   uint64_t *hash_ = nullptr;   // (NHASH, c_) in the output block: aHash, wHash, pHash rows
   std::vector<size_t> hshape_; // {NHASH, c_}
-  bool hfast_ = false;                          // finest grid tiles HN -> hashes reuse its S1
+  bool hfast_ = false;         // finest grid tiles HN -> hashes reuse its S1
 
   std::vector<int64_t> graw_;
   float *gfeat_ = nullptr; // the global outputs, in the output block
@@ -1795,7 +1793,8 @@ class FeatureComputer
         for (int t = 0; t < NLAWS; ++t) S[LAWS0 + t] = sum(K_LAWS + t);
         // the moments, from the kernel's power sums about KBIAS: a block's cells hold at most
         // KROWS rows of half a block of columns, far below the 2^20 samples that stay exact
-        V a[NMOM] = {sum_signed(K_T1), sum(K_T2), sum_signed(K_T3), sum(K_T4)}, t[NMOM], q;
+        const V a[NMOM] = {sum_signed(K_T1), sum(K_T2), sum_signed(K_T3), sum(K_T4)};
+        V t[NMOM], q;
         moments_recentre(a, (double)n, invn, t, q);
         moments_tail(t, hn::Add(q, hn::Set(dd, (double)KBIAS)), hn::Set(dd, invn), M);
         store_moments(M, std::min<size_t>(LD, cells - i), (size_t)c_ * NMOM,
@@ -1956,7 +1955,7 @@ class FeatureComputer
     // every channel in one pass of the blocks, and blocks of enough cells to fill derive's vectors
     const bool derives = stream_ && local && group_ == c_ && block_cells_ >= (size_t)LD;
     const size_t nxs = local ? block_cells_ | 1 : cells_stride(); // never above cells_stride()
-    const size_t pstride = (size_t)slots_ * (size_t)s.row_stride, lanes = (size_t)lanes_;
+    const size_t pstride = (size_t)slots_ * (size_t)s.row_stride, lanes = lanes_;
     V16 rays[HB - 1];
     for (int j = 0; j < HB - 1; ++j)
       rays[j] = hn::InterleaveLower(d16, hn::Set(d16, ray_[j][0]), hn::Set(d16, ray_[j][1]));
@@ -2057,7 +2056,7 @@ class FeatureComputer
                 fold32<false>(hn::BitCast(d32, hn::PromoteUpperTo(du32, sums)), g / 2, adds[2],
                               cb + t * nxs + at[2]);
               }
-              for (int h = 0; h < 2; ++h)
+              for (size_t h = 0; h < 2; ++h)
               {
                 const bool ad = adds[2 * h];
                 int64_t *IF_RESTRICT ch = cb + at[2 * h];
@@ -2098,10 +2097,10 @@ class FeatureComputer
   // them and in n, so the conversion waits for flush_up()); the first child row of a parent
   // stores. The hash grid takes its S1.
   void roll_block(Scratch &s, const int64_t *IF_RESTRICT sums, size_t nxs, size_t cy, size_t e,
-                  size_t cells, int64_t n, int64_t *IF_RESTRICT hs)
+                  size_t cells, int64_t n, int64_t *IF_RESTRICT hs) const
   {
     const Level &fine = levels_[0];
-    Level &lv = levels_[1];
+    const Level &lv = levels_[1];
     // fx, fy and the hash block are powers of two: every index below is a shift or a mask
     auto log2 = [](size_t v)
     {
@@ -2123,9 +2122,9 @@ class FeatureComputer
           int64_t &up = s.up[r * nxu + ((e + i) >> fxl)];
           up = first(e + i) ? sums[r * nxs + i] : up + sums[r * nxs + i];
         }
-    const size_t up0 = (cy >> log2((size_t)lv.fy)) * lv.nx, bxl = log2((size_t)fine.nx / HN);
     if (hfast_) // the finest grid tiles the hash grid: block-sum its S1 = T1 + KBIAS * n
     {
+      const size_t bxl = log2((size_t)fine.nx / HN);
       int64_t *IF_RESTRICT hrow = hs + (cy >> log2((size_t)fine.ny / HN)) * HN * c_;
       for (size_t i = 0; i < cells; ++i)
         for (int k = 0; k < c_; ++k)
@@ -2292,9 +2291,9 @@ class FeatureComputer
         for (; s.filled <= std::min(h_ - 1, rows.back() + BARD_MAXLAG); ++s.filled)
         {
           if (resize_) // the thumbnail row the band made, read as a planar row
-            deinterleave_row(s.line.data() + (size_t)(s.filled - s.line0) * need_.size() * w_, 0,
-                             1, coff_rz_.data(), chan_.data(), conv_, c_, w_, 0, false,
-                             s.row_stride, slots_, s.fslot, phases_, s.phase_stride, s.lin.data(),
+            deinterleave_row(s.line.data() + (size_t)(s.filled - s.line0) * need_.size() * w_, 0, 1,
+                             coff_rz_.data(), chan_.data(), conv_, c_, w_, 0, false, s.row_stride,
+                             slots_, s.fslot, phases_, s.phase_stride, s.lin.data(),
                              s.planes.data());
           else
             deinterleave_row(img, rs, cs, coff_.data(), chan_.data(), conv_, c_, w_, s.filled,
@@ -2384,8 +2383,7 @@ class FeatureComputer
     {
       std::unique_lock<std::mutex> lk(mu_);
       cv_go_.wait(lk, [&] { return quit_ || epoch_ != seen; });
-      if (quit_)
-        return;
+      if (quit_) return;
       seen = epoch_;
       const Job j = job_;
       lk.unlock();
@@ -2394,8 +2392,7 @@ class FeatureComputer
       else
         derive_cells(bi);
       lk.lock();
-      if (--pending_ == 0)
-        cv_done_.notify_one();
+      if (--pending_ == 0) cv_done_.notify_one();
     }
   }
 
@@ -2405,7 +2402,8 @@ class FeatureComputer
   void run_job(Job j)
   {
     const int nb = (int)bands_.size();
-    auto one = [&](int bi) {
+    auto one = [&](int bi)
+    {
       if (j == JOB_ACC)
         accumulate_band(task_img_, task_rs_, task_cs_, bi);
       else
@@ -2413,12 +2411,11 @@ class FeatureComputer
     };
     if (workers_.empty())
     {
-      for (int bi = 0; bi < nb; ++bi)
-        one(bi);
+      for (int bi = 0; bi < nb; ++bi) one(bi);
       return;
     }
     {
-      std::lock_guard<std::mutex> lk(mu_);
+      const std::lock_guard<std::mutex> lk(mu_);
       job_ = j;
       pending_ = nb - 1;
       ++epoch_;
@@ -2431,15 +2428,13 @@ class FeatureComputer
 
   void pool_stop()
   {
-    if (workers_.empty())
-      return;
+    if (workers_.empty()) return;
     {
-      std::lock_guard<std::mutex> lk(mu_);
+      const std::lock_guard<std::mutex> lk(mu_);
       quit_ = true;
     }
     cv_go_.notify_all();
-    for (std::thread &t : workers_)
-      t.join();
+    for (std::thread &t : workers_) t.join();
     workers_.clear();
     quit_ = false;
   }
@@ -2494,8 +2489,7 @@ class FeatureComputer
     }
     else // the conversion reads all three source channels whatever is selected
     {
-      for (int k = 0; k < 3; ++k)
-        coff_[k] = (int64_t)k * chs;
+      for (int k = 0; k < 3; ++k) coff_[k] = (int64_t)k * chs;
       interleaved_ = chs == 1 && cs == 3;
     }
     task_img_ = img;
@@ -2505,8 +2499,7 @@ class FeatureComputer
 
     if (hashing) // fold the bands' private hash partials; int64 sums, so still exact
       for (size_t b = 1; b < scr_.size(); ++b)
-        for (size_t t = 0; t < hsum_.size(); ++t)
-          hsum_[t] += scr_[b].hsum[t];
+        for (size_t t = 0; t < hsum_.size(); ++t) hsum_[t] += scr_[b].hsum[t];
 
     const int stripe = c_ * NSUM;
     for (const Scratch &sc : scr_) // the rows whose parents another band had to write first
@@ -2524,7 +2517,7 @@ class FeatureComputer
           for (int ky = 0, first = 1; ky < lv.fy; ++ky)
             for (int kx = 0; kx < lv.fx; ++kx, first = 0)
             {
-              const size_t src = (size_t)(i * lv.fy + ky) * p.nx + j * lv.fx + kx;
+              const size_t src = (size_t)(i * lv.fy + ky) * p.nx + (size_t)(j * lv.fx + kx);
               const int64_t *IF_RESTRICT sc = p.buf.data() + src * stripe;
               if (first)
               {
@@ -2547,8 +2540,7 @@ class FeatureComputer
     for (size_t cell = 0, nc = (size_t)last.ny * last.nx; cell < nc; ++cell)
     {
       const int64_t *IF_RESTRICT s = last.buf.data() + cell * stripe;
-      for (int t = 0; t < stripe; ++t)
-        graw_[t] += s[t];
+      for (int t = 0; t < stripe; ++t) graw_[t] += s[t];
     }
   }
 
@@ -2666,11 +2658,10 @@ class FeatureComputer
     for (int k = 0; k < c_; ++k)
     {
       // the same division per cell, a vector of cells at a time (an empty cell divides by 1)
-      const size_t LH = hn::Lanes(DDV());
-      for (int i = 0; i < NHC; i += (int)LH)
+      for (int i = 0; i < NHC; i += LD)
       {
         double num[LD];
-        for (size_t l = 0; l < LH; ++l) num[l] = (double)hsum_[(size_t)(i + l) * c_ + k];
+        for (size_t l = 0; l < LD; ++l) num[l] = (double)hsum_[(size_t)(i + l) * c_ + k];
         const auto den = hn::LoadU(DDV(), hden_.data() + i);
         const auto quo = hn::Div(gather(num), den);
         hn::StoreU(
@@ -2694,13 +2685,12 @@ class FeatureComputer
           m8[bi * HS + bj] = n > 0 ? (double)s / (double)n : 0.0;
         }
       double avg = 0.0;
-      for (int i = 0; i < HS * HS; ++i)
-        avg += m8[i];
-      avg /= HS * HS;
-      double srt[HS * HS];
-      std::copy(m8, m8 + HS * HS, srt);
-      std::sort(srt, srt + HS * HS);
-      const double med = 0.5 * (srt[HS * HS / 2 - 1] + srt[HS * HS / 2]);
+      for (int i = 0; i < HS * HS; ++i) avg += m8[i];
+      avg /= HS2;
+      double srt[HS2];
+      std::copy(m8, m8 + HS2, srt);
+      std::sort(srt, srt + HS2);
+      const double med = 0.5 * (srt[HS2 / 2 - 1] + srt[HS2 / 2]);
       uint64_t a = 0, w = 0;
       for (int i = 0; i < HS * HS; ++i)
       {
@@ -2728,17 +2718,15 @@ class FeatureComputer
         for (int vv = 0; vv < HS; ++vv)
         {
           double acc = 0.0;
-          for (int n = 0; n < HN; ++n)
-            acc += dctb_[(size_t)vv * HN + n] * d0[(size_t)u * HN + n];
+          for (int n = 0; n < HN; ++n) acc += dctb_[(size_t)vv * HN + n] * d0[(size_t)u * HN + n];
           dl[u * HS + vv] = acc;
         }
-      double psrt[HS * HS];
-      std::copy(dl, dl + HS * HS, psrt);
-      std::sort(psrt, psrt + HS * HS);
-      const double pmed = 0.5 * (psrt[HS * HS / 2 - 1] + psrt[HS * HS / 2]);
+      double psrt[HS2];
+      std::copy(dl, dl + HS2, psrt);
+      std::sort(psrt, psrt + HS2);
+      const double pmed = 0.5 * (psrt[HS2 / 2 - 1] + psrt[HS2 / 2]);
       uint64_t p = 0;
-      for (int i = 0; i < HS * HS; ++i)
-        p |= (uint64_t)(dl[i] > pmed) << (63 - i);
+      for (int i = 0; i < HS * HS; ++i) p |= (uint64_t)(dl[i] > pmed) << (63 - i);
       hash_[2 * (size_t)c_ + k] = p;
     }
   }
@@ -2768,7 +2756,7 @@ class FeatureComputer
   }
   void summary_fold(const Level &L, size_t cell, size_t cells)
   {
-    for (int k = 0; k < c_; ++k)
+    for (size_t k = 0; k < (size_t)c_; ++k)
     {
       fold_summary(L.feat + (cell * c_ + k) * NMAP, (size_t)c_ * NMAP, cells, NF, &sfmn_[k * NF],
                    &sfmx_[k * NF], &sfsm_[k * NF], &sfsq_[k * NF]);
@@ -2779,11 +2767,11 @@ class FeatureComputer
   void summary_write(const Level &L)
   {
     const size_t nc = (size_t)L.ny * L.nx;
-    for (int k = 0; k < c_; ++k)
+    for (size_t k = 0; k < (size_t)c_; ++k)
     {
       const size_t stride = (size_t)c_ * NST; // feature axis first, as FEATURE_NAMES runs
       write_summary(NF, nc, &sfmn_[k * NF], &sfmx_[k * NF], &sfsm_[k * NF], &sfsq_[k * NF],
-                    L.sum + (size_t)k * NST, stride);
+                    L.sum + k * NST, stride);
       write_summary(NMOM, nc, &smmn_[k * NMOM], &smmx_[k * NMOM], &smsm_[k * NMOM],
                     &smsq_[k * NMOM], L.sum + (NF * (size_t)c_ + k) * NST, stride);
     }
@@ -2844,9 +2832,9 @@ class FeatureComputer
         summary_write(L);
       }
     const double ginvn = graw_[CNT] > 0 ? 1.0 / (double)graw_[CNT] : 0.0;
-    double ginvns[GMAX * 2];
-    std::vector<double> many((size_t)c_ > GMAX * 2 ? (size_t)c_ : 0, ginvn);
-    std::fill(ginvns, ginvns + GMAX * 2, ginvn);
+    double ginvns[2 * GMAX];
+    std::fill_n(ginvns, std::size(ginvns), ginvn);
+    std::vector<double> many((size_t)c_ > std::size(ginvns) ? (size_t)c_ : 0, ginvn);
     moments_records(graw_.data(), many.empty() ? ginvns : many.data(), (size_t)c_, gmom_);
     derive_records(graw_.data(), gmom_, many.empty() ? ginvns : many.data(), (size_t)c_, gfeat_);
   }
@@ -2855,9 +2843,8 @@ public:
   FeatureComputer() = default;
 
   void set_config(const std::vector<int64_t> &dims, const std::vector<int> &channels,
-                  const std::vector<std::vector<int>> &grids,
-                  const std::vector<int64_t> &stride, int threads, int convert,
-                  const std::vector<int64_t> &thumb)
+                  const std::vector<std::vector<int>> &grids, const std::vector<int64_t> &stride,
+                  int threads, int convert, const std::vector<int64_t> &thumb)
   {
     pool_stop();
     size_t block = 0; // the output block: every features() array at a 64-byte-aligned offset
@@ -2877,8 +2864,7 @@ public:
       sh_ = h_, sw_ = w_;
       csrc_ = (int)dims[2];
       h_ = (int)thumb[0], w_ = (int)thumb[1];
-      if (csrc_ > 4)
-        throw std::invalid_argument("the thumbnail resize takes up to 4 channels");
+      if (csrc_ > 4) throw std::invalid_argument("the thumbnail resize takes up to 4 channels");
       area_.setup(sh_, sw_, h_, w_, csrc_);
       need_.clear();
       coff_src_.assign((size_t)csrc_, 0);
@@ -3026,16 +3012,13 @@ public:
 
     // --- perceptual hashes: HN x HN value-sum grid, filled in the same pass ---
     hrow_.resize(h_);
-    for (int r = 0; r < h_; ++r)
-      hrow_[r] = (int)((int64_t)r * HN / h_);
+    for (int r = 0; r < h_; ++r) hrow_[r] = (int)((int64_t)r * HN / h_);
     hcol_.resize(w_);
-    for (int c = 0; c < w_; ++c)
-      hcol_[c] = (int)((int64_t)c * HN / w_);
+    for (int c = 0; c < w_; ++c) hcol_[c] = (int)((int64_t)c * HN / w_);
     // Per-cell sampled-pixel counts + the hash-column run structure. Columns are
     // sampled at sx_ (restarted per finest cell) and visited in increasing order.
     std::vector<int64_t> rcnt(HN, 0), ccnt(HN, 0);
-    for (int r = 0; r < h_; r += sy_)
-      rcnt[hrow_[r]]++;
+    for (int r = 0; r < h_; r += sy_) rcnt[hrow_[r]]++;
     // Group sampled columns into runs of one hash column within one finest cell.
     hrbeg_.clear();
     hrend_.clear();
@@ -3048,8 +3031,7 @@ public:
         for (int c = e * cw; c < e1;)
         {
           const int hc = hcol_[c], b = c;
-          while (c < e1 && hcol_[c] == hc)
-            ccnt[hc]++, c += sx_;
+          while (c < e1 && hcol_[c] == hc) ccnt[hc]++, c += sx_;
           hrbeg_.push_back(b / phases_); // runs are read from phase 0, so in its lanes
           hrend_.push_back(c / phases_);
           hrhc_.push_back(hc);
@@ -3058,8 +3040,7 @@ public:
     }
     hcnt_.assign((size_t)HN * HN, 0);
     for (int i = 0; i < HN; ++i)
-      for (int j = 0; j < HN; ++j)
-        hcnt_[(size_t)i * HN + j] = rcnt[i] * ccnt[j];
+      for (int j = 0; j < HN; ++j) hcnt_[(size_t)i * HN + j] = rcnt[i] * ccnt[j];
     hcntd_.assign(hcnt_.size() + LD, 0.0); // (slack for a last vector)
     hden_.assign(hcnt_.size() + LD, 1.0);
     for (size_t i = 0; i < hcnt_.size(); ++i)
@@ -3116,8 +3097,7 @@ public:
       if (levels_.size() > 1) s.up.assign((size_t)c_ * K_N * ((size_t)levels_[1].nx + N), 0);
       s.graw.assign((size_t)c_ * NSUM, 0);
     }
-    for (size_t b = 1; b < bands_.size(); ++b)
-      workers_.emplace_back([this, b] { worker((int)b); });
+    for (size_t b = 1; b < bands_.size(); ++b) workers_.emplace_back([this, b] { worker((int)b); });
     if (blocks_) blocks_->retire(); // arrays of the old configuration keep their blocks
     blocks_ = new Blocks;
     blocks_->bytes = block;
@@ -3140,8 +3120,8 @@ public:
     for (Level &L : levels_)
       out.append(nb::ndarray<nb::numpy, int64_t>(L.buf.data(), L.rshape.size(), L.rshape.data(),
                                                  nb::handle()));
-    out.append(nb::ndarray<nb::numpy, int64_t>(graw_.data(), graw_shape_.size(),
-                                               graw_shape_.data(), nb::handle()));
+    out.append(nb::ndarray<nb::numpy, int64_t>(graw_.data(), graw_shape_.size(), graw_shape_.data(),
+                                               nb::handle()));
     return out;
   }
 
@@ -3173,7 +3153,7 @@ public:
       return nb::ndarray<nb::numpy, T>(data, shape.size(), shape.data(), owner);
     };
     nb::list feat, mom, sums;
-    for (Level &L : levels_)
+    for (const Level &L : levels_)
     {
       feat.append(view(L.feat, L.fshape));
       mom.append(view(L.mom, L.mshape));
@@ -3194,7 +3174,7 @@ using Arr = nb::ndarray<nb::numpy, const uint8_t, nb::device::cpu>;
 
 // The conversion on its own: a new (H, W, 3) image from an (H, W, 3) one in any layout. The
 // same row kernel the pass fuses, so this is also how the tests pin that kernel to OpenCV.
-nb::ndarray<nb::numpy, uint8_t> convert_image(Arr a, int conv)
+nb::ndarray<nb::numpy, uint8_t> convert_image(const Arr &a, int conv)
 {
   if (a.ndim() != 3 || a.shape(2) != 3)
     throw std::invalid_argument("convert: expected an (H, W, 3) uint8 image");
@@ -3239,7 +3219,7 @@ nb::ndarray<nb::numpy, uint8_t> resize_image(Arr a, int dh, int dw, int threads)
   AreaResizer r;
   r.setup(sh, sw, dh, dw, C);
   const int64_t rs = a.stride(0), cs = a.stride(1), chs = a.ndim() == 3 ? a.stride(2) : 0;
-  int64_t coff[4] = {0, chs, 2 * chs, 3 * chs};
+  const int64_t coff[4] = {0, chs, 2 * chs, 3 * chs};
   const bool packed = a.ndim() == 3 && chs == 1 && cs == C;
   auto *buf = new uint8_t[(size_t)dh * dw * C];
   const nb::capsule owner(buf, [](void *p) noexcept { delete[] static_cast<uint8_t *>(p); });
@@ -3272,8 +3252,8 @@ nb::ndarray<nb::numpy, uint8_t> resize_image(Arr a, int dh, int dw, int threads)
 NB_MODULE(imfeat_core, m)
 {
   m.doc() = "imfeat internal C++ module. Public API: imfeat.FeatureComputer.";
-  m.attr("HB") = HB;     // HOG orientation-bin count; Python derives its bin labels from this
-  m.attr("LBPB") = LBPB; // LBP^riu2 bin count (9 uniform + 1 non-uniform)
+  m.attr("HB") = HB;           // HOG orientation-bin count; Python derives its bin labels from this
+  m.attr("LBPB") = LBPB;       // LBP^riu2 bin count (9 uniform + 1 non-uniform)
   m.attr("BARD_NL") = BARD_NL; // bar-detector lag count (sizes the spectrum block)
   m.attr("CONVERT_NONE") = (int)CONV_NONE; // colour conversions fused into the pass (Convert)
   m.attr("CONVERT_BGR2HSV") = (int)CONV_BGR2HSV;
@@ -3292,16 +3272,18 @@ NB_MODULE(imfeat_core, m)
       .def("threads", &FeatureComputer::threads)
       .def(
           "raw",
-          [](FeatureComputer &self, Arr a, std::optional<ThumbArr> thumb) {
+          [](FeatureComputer &self, const Arr &a, std::optional<ThumbArr> thumb)
+          {
             return self.raw(a.data(), a.stride(0), a.stride(1), a.ndim() > 2 ? a.stride(2) : 0,
                             thumb_ptr(thumb));
           },
           nb::arg("arr"), nb::arg("thumb_out").none() = nb::none())
       .def(
           "features",
-          [](FeatureComputer &self, Arr a, std::optional<ThumbArr> thumb) {
-            return self.features(a.data(), a.stride(0), a.stride(1),
-                                 a.ndim() > 2 ? a.stride(2) : 0, thumb_ptr(thumb));
+          [](FeatureComputer &self, const Arr &a, std::optional<ThumbArr> thumb)
+          {
+            return self.features(a.data(), a.stride(0), a.stride(1), a.ndim() > 2 ? a.stride(2) : 0,
+                                 thumb_ptr(thumb));
           },
           nb::arg("arr"), nb::arg("thumb_out").none() = nb::none());
 }

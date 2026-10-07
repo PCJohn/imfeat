@@ -47,7 +47,7 @@ shifted right -- a pixel's feature vector at every scale is an O(1) lookup.
 from __future__ import annotations
 
 from collections.abc import Sequence
-from typing import NamedTuple, Union, cast
+from typing import Any, NamedTuple, Union, cast, overload
 
 import numpy as np
 
@@ -78,8 +78,9 @@ __version__ = "0.1.0"
 # Grid spec accepted by FeatureComputer: k, (ky, kx), or a list of either.
 GridSpec = Union[int, Sequence[int], Sequence[Sequence[int]]]
 # Thumbnail spec accepted by FeatureComputer and resize_area: (rows, cols), one int for a
-# square, or the name of a policy (THUMB_POLICIES) that derives the size from the frame's.
-ThumbSpec = Union[int, Sequence[int], str]
+# square (numpy integers too), or the name of a policy (THUMB_POLICIES) that derives the size
+# from the frame's.
+ThumbSpec = Union[int, "np.integer[Any]", Sequence[int], str]
 
 #: Colour spaces of 3-channel images, as `input_space` / `feature_space` name them.
 COLOR_SPACES = ("bgr", "hsv")
@@ -132,7 +133,7 @@ HOG_FEATURES = tuple(f"hog_{b}" for b in range(_core.HB))
 COUNT_FEATURES = ("local_max", "local_min")
 # Rotation-invariant uniform LBP ("lbp_i"), L1-normalised. Bins 0..8 are the popcounts
 # of the uniform codes (<=2 circular 0/1 transitions); bin 9 collects everything else.
-LBP_FEATURES = tuple(f"lbp_{b}" for b in range(_core.LBPB - 1)) + ("lbp_nonuniform",)
+LBP_FEATURES = (*(f"lbp_{b}" for b in range(_core.LBPB - 1)), "lbp_nonuniform")
 # Model-ready nonlinear descriptors ("desc_i"), all derived in the same pass from the sums
 # above (no extra accumulators). std_skew/excess_kurt are the dimensionless (illumination-
 # invariant) shape of the intensity distribution; edge_sharpness/detail are structure-tensor
@@ -158,9 +159,11 @@ DESCRIPTOR_FEATURES = (
 # profile's coefficient of variation (one dominant width vs texture); bal is dark/light
 # polarity in [-1, 1]. All but cover are ratios, hence invariant to stride and cell size.
 BARD_FEATURES = (
-    ("bard_cover",)
-    + tuple(f"bard_spec{j + 1}" for j in range(_core.BARD_NL))
-    + ("bard_peak", "bard_peaked", "bard_bal")
+    "bard_cover",
+    *(f"bard_spec{j + 1}" for j in range(_core.BARD_NL)),
+    "bard_peak",
+    "bard_peaked",
+    "bard_bal",
 )
 
 # Second-order texture from the 3x3 neighbourhood Sobel already reads. lap_var is the variance
@@ -305,6 +308,12 @@ def _resolve_thumb(thumb: ThumbSpec | None, h: int, w: int) -> tuple[int, int] |
     return rows, cols
 
 
+@overload
+def thumb_size(
+    shape: Sequence[int], thumb: ThumbSpec, channel_axis: int = -1
+) -> tuple[int, int]: ...
+@overload
+def thumb_size(shape: Sequence[int], thumb: None, channel_axis: int = -1) -> None: ...
 def thumb_size(
     shape: Sequence[int], thumb: ThumbSpec | None, channel_axis: int = -1
 ) -> tuple[int, int] | None:
@@ -489,7 +498,9 @@ class FeatureComputer:
             out = None
         return view, out
 
-    def _cut(self, a: np.ndarray, widths: Sequence[tuple[str, int]], i: str) -> dict:
+    def _cut(
+        self, a: np.ndarray, widths: Sequence[tuple[str, int]], i: str
+    ) -> dict[str, np.ndarray]:
         """Slice one wide (..., C, W) array into its feature groups, dropping the
         size-1 channel axis for single-channel (2-D) input.
 
