@@ -41,8 +41,8 @@ def _keys(n_levels: int) -> list[str]:
 
 
 def groups(fc: imfeat.FeatureComputer, img: np.ndarray) -> dict[str, np.ndarray]:
-    """Old-style dict: struct_i, hog_i, cnt_i, lbp_i, desc_i, bard_i, tex_i, mom_i, xchan_i,
-    *_summary_i, and the three hashes."""
+    """Old-style dict: struct_i, hog_i, cnt_i, lbp_i, desc_i, bard_i, tex_i, mom_i,
+    *_summary_i, the three hashes and the profiles."""
     p = fc.features(img)
     keys, out, two_d = _keys(len(p.maps)), {}, img.ndim == 2
     for i, m, mo in zip(keys, p.maps, p.moments):
@@ -52,8 +52,6 @@ def groups(fc: imfeat.FeatureComputer, img: np.ndarray) -> dict[str, np.ndarray]
             v = mo if name == "mom" else g[..., o : o + n]  # float64 moments
             out[f"{name}_{i}"] = v[..., 0, :] if two_d else v
             o += n
-    for i, x in zip(keys, p.cross):
-        out[f"xchan_{i}"] = x
     for i, s in zip(keys[:-1], p.summary):
         o = 0
         for name, n in _W:

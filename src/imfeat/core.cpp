@@ -60,7 +60,6 @@ namespace nb = nanobind;
 // Per finest cell per channel we keep NSUM int64 additive sums:
 //   [0..3] Sxx Syy Sxy count | [4..12] HOG(9) | [13,14] local-max/min counts
 //   | [15..18] S1 S2 S3 S4 (raw power sums of the pixel value) | [19..28] LBP^riu2(10).
-// Alongside, one int64 per channel PAIR: Sum(v_i * v_j), the only cross-channel sum.
 // Every sum is additive, so pyramid levels and the global reduction are exact
 // sums of the finest cells -- the image is read exactly once. Central moments and
 // the tensor eigen-features are nonlinear, so they are derived at the end.
@@ -148,10 +147,10 @@ constexpr int BARDF0 = NF_S + HB + 2 + LBPB + NDER; // 34: start of the bard blo
 constexpr int TEXF0 = BARDF0 + BARD_NF; // 41
 constexpr int NTEX = 2 + NLAWS + 1;
 constexpr int NF = TEXF0 + NTEX; // 50 derived float32 per cell per channel
-// Cross-channel products Sum(v_i * v_j) over the C*(C-1)/2 unordered pairs. Off for
-// C=1 (no pairs) and for C > XMAX (hyperspectral: the pair count would explode).
-constexpr int XMAX = 8;
-constexpr int NXF = 2; // derived per pair: [cov, corr]
+// Channels kernel() carries through a block together, so that a block's cells are complete
+// for every channel at once and can be derived on the spot (cell_row). More channels than
+// this (hyperspectral) go one at a time, so the accumulators stay in L1 however many there are.
+constexpr int GMAX = 8;
 // Per-level cross-cell summary of every derived feature, folded into the derive
 // loop for free (same traversal, no extra pass). For each (channel, feature) we
 // reduce that feature's value over the level's cells into NST stats, in this
@@ -255,12 +254,6 @@ HWY_INLINE void add(V &acc, V v)
   acc = ROW0 ? v : hn::Add(acc, v);
 }
 
-template <class V>
-HWY_INLINE void add_to(bool adds, V &acc, V v)
-{
-  acc = adds ? hn::Add(acc, v) : v;
-}
-
 template <bool ROW0>
 HWY_INLINE void bard(const uint8_t *const *t, size_t x, V8 c, const V8 *IF_RESTRICT near, V8 mesh,
                      const uint8_t *IF_RESTRICT valid, size_t vstride, int hok, int vok, Acc &A)
@@ -309,12 +302,12 @@ HWY_INLINE void bard(const uint8_t *const *t, size_t x, V8 c, const V8 *IF_RESTR
 // rows above/centre/below by columns left/mid/right, then bard()'s taps. Replicate padding is
 // already in the planes, so there is no border logic here. MASKED zeroes the off-mesh lanes
 // (mask: 255 on the sampling mesh) before anything pairs up columns; the uint8 counts are per
-// column, so they are masked once, at the fold. `w` returns the centred pixels for the
-// cross-channel products, and `rowsum` gathers them over the row's blocks for the row profile.
+// column, so they are masked once, at the fold. `rowsum` gathers the centred pixels over the
+// row's blocks for the row profile.
 template <bool MASKED, bool ROW0>
 HWY_INLINE void kernel(const uint8_t *const *p, size_t x, const uint8_t *IF_RESTRICT mask,
                        const uint8_t *IF_RESTRICT valid, size_t vstride, int hok, int vok,
-                       const V16 *IF_RESTRICT rays, Acc &A, V16 *IF_RESTRICT w, V32 &rowsum)
+                       const V16 *IF_RESTRICT rays, Acc &A, V32 &rowsum)
 {
   const V8 aL = hn::LoadU(d8, p[0] + x), aM = hn::LoadU(d8, p[1] + x), aR = hn::LoadU(d8, p[2] + x);
   const V8 bL = hn::LoadU(d8, p[3] + x), c = hn::LoadU(d8, p[4] + x), bR = hn::LoadU(d8, p[5] + x);
@@ -387,7 +380,6 @@ HWY_INLINE void kernel(const uint8_t *const *p, size_t x, const uint8_t *IF_REST
     add<ROW0>(P[K_LAP2], hn::WidenMulPairwiseAdd(d32, lap, lap));
     const V16 gx = on_mesh(gx0), gy = on_mesh(hn::Sub(Le, La)),
               wc = on_mesh(hn::Sub(cc, hn::Set(d16, KBIAS)));
-    w[h] = wc;
     add<ROW0>(A.col[h], wc);
     const V16 w2 = hn::Mul(wc, wc);
     add<ROW0>(P[K_SXX], hn::WidenMulPairwiseAdd(d32, gx, gx));
@@ -1602,13 +1594,13 @@ struct Blocks
 struct Level
 {
   int ny = 0, nx = 0, fy = 0, fx = 0;
-  std::vector<int64_t> buf, xbuf;
+  std::vector<int64_t> buf;
   // Outputs, in the block of the features() call in flight; o* are their offsets in it.
-  float *feat = nullptr, *xfeat = nullptr;
+  float *feat = nullptr;
   double *mom = nullptr;
   double *sum = nullptr; // (NMAP, c, NST) cross-cell summary of feat, then of mom
-  size_t ofeat = 0, oxfeat = 0, omom = 0, osum = 0;
-  std::vector<size_t> rshape, fshape, mshape, xrshape, xfshape, sumshape;
+  size_t ofeat = 0, omom = 0, osum = 0;
+  std::vector<size_t> rshape, fshape, mshape, sumshape;
 };
 
 class FeatureComputer
@@ -1639,8 +1631,7 @@ class FeatureComputer
   int phases_ = 1;           // column phases the planes are split into (1 = not split)
   int slots_ = 9;            // rolling plane window rows (see the window comment)
   int bard_lagmask_ = 0;     // bit j set iff bard lag j fits the image (see bard())
-  int np_ = 0;               // number of channel pairs (0 if C<2 or C>XMAX)
-  std::vector<int> pi_, pj_; // the pairs, in (i<j) lexicographic order
+  int group_ = 1;            // channels a block carries together: c_ up to GMAX, else 1
 
   // How kernel() blocks map to cells, in LANES of phase 0 (a cell is cw_ of them, every
   // step_-th one sampled). A block either spans whole cells (multi_: cw_ divides it) or starts
@@ -1674,15 +1665,15 @@ class FeatureComputer
     size_t rowidx = 0;      // and the cell row's first sampled row, counted from the image top
     std::vector<int> vok;              // [sampled row] bard lags whose rows are inside the image
     std::vector<int> rws;              // the cell row's sampled rows
-    std::vector<int64_t> cells;  // [channel][K_N][cell], then [pair][cell]: the cell row's sums
+    std::vector<int64_t> cells;  // [channel][K_N][cell]: the cell row's sums
     std::vector<int64_t> hsum;   // private hash partial; bands >0 only
-    std::vector<int64_t> row, rowx, graw, gxraw; // features(): the cell row in flight, and the
-                                                 // band's share of the global sums
+    std::vector<int64_t> row, graw; // features(): the cell row in flight, and the band's share
+                                    // of the global sums
     std::vector<int64_t>
         up;           // features(): the level-1 cell row in flight, as kernel sums like `cells`
     int64_t up_n = 0; // ... and its sample count per cell so far
-    std::vector<int64_t> held, heldx;            // ... and its first rows, when their parents
-    std::vector<int> held_cy;    // belong to the band above: rolled up after the join
+    std::vector<int64_t> held; // ... and its first rows, when their parents belong to the
+    std::vector<int> held_cy;  // band above: rolled up after the join
     std::vector<uint8_t> planes; // padded de-interleaved planes: the rolling window
     std::vector<uint8_t> lin;    // one row, channels contiguous, then the phase split's scratch
     AreaScratch area;            // resize_: the resize's working set, and the band's rows of
@@ -1734,15 +1725,15 @@ class FeatureComputer
   std::vector<size_t> hshape_; // {NHASH, c_}
   bool hfast_ = false;                          // finest grid tiles HN -> hashes reuse its S1
 
-  std::vector<int64_t> graw_, gxraw_;
-  float *gfeat_ = nullptr, *gxfeat_ = nullptr; // the global outputs, in the output block
+  std::vector<int64_t> graw_;
+  float *gfeat_ = nullptr; // the global outputs, in the output block
   double *gmom_ = nullptr;
-  size_t ogfeat_ = 0, ogxfeat_ = 0, ogmom_ = 0, ohash_ = 0;
+  size_t ogfeat_ = 0, ogmom_ = 0, ohash_ = 0;
   Blocks *blocks_ = nullptr; // output blocks of this configuration
   // reusable cross-cell summary accumulators (sized c_*NF / c_*NMOM), refilled per level
   std::vector<float> sfmn_, sfmx_;
   std::vector<double> sfsm_, sfsq_, smmn_, smmx_, smsm_, smsq_;
-  std::vector<size_t> graw_shape_, gfeat_shape_, gmom_shape_, gxraw_shape_, gxfeat_shape_;
+  std::vector<size_t> graw_shape_, gfeat_shape_, gmom_shape_;
 
   // `count` consecutive cell-channels from their accumulator slots, LD at a time. A short last
   // group repeats its last record, and scatter() drops the repeats.
@@ -1773,8 +1764,7 @@ class FeatureComputer
   // block's first cell at index 0), which are contiguous per sum where the slots are not. The
   // conversions are exact: a sum below 2^52 is planted in the mantissa of 2^52 and that is
   // subtracted back off; a signed one is biased by 2^51 first; sum|grad|^4 can be wider, so its
-  // halves convert separately and meet in one rounding. `rec` / `recx` are the same cells'
-  // flushed slots, for the moments and the channel pairs; `cell` is the first one's index.
+  // halves convert separately and meet in one rounding. `cell` is the first cell's index.
   void derive_block(const int64_t *IF_RESTRICT sums, size_t nxs, size_t cell, size_t cells,
                     int64_t n)
   {
@@ -1828,19 +1818,6 @@ class FeatureComputer
         float *IF_RESTRICT f = L.feat + ((cell + i) * c_ + k) * NMAP;
         scatter(out, std::min<size_t>(LD, cells - i), (size_t)c_ * NMAP, f);
       }
-    for (size_t i = 0; i < cells && np_; ++i)
-    {
-      int64_t x[XMAX * (XMAX - 1) / 2];
-      for (int p = 0; p < np_; ++p) x[p] = pair_sum(sums, nxs, i, p, n);
-      derive_cross(L.mom + (cell + i) * c_ * NMOM, invn, x, L.xfeat + (cell + i) * np_ * NXF);
-    }
-  }
-  // sum(v_i * v_j) of cell `i` of the sums, from the centred products
-  int64_t pair_sum(const int64_t *IF_RESTRICT sums, size_t nxs, size_t i, int p, int64_t n) const
-  {
-    const int64_t B = KBIAS, ti = sums[((size_t)pi_[p] * K_N + K_T1) * nxs + i],
-                  tj = sums[((size_t)pj_[p] * K_N + K_T1) * nxs + i];
-    return sums[((size_t)c_ * K_N + p) * nxs + i] + B * (ti + tj) + B * B * n;
   }
   // LD doubles into one vector without a trip through memory (which would stall the load).
   static hn::VFromD<DDV> gather(const double *m)
@@ -1904,21 +1881,6 @@ class FeatureComputer
       for (size_t l = 0; l < cells; ++l) f[l * stride + j] = v[l];
     }
 #endif
-  }
-
-  // Cross-channel covariance and Pearson correlation per channel pair, from the raw
-  // products and the cell's already-derived per-channel [mean, var].
-  void derive_cross(const double *IF_RESTRICT m, double invn, const int64_t *IF_RESTRICT x,
-                    float *IF_RESTRICT f) const
-  {
-    for (int p = 0; p < np_; ++p)
-    {
-      const double *mi = m + (size_t)pi_[p] * NMOM, *mj = m + (size_t)pj_[p] * NMOM;
-      const double cov = (double)x[p] * invn - mi[0] * mj[0];
-      const double den = std::sqrt(mi[1] * mj[1]);
-      f[p * NXF] = (float)cov;
-      f[p * NXF + 1] = (float)(den > 0.0 ? cov / den : 0.0);
-    }
   }
 
   // Central moments [mean, var, m3, m4] (float64) from the raw power sums.
@@ -1997,7 +1959,7 @@ class FeatureComputer
   // Returns whether it also derived the row (features() only): block by block, while the
   // block's sums are still laid out contiguously per sum, which is what derive_block() reads.
   bool cell_row(Scratch &s, const std::vector<int> &rws, size_t cy, bool rolls,
-                int64_t *IF_RESTRICT hs, int64_t *IF_RESTRICT dst, int64_t *IF_RESTRICT dstx)
+                int64_t *IF_RESTRICT hs, int64_t *IF_RESTRICT dst)
   {
     const size_t N = hn::Lanes(d8), nfx = (size_t)levels_[0].nx;
     // When a block holds whole cells and the cell row is one chunk of rows, a block finishes
@@ -2006,15 +1968,13 @@ class FeatureComputer
     const bool local = multi_ && rws.size() <= (size_t)KROWS;
     const int64_t n = (int64_t)rws.size() * ncols_; // samples per cell, the same for the whole row
     // every channel in one pass of the blocks, and blocks of enough cells to fill derive's vectors
-    const bool derives = stream_ && local && (np_ || c_ == 1) && block_cells_ >= (size_t)LD;
+    const bool derives = stream_ && local && group_ == c_ && block_cells_ >= (size_t)LD;
     const size_t nxs = local ? block_cells_ | 1 : cells_stride(); // never above cells_stride()
     const size_t pstride = (size_t)slots_ * (size_t)s.row_stride, lanes = (size_t)lanes_;
     V16 rays[HB - 1];
     for (int j = 0; j < HB - 1; ++j)
       rays[j] = hn::InterleaveLower(d16, hn::Set(d16, ray_[j][0]), hn::Set(d16, ray_[j][1]));
-    // Without channel pairs the channels are independent, so they go one at a time and the
-    // accumulators stay in L1 however many there are.
-    const int G = np_ ? c_ : 1;
+    const int G = group_;
     for (size_t q0 = 0; q0 < rws.size(); q0 += KROWS)
     {
       const size_t nr = std::min<size_t>(KROWS, rws.size() - q0);
@@ -2069,10 +2029,7 @@ class FeatureComputer
             const bool edge =
                 x * phases_ < (size_t)BARD_MAXLAG || (x + N) * phases_ + BARD_MAXLAG > (size_t)w_;
             const uint8_t *IF_RESTRICT valid = edge ? bvalid_.data() : nullptr;
-            V32 cross[XMAX * (XMAX - 1) / 2][2];
-            V16 w[XMAX][2];
             for (size_t q = 0; q < nr; ++q) // row 0 of a block assigns its accumulators
-            {
               for (int k = 0; k < G; ++k)
               {
                 const uint8_t *const *rp = &s.rows[(q * c_ + k0 + k) * KPTR];
@@ -2080,7 +2037,7 @@ class FeatureComputer
                 {
                   kernel<decltype(m)::value, decltype(first)::value>(
                       rp, x, mask, valid, bvalid_stride_, bard_lagmask_, s.vok[q], rays, s.acc[k],
-                      w[k], s.rowv[q * c_ + k0 + k]);
+                      s.rowv[q * c_ + k0 + k]);
                 };
                 if (msk)
                   q ? run(std::true_type(), std::false_type())
@@ -2089,11 +2046,6 @@ class FeatureComputer
                   q ? run(std::false_type(), std::false_type())
                     : run(std::false_type(), std::true_type());
               }
-              for (int p = 0; p < np_; ++p)
-                for (int h = 0; h < 2; ++h)
-                  add_to(q > 0, cross[p][h],
-                         hn::WidenMulPairwiseAdd(d32, w[pi_[p]][h], w[pj_[p]][h]));
-            }
             // Lanes -> cells, a quarter block (or a half: quarters 0 and 2) at a time. The block
             // holds g lanes per cell, so the part starting at lane l belongs to cell e0 + l / g; a
             // block no wider than a cell (g == N) is all e0. A part adds to its cell unless it is
@@ -2146,14 +2098,10 @@ class FeatureComputer
                   fold32<false>(A.hog[q][j], gq, adds[q], cq + (K_HOG + j) * nxs);
               }
             }
-            for (int p = 0; p < np_; ++p)
-              for (int h = 0; h < 2; ++h)
-                fold32<true>(cross[p][h], g / 2, adds[2 * h],
-                             s.cells.data() + (c_ * K_N + p) * nxs + at[2 * h]);
             if (local)
             {
               const size_t e = cell, cells = std::min(block_cells_, nfx - e);
-              if (!(derives && rolls)) flush(s.cells.data(), nxs, e, cells, k0, G, n, dst, dstx);
+              if (!(derives && rolls)) flush(s.cells.data(), nxs, e, cells, k0, G, n, dst);
               if (derives)
               {
                 derive_block(s.cells.data(), nxs, cy * nfx + e, cells, n);
@@ -2166,7 +2114,7 @@ class FeatureComputer
         for (int k = 0; k < c_; ++k)
           rowprof_[(s.rowidx + q0 + q) * c_ + k] = hn::ReduceSum(d32, s.rowv[q * c_ + k]);
     }
-    if (!local) flush(s.cells.data(), nxs, 0, nfx, 0, c_, n, dst, dstx);
+    if (!local) flush(s.cells.data(), nxs, 0, nfx, 0, c_, n, dst);
     if (derives && rolls) s.up_n += n * levels_[1].fx;
     return derives;
   }
@@ -2174,7 +2122,7 @@ class FeatureComputer
   // features(): a block's cell sums straight up into the level-1 row in flight -- the finest
   // cells are never turned into slots at all. Sums add as they are (the slots are linear in
   // them and in n, so the conversion waits for flush_up()); the first child row of a parent
-  // stores. The hash grid takes its S1, and the pair sums go up as the slots they already are.
+  // stores. The hash grid takes its S1.
   void roll_block(Scratch &s, const int64_t *IF_RESTRICT sums, size_t nxs, size_t cy, size_t e,
                   size_t cells, int64_t n, int64_t *IF_RESTRICT hs)
   {
@@ -2202,14 +2150,10 @@ class FeatureComputer
           up = first(e + i) ? sums[r * nxs + i] : up + sums[r * nxs + i];
         }
     const size_t up0 = (cy >> log2((size_t)lv.fy)) * lv.nx, bxl = log2((size_t)fine.nx / HN);
-    int64_t *IF_RESTRICT hrow =
-        hfast_ ? hs + (cy >> log2((size_t)fine.ny / HN)) * HN * c_ : nullptr;
-    for (size_t i = 0; i < cells; ++i)
+    if (hfast_) // the finest grid tiles the hash grid: block-sum its S1 = T1 + KBIAS * n
     {
-      int64_t *IF_RESTRICT x = lv.xbuf.data() + (up0 + ((e + i) >> fxl)) * np_;
-      for (int p = 0; p < np_; ++p)
-        x[p] = first(e + i) ? pair_sum(sums, nxs, i, p, n) : x[p] + pair_sum(sums, nxs, i, p, n);
-      if (hfast_) // the finest grid tiles the hash grid: block-sum its S1 = T1 + KBIAS * n
+      int64_t *IF_RESTRICT hrow = hs + (cy >> log2((size_t)fine.ny / HN)) * HN * c_;
+      for (size_t i = 0; i < cells; ++i)
         for (int k = 0; k < c_; ++k)
           hrow[((e + i) >> bxl) * c_ + k] += sums[((size_t)k * K_N + K_T1) * nxs + i] + KBIAS * n;
     }
@@ -2254,14 +2198,14 @@ class FeatureComputer
   {
     Level &lv = levels_[1];
     flush(s.up.data(), (size_t)lv.nx + hn::Lanes(d64), 0, (size_t)lv.nx, 0, c_, s.up_n,
-          lv.buf.data() + (cy >> up_shift_) * lv.nx * c_ * NSUM, nullptr);
+          lv.buf.data() + (cy >> up_shift_) * lv.nx * c_ * NSUM);
     s.up_n = 0;
   }
 
   // Cell sums -> accumulator slots, for the `cells` cells from cell0 on that the sums hold (a
   // block's, or the whole row's), `nxs` apart, and for channels [k0, k0 + G).
   void flush(const int64_t *IF_RESTRICT sums, size_t nxs, size_t cell0, size_t cells, int k0, int G,
-             int64_t n, int64_t *IF_RESTRICT dst, int64_t *IF_RESTRICT dstx) const
+             int64_t n, int64_t *IF_RESTRICT dst) const
   {
     const int64_t B = KBIAS;
     for (size_t i = 0; i < cells; ++i)
@@ -2301,11 +2245,6 @@ class FeatureComputer
         a[LAP2] = sum(K_LAP2);
         for (int t = 0; t < NLAWS; ++t) a[LAWS0 + t] = sum(K_LAWS + t);
       }
-      if (G == c_ && dstx) // (the level-1 row in flight gathers its pair sums as it goes: no dstx)
-        for (int p = 0; p < np_; ++p)
-        {
-          dstx[e * np_ + p] = pair_sum(sums, nxs, src, p, n);
-        }
     }
   }
 
@@ -2338,9 +2277,7 @@ class FeatureComputer
     if (stream_)
     {
       std::fill(s.graw.begin(), s.graw.end(), (int64_t)0);
-      std::fill(s.gxraw.begin(), s.gxraw.end(), (int64_t)0);
       s.held.clear();
-      s.heldx.clear();
       s.held_cy.clear();
       if (bands_.size() == 1) summary_reset();
     }
@@ -2370,7 +2307,6 @@ class FeatureComputer
       // raw(): the row goes into the pyramid. features(): into a row buffer that stays in cache
       // while stream_row() derives it and rolls it up, so the finest level is never stored.
       int64_t *IF_RESTRICT dst = stream_ ? s.row.data() : fine.buf.data() + cy * nfx * c_ * NSUM;
-      int64_t *IF_RESTRICT dstx = stream_ ? s.rowx.data() : fine.xbuf.data() + cy * nfx * np_;
       // A band rolls a row up from its sums when it also has the first row of that row's parents;
       // otherwise the row becomes slots, which wait for the join (see Scratch::held).
       const int fy1 = 1 << up_shift_; // level 1's fy, or 1 without a level 1
@@ -2379,7 +2315,6 @@ class FeatureComputer
       if (rows.empty()) // the stride skipped the whole cell row. Every other one is written, not
       {                 // added to, by cell_row(), so nothing else ever needs zeroing.
         std::fill_n(dst, nfx * c_ * NSUM, (int64_t)0);
-        std::fill_n(dstx, nfx * np_, (int64_t)0);
       }
       else
       {
@@ -2396,7 +2331,7 @@ class FeatureComputer
                              s.lin.data(), s.planes.data());
           s.fslot = s.fslot + 1 == slots_ ? 0 : s.fslot + 1;
         }
-        derived = cell_row(s, rows, (size_t)cy, rolls, hs, dst, dstx);
+        derived = cell_row(s, rows, (size_t)cy, rolls, hs, dst);
         if (!hfast_)
           for (size_t i = 0; i < rows.size(); ++i)
             accumulate_hash_row(s.planes.data() + (size_t)s.rslot[i] * s.row_stride + PAD_L,
@@ -2408,13 +2343,8 @@ class FeatureComputer
       {
         if (rows.empty()) // nothing went up: derive the zeros, and start the parents at zero
         {
-          derive_run(fine, (size_t)cy * nfx, nfx, dst, dstx, bands_.size() == 1);
-          if ((cy & (fy1 - 1)) == 0)
-          {
-            std::fill(s.up.begin(), s.up.end(), (int64_t)0);
-            std::fill_n(levels_[1].xbuf.begin() + (cy >> up_shift_) * levels_[1].nx * np_,
-                        levels_[1].nx * np_, (int64_t)0);
-          }
+          derive_run(fine, (size_t)cy * nfx, nfx, dst, bands_.size() == 1);
+          if ((cy & (fy1 - 1)) == 0) std::fill(s.up.begin(), s.up.end(), (int64_t)0);
         }
         if ((cy & (fy1 - 1)) == fy1 - 1 || cy == bands_[bi].cy1 - 1) flush_up(s, (size_t)cy);
       }
@@ -2439,46 +2369,39 @@ class FeatureComputer
               s.row[e * stripe + (size_t)k * NSUM + PS0];
     }
     if (!derived) // cell_row() does it block by block when it can
-      derive_run(fine, (size_t)cy * nfx, nfx, s.row.data(), s.rowx.data(), bands_.size() == 1);
+      derive_run(fine, (size_t)cy * nfx, nfx, s.row.data(), bands_.size() == 1);
     if (levels_.size() == 1) // no coarser level: straight into the band's share of the global
     {
       for (size_t e = 0; e < nfx; ++e)
         for (size_t t = 0; t < stripe; ++t) s.graw[t] += s.row[e * stripe + t];
-      for (size_t e = 0; e < nfx; ++e)
-        for (int t = 0; t < np_; ++t) s.gxraw[t] += s.rowx[e * np_ + t];
       return;
     }
     if (!owner)
     {
       s.held.insert(s.held.end(), s.row.begin(), s.row.end());
-      s.heldx.insert(s.heldx.end(), s.rowx.begin(), s.rowx.end());
       s.held_cy.push_back(cy);
       return;
     }
-    roll_row(cy, s.row.data(), s.rowx.data());
+    roll_row(cy, s.row.data());
   }
-  // The finest row cy (sums at row / rowx) into its level-1 parents: a parent is written by
-  // its first child and added to by the rest.
-  void roll_row(int cy, const int64_t *IF_RESTRICT row, const int64_t *IF_RESTRICT rowx)
+  // The finest row cy (sums at row) into its level-1 parents: a parent is written by its first
+  // child and added to by the rest.
+  void roll_row(int cy, const int64_t *IF_RESTRICT row)
   {
     Level &lv = levels_[1];
     const size_t i = (size_t)cy / lv.fy, stripe = (size_t)c_ * NSUM;
     for (size_t j = 0; j < (size_t)lv.nx; ++j)
     {
       int64_t *IF_RESTRICT dc = lv.buf.data() + (i * lv.nx + j) * stripe;
-      int64_t *IF_RESTRICT dx = lv.xbuf.data() + (i * lv.nx + j) * np_;
       for (size_t kx = 0; kx < (size_t)lv.fx; ++kx)
       {
         const int64_t *IF_RESTRICT sc = row + (j * lv.fx + kx) * stripe;
-        const int64_t *IF_RESTRICT sx = rowx + (j * lv.fx + kx) * np_;
         if (cy % lv.fy == 0 && kx == 0)
         {
           std::copy(sc, sc + stripe, dc);
-          std::copy(sx, sx + np_, dx);
           continue;
         }
         for (size_t t = 0; t < stripe; ++t) dc[t] += sc[t];
-        for (int t = 0; t < np_; ++t) dx[t] += sx[t];
       }
     }
   }
@@ -2617,8 +2540,7 @@ class FeatureComputer
     const int stripe = c_ * NSUM;
     for (const Scratch &sc : scr_) // the rows whose parents another band had to write first
       for (size_t r = 0; r < sc.held_cy.size(); ++r)
-        roll_row(sc.held_cy[r], sc.held.data() + r * levels_[0].nx * stripe,
-                 sc.heldx.data() + r * levels_[0].nx * np_);
+        roll_row(sc.held_cy[r], sc.held.data() + r * levels_[0].nx * stripe);
     for (size_t lvl = stream_ ? 2 : 1; lvl < levels_.size(); ++lvl) // stream_row() fed level 1
     {
       const Level &p = levels_[lvl - 1];
@@ -2628,35 +2550,27 @@ class FeatureComputer
         {
           const size_t dst = (size_t)i * lv.nx + j;
           int64_t *IF_RESTRICT dc = lv.buf.data() + dst * stripe;
-          int64_t *IF_RESTRICT dx = lv.xbuf.data() + dst * np_;
           for (int ky = 0, first = 1; ky < lv.fy; ++ky)
             for (int kx = 0; kx < lv.fx; ++kx, first = 0)
             {
               const size_t src = (size_t)(i * lv.fy + ky) * p.nx + j * lv.fx + kx;
               const int64_t *IF_RESTRICT sc = p.buf.data() + src * stripe;
-              const int64_t *IF_RESTRICT sx = p.xbuf.data() + src * np_;
               if (first)
               {
                 std::copy(sc, sc + stripe, dc);
-                std::copy(sx, sx + np_, dx);
                 continue;
               }
               for (int t = 0; t < stripe; ++t) dc[t] += sc[t];
-              for (int t = 0; t < np_; ++t) dx[t] += sx[t];
             }
         }
     }
 
     const Level &last = levels_.back();
     std::fill(graw_.begin(), graw_.end(), (int64_t)0);
-    std::fill(gxraw_.begin(), gxraw_.end(), (int64_t)0);
     if (stream_ && levels_.size() == 1) // the only level was never stored: the bands summed it
     {
       for (const Scratch &sc : scr_)
-      {
         for (int t = 0; t < stripe; ++t) graw_[t] += sc.graw[t];
-        for (int t = 0; t < np_; ++t) gxraw_[t] += sc.gxraw[t];
-      }
       return;
     }
     for (size_t cell = 0, nc = (size_t)last.ny * last.nx; cell < nc; ++cell)
@@ -2664,9 +2578,6 @@ class FeatureComputer
       const int64_t *IF_RESTRICT s = last.buf.data() + cell * stripe;
       for (int t = 0; t < stripe; ++t)
         graw_[t] += s[t];
-      const int64_t *IF_RESTRICT x = last.xbuf.data() + cell * np_;
-      for (int t = 0; t < np_; ++t)
-        gxraw_[t] += x[t];
     }
   }
 
@@ -2877,7 +2788,7 @@ class FeatureComputer
     }
   }
 
-  // Per-cell derivation. Every cell writes only its own feat/mom/xfeat slice, so this
+  // Per-cell derivation. Every cell writes only its own feat/mom slice, so this
   // splits over bands. The cross-cell summary fold is deliberately NOT here: its sum
   // and sum-of-squares are float64 reductions over cells, and splitting them would
   // reassociate the additions and make the output depend on the thread count. It stays
@@ -2927,11 +2838,11 @@ class FeatureComputer
   // it rounds the same for any thread count: a lone band folds each batch while it is still in
   // L1, several bands leave it to derive().
   static constexpr size_t SB = 32;
-  // Derive `cells` cells of L from cell0 on, whose sums start at buf / xbuf.
+  // Derive `cells` cells of L from cell0 on, whose sums start at buf.
   void derive_run(const Level &L, size_t cell0, size_t cells, const int64_t *IF_RESTRICT buf,
-                  const int64_t *IF_RESTRICT xbuf, bool fold)
+                  bool fold)
   {
-    double invn[SB * XMAX * 2], inverse = 0.0; // 1/n per cell-channel of a batch
+    double invn[SB * GMAX * 2], inverse = 0.0; // 1/n per cell-channel of a batch
     int64_t n = -1;
     const size_t batch = std::min(SB, sizeof(invn) / sizeof(*invn) / (size_t)c_);
     for (size_t b0 = 0; b0 < cells; b0 += batch)
@@ -2948,9 +2859,6 @@ class FeatureComputer
         for (int k = 0; k < c_; ++k) invn[i * c_ + k] = inverse;
       }
       moments_records(buf + b0 * c_ * NSUM, invn, nb * c_, L.mom + (cell0 + b0) * c_ * NMOM);
-      for (size_t i = 0; i < nb && np_; ++i)
-        derive_cross(L.mom + (cell0 + b0 + i) * c_ * NMOM, invn[i * c_], xbuf + (b0 + i) * np_,
-                     L.xfeat + (cell0 + b0 + i) * np_ * NXF);
       derive_records(buf + b0 * c_ * NSUM, L.mom + (cell0 + b0) * c_ * NMOM, invn, nb * c_,
                      L.feat + (cell0 + b0) * c_ * NMAP);
       if (fold) summary_fold(L, cell0 + b0, nb);
@@ -2965,7 +2873,7 @@ class FeatureComputer
       const size_t nc = (size_t)L.ny * L.nx, c0 = nc * (size_t)bi / nb,
                    c1 = nc * (size_t)(bi + 1) / nb;
       if (nb == 1) summary_reset();
-      derive_run(L, c0, c1 - c0, L.buf.data() + c0 * c_ * NSUM, L.xbuf.data() + c0 * np_, nb == 1);
+      derive_run(L, c0, c1 - c0, L.buf.data() + c0 * c_ * NSUM, nb == 1);
       if (nb == 1) summary_write(L);
     }
   }
@@ -2981,12 +2889,11 @@ class FeatureComputer
         summary_write(L);
       }
     const double ginvn = graw_[CNT] > 0 ? 1.0 / (double)graw_[CNT] : 0.0;
-    double ginvns[XMAX * 2];
-    std::vector<double> many((size_t)c_ > XMAX * 2 ? (size_t)c_ : 0, ginvn);
-    std::fill(ginvns, ginvns + XMAX * 2, ginvn);
+    double ginvns[GMAX * 2];
+    std::vector<double> many((size_t)c_ > GMAX * 2 ? (size_t)c_ : 0, ginvn);
+    std::fill(ginvns, ginvns + GMAX * 2, ginvn);
     moments_records(graw_.data(), many.empty() ? ginvns : many.data(), (size_t)c_, gmom_);
     derive_records(graw_.data(), gmom_, many.empty() ? ginvns : many.data(), (size_t)c_, gfeat_);
-    if (np_) derive_cross(gmom_, ginvn, gxraw_.data(), gxfeat_);
   }
 
 public:
@@ -3030,16 +2937,7 @@ public:
     if (conv_ != CONV_NONE && dims[2] != 3)
       throw std::invalid_argument("a colour conversion needs a 3-channel image");
 
-    pi_.clear();
-    pj_.clear();
-    if (c_ >= 2 && c_ <= XMAX)
-      for (int i = 0; i < c_; ++i)
-        for (int j = i + 1; j < c_; ++j)
-        {
-          pi_.push_back(i);
-          pj_.push_back(j);
-        }
-    np_ = (int)pi_.size();
+    group_ = c_ <= GMAX ? c_ : 1;
     // A lag whose span exceeds the smaller side is dropped on BOTH axes, matching the
     // dense reference maps rather than testing each axis independently.
     bard_lagmask_ = 0;
@@ -3086,13 +2984,9 @@ public:
       L.ofeat = place(nc * c_ * NMAP * sizeof(float));
       L.omom = place(nc * c_ * NMOM * sizeof(double));
       L.osum = place((size_t)NMAP * c_ * NST * sizeof(double));
-      L.oxfeat = place(nc * np_ * NXF * sizeof(float));
-      L.xbuf.assign(nc * np_, 0);
       L.rshape = {(size_t)L.ny, (size_t)L.nx, (size_t)c_, (size_t)NSUM};
       L.fshape = {(size_t)L.ny, (size_t)L.nx, (size_t)c_ * NMAP};
       L.mshape = {(size_t)L.ny, (size_t)L.nx, (size_t)c_, (size_t)NMOM};
-      L.xrshape = {(size_t)L.ny, (size_t)L.nx, (size_t)np_};
-      L.xfshape = {(size_t)L.ny, (size_t)L.nx, (size_t)np_, (size_t)NXF};
       L.sumshape = {(size_t)NMAP, (size_t)c_, (size_t)NST};
       levels_.push_back(std::move(L));
     }
@@ -3137,7 +3031,7 @@ public:
       for (size_t l = 0; l < lanes_; ++l)
         if ((l % cw_) % step_ == 0) mesh_lanes_.push_back((uint32_t)l);
       // when cell_row() derives by the block, and there is a level for the sums to go up to
-      rolls_ = multi_ && N / cw_ >= LD && (np_ || c_ == 1) && levels_.size() > 1 &&
+      rolls_ = multi_ && N / cw_ >= LD && group_ == c_ && levels_.size() > 1 &&
                (h_ / levels_[0].ny + sy_ - 1) / sy_ <= KROWS;
       for (int i = 0; i < (w_ / phases_) % N; ++i) ktail_[i] = kmask_[i];
     }
@@ -3174,13 +3068,9 @@ public:
     smmx_.resize((size_t)c_ * NMOM);
     smsm_.resize((size_t)c_ * NMOM);
     smsq_.resize((size_t)c_ * NMOM);
-    gxraw_.assign((size_t)np_, 0);
-    ogxfeat_ = place((size_t)np_ * NXF * sizeof(float));
     graw_shape_ = {(size_t)c_, (size_t)NSUM};
     gfeat_shape_ = {(size_t)c_ * NMAP};
     gmom_shape_ = {(size_t)c_, (size_t)NMOM};
-    gxraw_shape_ = {(size_t)np_};
-    gxfeat_shape_ = {(size_t)np_, (size_t)NXF};
 
     // --- perceptual hashes: HN x HN value-sum grid, filled in the same pass ---
     hrow_.resize(h_);
@@ -3257,12 +3147,12 @@ public:
     for (size_t b = 0; b < scr_.size(); ++b)
     {
       Scratch &s = scr_[b];
-      s.acc.resize((size_t)(np_ ? c_ : 1));
+      s.acc.resize((size_t)group_);
       s.rows.assign(nrows * c_ * KPTR, nullptr);
       s.vok.assign(nrows, 0);
       s.rowv.assign(nrows * c_, hn::Zero(d32));
       s.col.assign((size_t)c_ * ((size_t)(w_ / phases_) + N), 0);
-      s.cells.assign(((size_t)c_ * K_N + np_) * cells_stride() + N, 0);
+      s.cells.assign((size_t)c_ * K_N * cells_stride() + N, 0);
       s.phase_stride = (int64_t)(w_ / phases_) + PAD_L + PAD_R;
       s.row_stride = s.phase_stride * phases_;
       // a slack row and block so the final vector's overrun stays inside the allocation
@@ -3279,9 +3169,7 @@ public:
       if (b) s.hsum.assign((size_t)HN * HN * c_, 0);
       s.row.assign((size_t)levels_[0].nx * c_ * NSUM, 0);
       if (levels_.size() > 1) s.up.assign((size_t)c_ * K_N * ((size_t)levels_[1].nx + N), 0);
-      s.rowx.assign((size_t)levels_[0].nx * np_, 0);
       s.graw.assign((size_t)c_ * NSUM, 0);
-      s.gxraw.assign((size_t)np_, 0);
     }
     for (size_t b = 1; b < bands_.size(); ++b)
       workers_.emplace_back([this, b] { worker((int)b); });
@@ -3298,41 +3186,18 @@ public:
     if (blocks_) blocks_->retire();
   }
 
-  // The channel pairs, as flat [i0, j0, i1, j1, ...]; empty when cross-channel is off.
-  std::vector<int> pairs() const
-  {
-    std::vector<int> out;
-    for (int p = 0; p < np_; ++p)
-    {
-      out.push_back(pi_[p]);
-      out.push_back(pj_[p]);
-    }
-    return out;
-  }
-
   nb::list raw(const uint8_t *IF_RESTRICT img, int64_t rs, int64_t cs, int64_t chs,
                uint8_t *thumb_out)
   {
     stream_ = false;
     accumulate(img, rs, cs, chs, thumb_out);
-    nb::list out, cross;
+    nb::list out;
     for (Level &L : levels_)
-    {
       out.append(nb::ndarray<nb::numpy, int64_t>(L.buf.data(), L.rshape.size(), L.rshape.data(),
                                                  nb::handle()));
-      if (np_)
-        cross.append(nb::ndarray<nb::numpy, int64_t>(L.xbuf.data(), L.xrshape.size(),
-                                                     L.xrshape.data(), nb::handle()));
-    }
     out.append(nb::ndarray<nb::numpy, int64_t>(graw_.data(), graw_shape_.size(),
                                                graw_shape_.data(), nb::handle()));
-    if (np_)
-      cross.append(nb::ndarray<nb::numpy, int64_t>(gxraw_.data(), gxraw_shape_.size(),
-                                                   gxraw_shape_.data(), nb::handle()));
-    nb::list both;
-    both.append(out);
-    both.append(cross);
-    return both;
+    return out;
   }
 
   // Per level: the float32 `maps` rows, channel-major over NMAP, and the float64 moments
@@ -3348,12 +3213,10 @@ public:
     {
       at(L.feat, L.ofeat);
       at(L.mom, L.omom);
-      at(L.xfeat, L.oxfeat);
       at(L.sum, L.osum);
     }
     at(gfeat_, ogfeat_);
     at(gmom_, ogmom_);
-    at(gxfeat_, ogxfeat_);
     at(hash_, ohash_);
     at(prow_, oprow_);
     at(pcol_, opcol_);
@@ -3367,21 +3230,18 @@ public:
       using T = std::remove_pointer_t<decltype(data)>;
       return nb::ndarray<nb::numpy, T>(data, shape.size(), shape.data(), owner);
     };
-    nb::list feat, mom, cross, sums;
+    nb::list feat, mom, sums;
     for (Level &L : levels_)
     {
       feat.append(view(L.feat, L.fshape));
       mom.append(view(L.mom, L.mshape));
-      if (np_) cross.append(view(L.xfeat, L.xfshape));
       sums.append(view(L.sum, L.sumshape));
     }
     feat.append(view(gfeat_, gfeat_shape_));
     mom.append(view(gmom_, gmom_shape_));
-    if (np_) cross.append(view(gxfeat_, gxfeat_shape_));
     nb::list all;
     all.append(feat);
     all.append(mom);
-    all.append(cross);
     all.append(sums);
     all.append(view(hash_, hshape_));
     all.append(view(prow_, prow_shape_));
@@ -3475,7 +3335,6 @@ NB_MODULE(imfeat_core, m)
   m.attr("HB") = HB;     // HOG orientation-bin count; Python derives its bin labels from this
   m.attr("LBPB") = LBPB; // LBP^riu2 bin count (9 uniform + 1 non-uniform)
   m.attr("BARD_NL") = BARD_NL; // bar-detector lag count (sizes the spectrum block)
-  m.attr("XMAX") = XMAX; // cross-channel products are computed only for C <= XMAX
   m.attr("CONVERT_NONE") = (int)CONV_NONE; // colour conversions fused into the pass (Convert)
   m.attr("CONVERT_BGR2HSV") = (int)CONV_BGR2HSV;
   m.def("cpu_count", [] { //  0 when the runtime cannot tell; callers see at least 1
@@ -3491,7 +3350,6 @@ NB_MODULE(imfeat_core, m)
            nb::arg("grids"), nb::arg("stride"), nb::arg("threads"), nb::arg("convert"),
            nb::arg("thumb"))
       .def("threads", &FeatureComputer::threads)
-      .def("pairs", &FeatureComputer::pairs)
       .def(
           "raw",
           [](FeatureComputer &self, Arr a, std::optional<ThumbArr> thumb) {

@@ -1,4 +1,4 @@
-"""LBP^riu2 and cross-channel products.
+"""LBP^riu2.
 
 Three tiers, mirroring the existing suites:
   1. exactness   -- a numpy oracle with identical rules; bit-exact equality.
@@ -69,24 +69,6 @@ def ref_lbp(img, grid, stride):
     return out
 
 
-def ref_cross(img, grid, stride):
-    """Per-cell sum(v_i * v_j) per channel pair, per level."""
-    h, w, c = img.shape
-    rows, cols = _sample(h, w, grid, stride)
-    v = img[np.ix_(rows, cols)].astype(np.int64)
-    pairs = [(i, j) for i in range(c) for j in range(i + 1, c)]
-    out = []
-    for ky, kx in grid:
-        nr, nc = 1 << ky, 1 << kx
-        rr, cc = np.meshgrid((rows * nr) // h, (cols * nc) // w, indexing="ij")
-        idx = (rr * nc + cc).ravel()
-        flat = np.zeros((nr * nc, len(pairs)), np.int64)
-        for p, (i, j) in enumerate(pairs):
-            np.add.at(flat[:, p], idx, (v[..., i] * v[..., j]).ravel())
-        out.append(flat.reshape(nr, nc, len(pairs)))
-    return out
-
-
 # ---------------- images -----------------------------------------------------
 def noise(n=64):
     return rng.integers(0, 256, (n, n), dtype=np.uint8)
@@ -116,16 +98,6 @@ def test_lbp_exact(img, grid, stride):
         assert np.array_equal(r[f"lbp_{i}"], ref)
 
 
-@pytest.mark.parametrize("grid", GRIDS)
-@pytest.mark.parametrize("stride", STRIDES)
-def test_cross_exact(grid, stride):
-    img = np.stack([textured(), noise(), vstep()], -1)
-    fc = imfeat.FeatureComputer(img.shape, grid=grid, stride=stride, feature_space=None)
-    r = fc.compute(img)
-    for i, ref in enumerate(ref_cross(img, grid, stride)):
-        assert np.array_equal(r[f"xchan_{i}"], ref)
-
-
 def test_bins_partition_the_pixels():
     """Every sampled pixel lands in exactly one bin, so the bins sum to the count."""
     img = np.stack([textured(), noise()], -1)
@@ -138,10 +110,9 @@ def test_bins_partition_the_pixels():
 def test_pooling_is_additive():
     img = np.stack([textured(), noise(), vstep()], -1)
     r = imfeat.FeatureComputer(img.shape, grid=[(3, 3), (1, 1)]).compute(img)
-    for k in ("lbp", "xchan"):
-        fine = r[f"{k}_0"].reshape(2, 4, 2, 4, *r[f"{k}_0"].shape[2:])
-        assert np.array_equal(fine.sum(axis=(1, 3)), r[f"{k}_1"])
-        assert np.array_equal(r[f"{k}_1"].sum(axis=(0, 1)), r[f"{k}_global"])
+    fine = r["lbp_0"].reshape(2, 4, 2, 4, *r["lbp_0"].shape[2:])
+    assert np.array_equal(fine.sum(axis=(1, 3)), r["lbp_1"])
+    assert np.array_equal(r["lbp_1"].sum(axis=(0, 1)), r["lbp_global"])
 
 
 # ==========================================================================
@@ -220,54 +191,3 @@ def test_rotation_invariance():
     for t in (np.rot90(img, 1), np.rot90(img, 2), np.fliplr(img), img.T):
         t = np.ascontiguousarray(t)
         assert np.array_equal(fc.compute(t)["lbp_global"], b)
-
-
-# ==========================================================================
-# cross-channel semantics
-# ==========================================================================
-def test_cross_identical_and_negated_channels():
-    v = textured()
-    img = np.stack([v, v, 255 - v], -1)
-    fc = imfeat.FeatureComputer(img.shape, grid=[(2, 2)], feature_space=None)
-    f = groups(fc, img)
-    assert fc.channel_pairs == [(0, 1), (0, 2), (1, 2)]
-    cov, corr = f["xchan_0"][..., 0], f["xchan_0"][..., 1]
-    assert np.allclose(corr[..., 0], 1.0, atol=1e-5)  # v vs v
-    assert np.allclose(corr[..., 1], -1.0, atol=1e-5)  # v vs 255 - v
-    assert np.allclose(cov[..., 0], f["mom_0"][..., 0, 1], rtol=1e-4)  # cov(v,v) == var
-
-
-def test_cross_independent_channels_decorrelate():
-    img = np.stack([noise(256), noise(256)], -1)
-    f = groups(imfeat.FeatureComputer(img.shape, grid=[(0, 0)], feature_space=None), img)
-    assert abs(f["xchan_global"][0, 1]) < 0.02
-
-
-def test_cross_matches_numpy_corrcoef():
-    v = textured()
-    img = np.stack([v, noise(), np.clip(v // 2 + 40, 0, 255).astype(np.uint8)], -1)
-    f = groups(imfeat.FeatureComputer(img.shape, grid=[(1, 1)], feature_space=None), img)
-    for cy in range(2):
-        for cx in range(2):
-            blk = img[cy * 32 : cy * 32 + 32, cx * 32 : cx * 32 + 32].astype(float)
-            for p, (i, j) in enumerate([(0, 1), (0, 2), (1, 2)]):
-                c = np.corrcoef(blk[..., i].ravel(), blk[..., j].ravel())[0, 1]
-                assert np.isclose(f["xchan_0"][cy, cx, p, 1], c, atol=1e-5)
-
-
-def test_cross_constant_channel_is_zero_not_nan():
-    img = np.stack([textured(), np.full((64, 64), 9, np.uint8)], -1)
-    f = groups(imfeat.FeatureComputer(img.shape, grid=[(2, 2)], feature_space=None), img)
-    assert np.all(np.isfinite(f["xchan_0"]))
-    assert np.allclose(f["xchan_0"][..., 1], 0.0)
-
-
-@pytest.mark.parametrize("c", [1, 9])
-def test_cross_absent_without_pairs(c):
-    """One channel has no pairs; beyond XMAX the pair count would explode, so it is
-    switched off rather than silently quadratic."""
-    shape = (32, 32) if c == 1 else (32, 32, c)
-    img = rng.integers(0, 256, shape, dtype=np.uint8)
-    fc = imfeat.FeatureComputer(img.shape, grid=[(2, 2)], feature_space=None)
-    assert fc.channel_pairs == []
-    assert not any(k.startswith("xchan") for k in groups(fc, img))

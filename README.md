@@ -6,8 +6,9 @@ Fast, exact, single-pass image feature extraction on CPU.
 grid pyramid, 54 classical features: intensity **moments**, gradient **structure tensor**, an
 **orientation histogram**, **extrema densities**, a rotation-invariant **LBP** histogram,
 nonlinear **descriptors** of those, a **bar / stroke detector** and second-order **texture**
-energies (Laplacian, Laws). It also returns **cross-channel** covariance per channel pair,
-whole-frame **projection profiles** and three `imagehash`-compatible **perceptual hashes**.
+energies (Laplacian, Laws). It also returns a per-level **summary** of every feature over
+the cells, whole-frame **projection profiles** and three `imagehash`-compatible **perceptual
+hashes**.
 
 It is a C++17 / [Highway](https://github.com/google/highway) SIMD core behind a small
 [nanobind](https://github.com/wjakob/nanobind) Python API, built for the front of a real-time
@@ -27,7 +28,6 @@ p.maps[0]      # (32, 32, 162) float32   3 channels x 54 FEATURE_NAMES, channel-
 p.maps[-1]     # (162,)        float32   the whole-frame (global) level
 p.moments[0]   # (32, 32, 3, 4) float64  [mean, var, m3, m4] at full precision
 p.summary[0]   # (54, 3, 4)    float64   each feature's [min, max, mean, std] over the cells
-p.cross[0]     # (32, 32, 3, 2) float32  [cov, corr] per channel pair
 p.hashes       # (3, 3)        uint64    [ahash, whash, phash] x channel
 p.profiles     # (rows, cols)  float64   mean of each sampled row / column, per channel
 
@@ -93,7 +93,6 @@ written out.
 | `maps` | `(cy, cx, C*F)` | float32 | every per-channel feature, **channel-major** over `FEATURE_NAMES` |
 | `moments` | `(cy, cx, C, 4)` | float64 | `MOMENTS` at full precision (m3, m4 outgrow float32) |
 | `summary` | `(F, C, 4)` | float64 | each feature over the level's cells as `SUMMARY_STATS = [min, max, mean, std]`; grid levels only |
-| `cross` | `(cy, cx, P, 2)` | float32 | `CROSS_FEATURES = [cov, corr]` per channel pair (`fc.channel_pairs`); empty for one channel or `C > 8` |
 | `hashes` | `(3, C)`, not a list | uint64 | `HASHES = [ahash, whash, phash]`, whole frame |
 | `profiles` | `((R, C), (K, C))` | float64 | mean of each sampled row and of each sampled column, whole frame |
 
@@ -118,9 +117,9 @@ last of them is dropped.
 ### `.compute(img, thumb_out=None) -> dict`
 
 The raw **int64 sums** before any nonlinear step, keyed `{group}_{level}`: `struct_i`
-`[Sxx, Syy, Sxy, count]`, `mom_i` `[S1..S4]`, `hog_i`, `cnt_i`, `lbp_i`, and `xchan_i`
-(`Σ v_i·v_j` per channel pair). They are purely additive, so any pooling over cells, levels,
-channels or frames is one `numpy` sum away and exact:
+`[Sxx, Syy, Sxy, count]`, `mom_i` `[S1..S4]`, `hog_i`, `cnt_i` and `lbp_i`. They are purely
+additive, so any pooling over cells, levels, channels or frames is one `numpy` sum away and
+exact:
 
 ```python
 raw  = fc.compute(img)
@@ -166,7 +165,6 @@ Per channel and per cell ([docs/FEATURES.md](docs/FEATURES.md) has the definitio
 | descriptors | skew, kurtosis, edge sharpness, detail, HOG concentration / cardinality, gradient sparsity, RMS contrast | ratios and products a linear model cannot form |
 | bar detector | stroke cover, stroke-width spectrum, peak width, peakedness, polarity | fires on strokes, not on step edges |
 | texture | variance of the Laplacian, focus, six Laws 3×3 energies, line anisotropy | blur / sharpness, blobs, vertical-vs-horizontal strokes |
-| cross-channel | covariance and correlation per channel pair | the only group relating channels |
 | profiles, hashes | row / column projection profiles; aHash, wHash, pHash | whole frame: 1-D registration, near-duplicate keys |
 
 Every feature is normalised per sample, so no level carries a cell-area factor and one shared
@@ -179,7 +177,7 @@ dynamic range spans 1e-2 to 1e6); `summary` is the cheap way to collect the stat
 
 **Additive integer sums.** Every per-pixel quantity — gradient products, histogram votes,
 counts, powers of the pixel — is accumulated as an exact int64 sum into the finest cell of its
-channel: 44 sums per cell per channel, plus one per channel pair. Everything nonlinear
+channel: 44 sums per cell per channel. Everything nonlinear
 (eigenvalues, central moments, normalisation, ratios) is derived from those sums once per
 cell. Two consequences are the whole design: every feature shares **one traversal** of the
 image, and a coarser cell is the exact sum of the cells inside it, so **pyramid depth is

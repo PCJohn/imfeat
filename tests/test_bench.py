@@ -83,9 +83,6 @@ def quality(ref, out):
         (lb * lbr).sum(-1).mean()
         / (np.linalg.norm(lb, axis=-1) * np.linalg.norm(lbr, axis=-1)).mean()
     )
-    q["xchan_r"] = (
-        _corr(out["xchan_0"][..., 1], ref["xchan_0"][..., 1]) if "xchan_0" in ref else 1.0
-    )
     return q
 
 
@@ -100,7 +97,6 @@ COLS = [
     ("hog_cos", 8, "{:8.4f}"),
     ("cnt_r", 7, "{:7.4f}"),
     ("lbp_cos", 8, "{:8.4f}"),
-    ("xchan_r", 8, "{:8.4f}"),
 ]
 
 
@@ -156,7 +152,6 @@ def test_stride_sweep(n, k):
         assert r2["ori_deg"] < 6
         assert r2["hog_cos"] > 0.85
         assert r2["lbp_cos"] > 0.85
-        assert r2["xchan_r"] > 0.9
 
 
 @SIZE_GRID

@@ -64,7 +64,7 @@ def test_texture_sums_are_exact(shape, grid, stride, channels, threads):
     fc = imfeat.FeatureComputer(
         img.shape, grid=[grid], stride=stride, threads=threads, feature_space=None
     )
-    raw = fc._impl.raw(fc._view(img))[0][0][..., LAP1 : LAP1 + 8]
+    raw = fc._impl.raw(fc._view(img))[0][..., LAP1 : LAP1 + 8]
     for k, gray in enumerate(planes):
         want = oracle(gray, 1 << grid[0], 1 << grid[1], *strides(stride))
         np.testing.assert_array_equal(raw[:, :, k], want)

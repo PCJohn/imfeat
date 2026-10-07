@@ -55,7 +55,7 @@ def hsv_of(bgr: np.ndarray) -> np.ndarray:
 
 
 def assert_same_outputs(a: imfeat.Pyramid, b: imfeat.Pyramid) -> None:
-    for name in ("maps", "moments", "summary", "cross"):
+    for name in ("maps", "moments", "summary"):
         got, want = getattr(a, name), getattr(b, name)
         assert len(got) == len(want), name
         for i, (x, y) in enumerate(zip(got, want)):
@@ -128,7 +128,6 @@ def test_pass_converts_exactly(stride, threads, channels):
         bgr.shape, GRID, stride=stride, channels=channels, threads=threads, feature_space=None
     )
     assert fused.converts and not asis.converts
-    assert fused.channel_pairs == asis.channel_pairs
     assert_same_outputs(fused.features(bgr), asis.features(hsv))
     assert_same_raw(fused.compute(bgr), asis.compute(hsv))
 

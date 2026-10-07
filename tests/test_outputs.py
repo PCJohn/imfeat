@@ -14,7 +14,7 @@ SHAPE = (64, 96, 3)
 
 
 def arrays(p: imfeat.Pyramid) -> list[np.ndarray]:
-    return [*p.maps, *p.moments, *p.summary, *p.cross, p.hashes]
+    return [*p.maps, *p.moments, *p.summary, p.hashes, *p.profiles]
 
 
 def computer() -> imfeat.FeatureComputer:

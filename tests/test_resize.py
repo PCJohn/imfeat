@@ -61,7 +61,7 @@ def content(kind: str, shape: tuple[int, ...], seed: int = 0) -> np.ndarray:
 
 
 def assert_same_outputs(a: imfeat.Pyramid, b: imfeat.Pyramid) -> None:
-    for name in ("maps", "moments", "summary", "cross"):
+    for name in ("maps", "moments", "summary"):
         got, want = getattr(a, name), getattr(b, name)
         assert len(got) == len(want), name
         for i, (x, y) in enumerate(zip(got, want)):

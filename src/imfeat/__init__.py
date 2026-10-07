@@ -9,8 +9,8 @@ One traversal of the image produces, per pyramid cell per channel:
   * an LBP^riu2_{8,1} histogram          (10 rotation-invariant uniform-LBP bins)
   * derived nonlinear descriptors        (DESCRIPTOR_FEATURES, 8)
 
-plus, per cell, [cov, corr] for every pair of channels, and three whole-frame perceptual
-hashes (aHash / wHash / pHash) per channel.
+plus three whole-frame perceptual hashes (aHash / wHash / pHash) per channel, the
+projection profiles, and a per-level summary of every feature over the level's cells.
 
 Every accumulator is an additive integer sum, so coarser pyramid levels and the
 frame-wide "global" reduction are exact sums of the finest cells -- depth is free
@@ -35,7 +35,6 @@ around or inside that square, as closely as the grid allows).
     p.maps[-1]     # (114,)        global level
     p.moments[0]   # (32, 32, 3, 4) float64 MOMENTS at full precision
     p.summary[0]   # (38, 3, 4)    float64 SUMMARY_STATS of each feature across cells
-    p.cross[0]     # (32, 32, 3, 2) float32 CROSS_FEATURES per channel pair
     p.hashes       # (3, 3)        uint64  HASHES x channel
 
 ``compute()`` returns the raw int64 accumulators instead, as a dict per group.
@@ -57,7 +56,6 @@ from . import imfeat_core as _core  # type: ignore[attr-defined]
 __all__ = [
     "COLOR_SPACES",
     "COUNT_FEATURES",
-    "CROSS_FEATURES",
     "DESCRIPTOR_FEATURES",
     "FEATURES",
     "FEATURE_NAMES",
@@ -135,8 +133,6 @@ COUNT_FEATURES = ("local_max", "local_min")
 # Rotation-invariant uniform LBP ("lbp_i"), L1-normalised. Bins 0..8 are the popcounts
 # of the uniform codes (<=2 circular 0/1 transitions); bin 9 collects everything else.
 LBP_FEATURES = tuple(f"lbp_{b}" for b in range(_core.LBPB - 1)) + ("lbp_nonuniform",)
-# Cross-channel maps ("xchan_i"), one row per channel pair (see .channel_pairs).
-CROSS_FEATURES = ("cov", "corr")
 # Model-ready nonlinear descriptors ("desc_i"), all derived in the same pass from the sums
 # above (no extra accumulators). std_skew/excess_kurt are the dimensionless (illumination-
 # invariant) shape of the intensity distribution; edge_sharpness/detail are structure-tensor
@@ -218,7 +214,6 @@ class Pyramid(NamedTuple):
               trailing 4 channels of `maps`, kept at full precision because m3 and m4
               span a range float32 cannot hold to the accuracy the oracle tests demand
     summary : per level except global, (F, C, 4) float64 over SUMMARY_STATS
-    cross   : per level, (H, W, P, 2) float32 over CROSS_FEATURES; empty when C > XMAX
     hashes  : (3, C) uint64 over HASHES, whole-frame
     profiles: (rows, cols), float64 (R, C) and (K, C): mean intensity along each sampled row and
               each sampled column, in order -- projection profiles, for 1-D shift estimates
@@ -227,7 +222,6 @@ class Pyramid(NamedTuple):
     maps: list[np.ndarray]
     moments: list[np.ndarray]
     summary: list[np.ndarray]
-    cross: list[np.ndarray]
     hashes: np.ndarray
     profiles: tuple[np.ndarray, np.ndarray]
 
@@ -460,10 +454,6 @@ class FeatureComputer:
         )
         #: bands actually used, i.e. threads participating including the caller's.
         self.threads: int = self._impl.threads()
-        p = self._impl.pairs()
-        #: pairs of *selected*-channel indices carried by the "xchan_*" maps, in order.
-        #: Empty for a single channel and for C > imfeat_core.XMAX (hyperspectral).
-        self.channel_pairs: list[tuple[int, int]] = list(zip(p[::2], p[1::2]))
 
     def _view(self, img: np.ndarray) -> np.ndarray:
         """Validate and return an (H, W[, C]) axis-order view (no copy)."""
@@ -536,16 +526,11 @@ class FeatureComputer:
         cheap way to collect them.
         """
         # Every array arrives in its final layout, sharing ownership of this call's block.
-        maps, mom, cross, summary, hashes, rows, cols = self._impl.features(
+        maps, mom, summary, hashes, rows, cols = self._impl.features(
             *self._inputs(img, thumb_out)
         )
         return Pyramid(
-            maps=maps,
-            moments=mom,
-            summary=summary,
-            cross=cross,
-            hashes=hashes,
-            profiles=(rows, cols),
+            maps=maps, moments=mom, summary=summary, hashes=hashes, profiles=(rows, cols)
         )
 
     def compute(
@@ -557,18 +542,13 @@ class FeatureComputer:
             cnt_i    (cells_y, cells_x[, C], 2)  [local_max, local_min]
             mom_i    (cells_y, cells_x[, C], 4)  power sums [S1, S2, S3, S4]
             lbp_i    (cells_y, cells_x[, C], 10) LBP^riu2 bin counts (sum == pixel count)
-            xchan_i  (cells_y, cells_x, P)       Sum(v_i * v_j) per channel pair, P = len(channel_pairs)
-        plus the "_global" variants. The C axis is present only for multi-channel input;
-        "xchan_*" is absent when there are no channel pairs. ``thumb_out`` as in
-        :meth:`features`.
+        plus the "_global" variants. The C axis is present only for multi-channel input.
+        ``thumb_out`` as in :meth:`features`.
         """
         widths = (("struct", _NS_RAW), ("hog", _NH), ("cnt", _NC), ("mom", _NM), ("lbp", _NL))
-        lv, cross = self._impl.raw(*self._inputs(img, thumb_out))
         out: dict[str, np.ndarray] = {}
-        for i, a in zip(self._keys, lv):
+        for i, a in zip(self._keys, self._impl.raw(*self._inputs(img, thumb_out))):
             out.update(self._cut(a, widths, i))
-        for i, x in zip(self._keys, cross):
-            out[f"xchan_{i}"] = x
         return out
 
 
