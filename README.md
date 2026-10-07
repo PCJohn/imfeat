@@ -76,7 +76,7 @@ front; in steady state a frame allocates nothing.
 | `threads` | bands of cell rows processed in parallel. Default `1`. Output is bit-identical at any count; `.threads` reports what was used, `imfeat.cpu_count()` what is available |
 | `input_space` | colour space of the images passed in: `"bgr"` (OpenCV's order, the default) or `"hsv"` |
 | `feature_space` | colour space the features are computed in, `"hsv"` by default: a BGR frame gets HSV features with no `cvtColor` pass, the conversion running inside the extraction (per band, as each row is read) and giving exactly `cv2.cvtColor(img, cv2.COLOR_BGR2HSV)`'s bytes (checked on all 2^24 colours). `None`, or the input's own space, takes the channels as they are. Only 3-channel images are colour: 2-D and single-channel input is taken as it is, any other channel count needs `feature_space=None`. `.converts` says whether a conversion is on; `imfeat.convert(img)` is the conversion on its own |
-| `thumb` | `(rows, cols)`, or one int for a square: every image is resized to this first, inside the pass, exactly as `cv2.resize(img, (cols, rows), interpolation=cv2.INTER_AREA)` would (checked byte for byte on frames of many sizes). `shape` is then the frame's, the grid divides the thumbnail, and `.thumb` reports the size. Downscaling only, up to 4 channels: an upscale is bilinear in OpenCV, not `INTER_AREA`, and is refused. Or a **policy name**, and the size follows `shape`, all three from the same square, the largest power of two not above the shorter side: `"pow2"` is that square (720p → 512, 1080p and 1440p → 1024, 4K → 2048); `"pow2-cover"` keeps the frame's shape around it, the shorter side the power of two (720p → 512×896, 1080p → 1024×1792); `"pow2-fit"` keeps the shape inside it, the longer side the power of two (720p → 512×320, 1080p and 1440p → 1024×576, 4K → 2048×1152), so it never has more pixels than the square. Neither aspect policy keeps the shape exactly: the scaled side is rounded to a multiple of 64 for the grid, so a 16:9 frame is exact at widths 1024 and 2048 but a 1.6:1 picture at 512 (288 rows wanted), and a side too thin for that grain becomes one quantum — the shape is kept as closely as the grid allows, no closer. None upscales, and a grid of up to 64 cells divides them all (`THUMB_POLICIES` has the rules); the pass is fastest at a power-of-two *width*, which the square and, on a landscape frame, `"pow2-fit"` have. A thumbnail the frame's own size is the frame: nothing is resized. `.thumb` is the size settled on, `.thumb_policy` the name, `imfeat.thumb_size(shape, "pow2-fit")` the same sum on its own. `imfeat.resize_area(img, size)` is the resize on its own |
+| `thumb` | `(rows, cols)`, or one int for a square: every image is resized to this first, inside the pass, exactly as `cv2.resize(img, (cols, rows), interpolation=cv2.INTER_AREA)` would (checked byte for byte on frames of many sizes). `shape` is then the frame's, the grid divides the thumbnail, and `.thumb` reports the size. Downscaling only, up to 4 channels: an upscale is bilinear in OpenCV, not `INTER_AREA`, and is refused. Or a **policy name**, and the size follows `shape`, all three from the same square, the largest power of two not above the shorter side: `"pow2"` is that square (720p → 512, 1080p and 1440p → 1024, 4K → 2048); `"pow2-cover"` keeps the frame's shape around it, the shorter side the power of two (720p → 512×896, 1080p → 1024×1792); `"pow2-fit"` keeps the shape inside it, the longer side the power of two (720p → 512×320, 1080p and 1440p → 1024×576, 4K → 2048×1152), so it never has more pixels than the square. Neither aspect policy keeps the shape exactly: the scaled side is rounded to a multiple of 64 for the grid, so a 16:9 frame is exact at widths 1024 and 2048 but a 1.6:1 picture at 512 (288 rows wanted), and a side too thin for that grain becomes one quantum — the shape is kept as closely as the grid allows, no closer. None of them upscales, and a grid of up to 64 cells divides them all (`THUMB_POLICIES` has the rules); the pass is fastest at a power-of-two *width*, which the square and, on a landscape frame, `"pow2-fit"` have. A thumbnail the frame's own size is the frame: nothing is resized. `.thumb` is the size settled on, `.thumb_policy` the name, `imfeat.thumb_size(shape, "pow2-fit")` the same rule on its own. `imfeat.resize_area(img, size)` is the resize on its own |
 
 ### `.features(img, thumb_out=None) -> Pyramid`
 
@@ -174,11 +174,10 @@ dynamic range spans 1e-2 to 1e6); `summary` is the cheap way to collect the stat
 
 **Additive integer sums.** Every per-pixel quantity — gradient products, histogram votes,
 counts, powers of the pixel — is accumulated as an exact int64 sum into the finest cell of its
-channel: 44 sums per cell per channel. Everything nonlinear
-(eigenvalues, central moments, normalisation, ratios) is derived from those sums once per
-cell. Two consequences are the whole design: every feature shares **one traversal** of the
-image, and a coarser cell is the exact sum of the cells inside it, so **pyramid depth is
-nearly free**.
+channel: 44 sums per cell per channel. Everything nonlinear (eigenvalues, central moments,
+normalisation, ratios) is derived from those sums once per cell. Two consequences are the
+whole design: every feature shares **one traversal** of the image, and a coarser cell is the
+exact sum of the cells inside it, so **pyramid depth is nearly free**.
 
 **Columns are the SIMD lane.** Each row is de-interleaved once into a rolling window of planar
 rows (split by column phase when the stride is even, so sampled columns become adjacent). One
@@ -223,14 +222,18 @@ multiply-adds included, so it does not drift with the compiler.
 Two x86 machines: a 16-core 2.1 GHz Xeon (Linux, GCC) and a 22-thread laptop (Windows, MSVC).
 `pytest -v -s --full tests/test_bench.py` regenerates everything here.
 
-Finest grid 32×32 (Xeon / laptop):
+Finest grid 32×32 (Xeon / laptop; minimum over the frames of a run):
 
 | input | stride=1 | stride=2 | stride=4 | stride=8 |
 |---|---|---|---|---|
-| 256×256×3 | 0.90 / 0.73 | 0.43 / 0.35 | 0.36 / 0.30 | 0.33 / 0.27 |
-| 512×512×3 | 2.42 / 2.06 | 0.95 / 0.77 | 0.48 / 0.40 | 0.41 / 0.35 |
-| 1024×1024×3 | 8.06 / 6.97 | 2.57 / 2.20 | 1.12 / 1.00 | 0.73 / 0.57 |
-| 1024×1024 (C=1) | 2.71 / 2.29 | 0.88 / 0.73 | 0.39 / 0.30 | 0.24 / 0.19 |
+| 256×256×3 | 0.90 / 0.69 | 0.43 / 0.33 | 0.36 / 0.28 | 0.33 / 0.26 |
+| 512×512×3 | 2.42 / 1.95 | 0.95 / 0.73 | 0.48 / 0.37 | 0.41 / 0.32 |
+| 1024×1024×3 | 8.06 / 6.66 | 2.57 / 2.10 | 1.12 / 0.88 | 0.73 / 0.55 |
+| 1024×1024 (C=1) | 2.71 / 2.23 | 0.88 / 0.71 | 0.39 / 0.30 | 0.24 / 0.19 |
+
+The laptop column is the October 2026 run, after two unread outputs were dropped from the
+pass (steps 8–9 of [docs/OPTIMIZATION.md](docs/OPTIMIZATION.md), 4–5% of the instructions);
+the Xeon column predates that.
 
 Cost is linear in channels (0.12–0.17 ms per channel at 256², stride 2, from C=1 to C=16) and
 in sampled pixels, plus a per-cell term that no stride removes: at 256² with 8 px cells, going
@@ -246,7 +249,7 @@ the algorithm, not the machine):
 | 4 | 10.8 | 0.822 | 4.5° | 0.838 | 0.958 |
 | 8 | 23.9 | 0.570 | 5.0° | 0.761 | 0.834 |
 
-Threads (`features()` min, Xeon / laptop):
+Threads (`features()` min, Xeon / laptop; an earlier run of the bench, before steps 8–9):
 
 | frame | grid, stride | 1 thread | 2 | 3 | 4 |
 |---|---|---|---|---|---|
@@ -278,12 +281,12 @@ Threads (`features()` min, Xeon / laptop):
   0.31× `cv2.resize`'s time per thread.
 * **Let the thumbnail follow the frame.** `thumb="pow2"` picks the largest power of two the
   shorter side holds, so a frame smaller than a fixed thumbnail is never upscaled to it: on
-  the laptop a 720p frame costs 4.0 ms as a fused 512 px pass on one thread (2.2 ms on two,
-  2.1 on four) against 9.6 ms (5.3, 4.3) for `cv2.resize`'s bilinear upscale to 1024 px and
+  the laptop a 720p frame costs 3.8 ms as a fused 512 px pass on one thread (2.2 ms on two,
+  1.4 on four) against 9.5 ms (5.1, 3.9) for `cv2.resize`'s bilinear upscale to 1024 px and
   the pass on that; a 1080p frame is 1024 px either way, and the same time. The rule runs
   once, when the computer is built (a millisecond or two, including everything else the
   build does), never per frame. It cuts both ways: a 4K frame becomes 2048 px and its pass
-  takes 2.4× as long as at 1024 (39.8 against 16.3 ms on one thread, 19.9 against 8.4 on
+  takes 2.4× as long as at 1024 (37.1 against 15.4 ms on one thread, 18.8 against 8.1 on
   two), so a host that wants a ceiling takes `min(imfeat.thumb_size(shape, "pow2")[0], 1024)`
   and passes that number (`pytest -s tests/test_bench.py -k policy`).
 * **Keep the frame's shape inside the square, with the width a power of two.** The two
@@ -301,7 +304,7 @@ Threads (`features()` min, Xeon / laptop):
 
 ## Exactness and testing
 
-The suite has 853 tests:
+The suite has 805 tests:
 
 * **Oracles.** Integer sums are compared *exactly* with numpy / OpenCV implementations, over
   geometries chosen to reach every kernel path (cells narrower and wider than a vector, masked
@@ -328,7 +331,7 @@ AddressSanitizer.
 
 The core was rewritten from an earlier single-pass implementation (commit `1c35817`), which
 already had the additive-sum design but used the vector lanes for *channels* and stored the
-finest level. Against it, this version is 2.2–3.3× faster for three channels and up to 8× for
+finest level. Against it, this version is 2.3–3.3× faster for three channels and up to 8× for
 one — 13.8 M → 5.2 M instructions and 35,000 → 13 integer divisions per 256×256×3 frame —
 while computing nine more features. Every earlier output is unchanged, apart from two
 bar-detector corner cases that were bugs. The short version, with the full log in

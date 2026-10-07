@@ -22,13 +22,13 @@ def maps(gray, lags=LAGS):
         if SPAN * d >= min(h, w):
             continue
         c = g[:, d : w - d]
-        l = g[:, : w - SPAN * d]
-        r = g[:, SPAN * d :]
+        lf = g[:, : w - SPAN * d]
+        rt = g[:, SPAN * d :]
         dark[j][:, d : w - d] = np.maximum(
-            dark[j][:, d : w - d], np.minimum(np.maximum(l - c, 0), np.maximum(r - c, 0))
+            dark[j][:, d : w - d], np.minimum(np.maximum(lf - c, 0), np.maximum(rt - c, 0))
         ).astype(np.uint8)
         light[j][:, d : w - d] = np.maximum(
-            light[j][:, d : w - d], np.minimum(np.maximum(c - l, 0), np.maximum(c - r, 0))
+            light[j][:, d : w - d], np.minimum(np.maximum(c - lf, 0), np.maximum(c - rt, 0))
         ).astype(np.uint8)
         c = g[d : h - d, :]
         u = g[: h - SPAN * d, :]

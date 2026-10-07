@@ -1,14 +1,13 @@
-"""features() hands out views of a pooled block: they must behave like arrays that own their data."""
+"""features() hands out views of a pooled block: they must behave like arrays owning their data."""
 
 from __future__ import annotations
 
 import gc
 
 import numpy as np
+from conftest import frame
 
 import imfeat
-
-from conftest import frame
 
 SHAPE = (64, 96, 3)
 

@@ -30,13 +30,13 @@ sum of its finest level, and a Highway SIMD core. What it did differently:
 | block | one vector's worth of adjacent sampled columns (32 with AVX2), the unit the kernel works on |
 | lane | one element of a SIMD vector |
 | sums | the 44 additive int64 quantities accumulated per cell per channel |
-| gate's operating point | what framegate runs per frame: a 720p frame thumbnailed to 512×320 (`"pow2-fit"`) or a 1080p one to 1024×576, HSV, stride 1, six levels from 64×64, two threads |
 | slots | those sums laid out cell by cell, `[cell][channel][44]`: the form the pyramid levels and `compute()` use |
 | fold | summing an accumulator's column lanes into per-cell sums |
 | derive | turning a cell's sums into its float features |
 | band | the contiguous range of cell rows one thread processes |
 | Xeon, laptop | the two test machines: a 16-core 2.1 GHz Xeon (Linux, GCC) and a 22-thread laptop (Windows, MSVC) |
 | development VM | the single-core shared cloud machine the work was done on; its timings wander by ±5% |
+| gate's operating point | what framegate runs per frame: a 720p frame thumbnailed to 512×320 (`"pow2-fit"`) or a 1080p one to 1024×576, HSV, stride 1, six levels from 64×64, two threads |
 
 ## Result
 
@@ -228,16 +228,16 @@ upscale is not `INTER_AREA`, so the hosts fell back to `cv2.resize` (bilinear) f
 `thumb="pow2"` instead takes the largest power of two the shorter side holds, square: 720p
 becomes 512 px, 1080p and 1440p 1024, 4K 2048. The rule is a bit length on the shape and runs
 once, when the computer is built (the whole build is a millisecond or two), because every
-plan in the computer -- bands, halos, the resize taps, the scratch, the output block -- is
+plan in the computer — bands, halos, the resize taps, the scratch, the output block — is
 sized from that one (frame, thumbnail) pair; a host that serves several frame shapes keeps one
 computer per shape, as before, and `thumb_size(shape, "pow2")` tells it the size without
-building. On the laptop a 720p frame costs 4.0 ms as a fused 512 px pass on one thread, 2.2 on
-two and 2.1 on four, against 9.6, 5.3 and 4.3 for the bilinear upscale to 1024 and the pass on
-it (the development VM: 4.7 and 3.4 against 10.7 and 5.7 on one and two threads); a 4K frame
-goes the other way, 39.8 ms at 2048 against 16.3 at a fixed 1024 on one thread (19.9 against
-8.4 on two, 11.5 against 4.9 on four), since the pass is now four times the pixels on top of
-the same read of the frame. The one-off build of a computer measured 0.7-3 ms on the laptop,
-5 ms for the 4K-to-2048 one.
+building. On the laptop (October 2026 run) a 720p frame costs 3.8 ms as a fused 512 px pass
+on one thread, 2.2 on two and 1.4 on four, against 9.5, 5.1 and 3.9 for the bilinear upscale
+to 1024 and the pass on it (the development VM: 4.7 and 3.4 against 10.7 and 5.7 on one and
+two threads); a 4K frame goes the other way, 37.1 ms at 2048 against 15.4 at a fixed 1024 on
+one thread (18.8 against 8.1 on two, 12.8 against 5.0 on four), since the pass is now four
+times the pixels on top of the same read of the frame. The one-off build of a computer measured 0.3–2.5 ms on the laptop,
+4–5 ms for the 4K-to-2048 one.
 
 *Keeping the frame's shape.* Two more policies keep the aspect ratio, both from the same
 square as `"pow2"`, and differ in which side becomes its power of two: `"pow2-cover"` the
@@ -246,7 +246,7 @@ shorter side (1080p → 1024×1792, the square covered), `"pow2-fit"` the longer
 follows at the same scale, rounded to a multiple of 64 and never above the frame's own
 (`THUMB_QUANTUM`), and that rounding is why neither keeps the shape exactly: a 16:9 frame is
 exact at widths 1024 and 2048 (576 and 1152 rows), but at width 512 it wants 288 rows, no
-multiple of 64, and gets 320 -- a 1.6:1 picture, a 10 % squash where the square's is 78 %; a
+multiple of 64, and gets 320 — a 1.6:1 picture, a 10% squash where the square's is 78%; a
 side too thin for the grain becomes one quantum, so a banner ends up the square under
 `"pow2-fit"`. The shape is kept as closely as the grid allows, no closer. (`"pow2-fit"` first
 took the *longer* side's own power of two, 1024×576 for 720p as well: exact 16:9, but 2.25×
@@ -262,7 +262,7 @@ development-VM thread, within noise at two).
 The two aspect policies differ in cost far more than in pixels, and the reason is the pass,
 not the resize: its blocks span whole cells only when a cell is a power of two wide (step 4
 above, with the sampling stride folded into column phases); any other width is walked one
-masked block per cell, and a stride then leaves most of the block's lanes idle -- a 28 px cell
+masked block per cell, and a stride then leaves most of the block's lanes idle — a 28 px cell
 at stride 4 uses 7 lanes of 32. `"pow2"` and, on a landscape frame, `"pow2-fit"` keep the
 width a power of two; `"pow2-cover"` cannot, since the shorter side is the power of two and
 the aspect ratio is not. On the development VM with two threads, a 1080p frame at stride 4
@@ -273,10 +273,11 @@ does, on landscape frames; on portrait frames the two aspect policies swap roles
 
 **Steps 8 and 9, the outputs nothing read.** By October 2026 the pass had two consumers,
 `fastdet` (which reads `maps`) and `framegate` (which reads `maps`, `summary` and `hashes`),
-and a line-level profile of the fused pass at the gate's operating point (AVX2 build, one
-thread, 720p → 512×320: 52.0 M instructions per frame) put the frame at roughly: the
-thumbnail resize 29%, the pixel kernel 19%, the folds 11%, the per-cell derivation 10%, the
-level roll-up 8%, the summary fold 6%, the rest 10%. Two outputs ran through most of those
+and a per-function profile of the fused pass at the gate's operating point (callgrind, AVX2
+build, one thread, 720p → 512×320: 52.0 M instructions per frame in the core) put the frame
+at: the thumbnail resize 29%, the pixel kernel 25%, the rest of the cell-row loop (the folds
+and the level roll-up) 22%, the per-cell derivation 12%, the summary fold 6%, the HSV
+conversion 3%, the row gather and band scheduling 4%. Two outputs ran through most of those
 stages for no reader: the channel-pair products `Σ v_i v_j` (a `pmaddwd` per pair per half
 block per row, folded, rolled up and summed into the global like every other sum, then six
 divides and three square roots per cell) and the projection profiles (two vector adds per
@@ -284,8 +285,8 @@ half block per row, two load-add-stores per block, a horizontal reduction per sa
 Both were removed as pure deletions — [FEATURES.md §10](FEATURES.md) keeps their
 definitions, the way the pass made them and what they cost, so they can be put back as a
 revert — and every remaining output was checked byte for byte against the previous build over
-four clips at six operating points (1–3 threads, strides 1–4, four thumbnail rules; 20,400 and
-18,900 arrays). The block loop still carries up to `GMAX` (8) channels through a block
+four clips at six operating points (1–3 threads, strides 1, 2 and 4, four thumbnail rules;
+20,400 and 18,900 arrays). The block loop still carries up to `GMAX` (8) channels through a block
 together, which is what lets a block's cells be derived on the spot; it just no longer forms
 the products on the way.
 
@@ -388,9 +389,9 @@ the products on the way.
 9. **Count instructions inside the object, not the process.** A whole-process callgrind
    difference between a 2-frame and a 12-frame run is contaminated by anything that happens
    in one run and not the other — the first run of a fresh build compiles and writes the
-   package's `.pyc`, the second reads it — which made a −3.8% change read as −4.2% and a
-   −1.4% one as −5.6%. Sum the self cost of the library's own object (`cg_obj.py` in the
-   session notes: per-`ob=` totals of the callgrind file); those are identical run to run.
+   package's `.pyc`, the second reads it — which made step 8's −3.8%, −3.7% and −3.1% read
+   as −4.2%, −6.3% and −3.6%. Sum the self cost of the library's own object instead (the
+   per-`ob=` totals of the callgrind file); those are identical run to run.
 10. **Ask what reads an output before optimising how it is made.** Two whole stages of the
    pass (steps 8–9) had no consumer; deleting them was worth more than most kernel work and
    carried no risk to the rest.
@@ -401,7 +402,8 @@ the products on the way.
   and the least trustworthy; ±5% on a shared machine is noise.
 * **Instructions per frame**: `valgrind --tool=cachegrind` on a run of 4 frames and a run of
   24, differenced. `callgrind` with a few functions marked `noinline` gives the split by
-  stage.
+  stage. For a fused pass driven from Python, `callgrind` on 2 and 12 frames with the self
+  cost summed per object (lesson 9), and per function within the object for the split.
 * **Divider operations per frame**: `callgrind --dump-instr=yes`, summing the execution
   counts of every `div`, `idiv`, `vdiv*` and `vsqrt*` instruction in the library.
 
@@ -449,9 +451,10 @@ float64 moments move by at most one unit in the last place when the code around 
   sweep and adding straight into the level-1 row would remove most of the per-block
   bookkeeping. Exact by construction (integer sums). Not started.
 * **The serial tail at two threads.** The summary fold and the two wake-ups per frame are
-  serial; the laptop's scaling of the 1080p pass at 1024 px (10.5 / 5.9 / 3.5 ms on 1 / 2 / 4
-  threads) puts the serial share near 12%. The band-independent summary above is the exact
-  fix for about half of it; one wake-up per frame instead of two is the rest.
+  serial; the laptop's scaling of the 1080p pass at 1024 px (10.3 / 5.4 / 3.3 ms on 1 / 2 / 4
+  threads, October 2026) puts the serial share at 6–9% by Amdahl's law (an earlier run,
+  10.5 / 5.9 / 3.5, said 12%). The band-independent summary above is the exact fix for about
+  half of it; one wake-up per frame instead of two is the rest.
 * **Lazy outputs.** `summary` and `hashes` are read by framegate, `maps` by both hosts, and
   nothing else is made any more; if a host ever needs only `maps`, the summary fold (6% of
   the frame) and the hash readout could be skipped per computer. Cheap to add, exact.

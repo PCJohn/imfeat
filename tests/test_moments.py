@@ -13,13 +13,11 @@ test_struct.py:
                   the values.
 """
 
-
 import numpy as np
 import pytest
+from conftest import groups
 
 import imfeat
-
-from conftest import groups
 
 rng = np.random.default_rng(0)
 
@@ -197,9 +195,7 @@ def test_multichannel_matches_per_channel():
     multi = groups(fc, img)
     for c in range(3):
         plane = np.ascontiguousarray(img[:, :, c])
-        solo = groups(imfeat.FeatureComputer(plane.shape, grid=[(5, 5), (3, 3)]),
-            plane
-        )
+        solo = groups(imfeat.FeatureComputer(plane.shape, grid=[(5, 5), (3, 3)]), plane)
         for k in solo:
             got = multi[k][c] if multi[k].ndim == 1 else multi[k][..., c, :]
             assert np.array_equal(got, solo[k]), f"{k} ch{c}"
@@ -218,9 +214,7 @@ def test_arbitrary_channel_count(nch):
 def test_channel_subset():
     img = np.stack([textured(), noise(), ramp()], -1)
     full = groups(imfeat.FeatureComputer(img.shape, grid=[(5, 5)]), img)
-    sub = groups(imfeat.FeatureComputer(img.shape, grid=[(5, 5)], channels=[2, 0]),
-        img
-    )
+    sub = groups(imfeat.FeatureComputer(img.shape, grid=[(5, 5)], channels=[2, 0]), img)
     for k in full:
         if full[k].ndim == 1:  # per-channel scalar hashes: (C,)
             assert sub[k][0] == full[k][2] and sub[k][1] == full[k][0], k

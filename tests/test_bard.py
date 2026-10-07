@@ -4,13 +4,12 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
+from conftest import frame
 
 import imfeat
 
-from conftest import frame
-
-pytest.importorskip("cv2")  # bard_oracle imports it for its pooling
-from bard_oracle import TAU, maps  # noqa: E402
+bard_oracle = pytest.importorskip("bard_oracle")  # imports cv2 for its pooling: skipped without it
+TAU, maps = bard_oracle.TAU, bard_oracle.maps
 
 BARD0 = 30  # first bard slot of the raw sums: cover, response mass per lag, dark, light
 

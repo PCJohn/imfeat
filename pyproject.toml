@@ -22,3 +22,30 @@ markers = [
   "bench: benchmarks (timings printed with -s); skip with -m \"not bench\"",
   "full: needs reference libraries (cv2, imagehash, PIL, scipy); enabled by --full",
 ]
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF"]
+
+[tool.black]
+line-length = 100
+target-version = ["py39"]
+
+[tool.mypy]
+strict = true
+files = ["src"]
+
+[[tool.mypy.overrides]]
+module = ["cv2", "cv2.*", "scipy", "scipy.*", "imagehash", "PIL", "PIL.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+# `mypy src tests`: the tests are unannotated by design; their bodies are still checked.
+module = ["bard_cases", "bard_oracle", "bard_quality", "conftest", "test_bard", "test_bench", "test_color", "test_descriptors", "test_edges", "test_hash_cross", "test_lbp", "test_moments", "test_outputs", "test_resize", "test_struct", "test_summary", "test_texture", "test_threads"]
+disallow_untyped_defs = false
+disallow_incomplete_defs = false
+disallow_untyped_calls = false
+warn_return_any = false

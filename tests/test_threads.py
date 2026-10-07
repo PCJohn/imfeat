@@ -11,10 +11,9 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
+from conftest import frame, groups
 
 import imfeat
-
-from conftest import frame, groups
 
 CONFIGS = [
     ((128, 128, 3), [(5, 5), (4, 4), (3, 3), (2, 2)], 2),

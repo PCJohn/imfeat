@@ -10,13 +10,11 @@ Three tiers, mirroring the existing suites:
                     feature in imfeat, which is the point of adding it.
 """
 
-
 import numpy as np
 import pytest
+from conftest import groups
 
 import imfeat
-
-from conftest import groups
 
 rng = np.random.default_rng(7)
 

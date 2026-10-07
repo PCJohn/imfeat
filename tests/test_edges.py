@@ -5,10 +5,9 @@ prepare_row, which is the one place the hot loop trusts blindly."""
 
 import numpy as np
 import pytest
+from conftest import groups
 
 import imfeat
-
-from conftest import groups
 
 rng = np.random.default_rng(3)
 
@@ -41,9 +40,7 @@ def test_border_gradient_matches_replicate_padding():
     img[:, 0] = 255  # an edge that only exists in the leftmost column
     r = imfeat.FeatureComputer(img.shape, grid=[(3, 3)]).compute(img)
     p = np.pad(img.astype(np.int64), 1, mode="edge")
-    gx = (p[:-2, 2:] + 2 * p[1:-1, 2:] + p[2:, 2:]) - (
-        p[:-2, :-2] + 2 * p[1:-1, :-2] + p[2:, :-2]
-    )
+    gx = (p[:-2, 2:] + 2 * p[1:-1, 2:] + p[2:, 2:]) - (p[:-2, :-2] + 2 * p[1:-1, :-2] + p[2:, :-2])
     assert r["struct_0"][..., 0].sum() == (gx * gx).sum()
 
 
@@ -54,12 +51,7 @@ def test_extrema_envelope_vs_bruteforce():
     r = imfeat.FeatureComputer(img.shape, grid=[(0, 0)]).compute(img)
     p = np.pad(img.astype(int), 1, mode="edge")
     nb = np.stack(
-        [
-            p[i : i + 64, j : j + 64]
-            for i in range(3)
-            for j in range(3)
-            if (i, j) != (1, 1)
-        ]
+        [p[i : i + 64, j : j + 64] for i in range(3) for j in range(3) if (i, j) != (1, 1)]
     )
     assert r["cnt_global"][0] == int((img > nb.max(0)).sum())
     assert r["cnt_global"][1] == int((img < nb.min(0)).sum())
@@ -78,9 +70,7 @@ def test_non_square_image():
     img = rng.integers(0, 256, (128, 256), dtype=np.uint8)
     r = groups(imfeat.FeatureComputer(img.shape, grid=[(3, 5), (2, 4)]), img)
     assert r["mom_0"].shape == (8, 32, 4) and r["mom_1"].shape == (4, 16, 4)
-    np.testing.assert_allclose(
-        r["mom_global"], moments(img.astype(float).ravel()), rtol=1e-9
-    )
+    np.testing.assert_allclose(r["mom_global"], moments(img.astype(float).ravel()), rtol=1e-9)
 
 
 def test_single_cell_equals_global():

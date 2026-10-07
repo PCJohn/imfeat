@@ -15,10 +15,9 @@ Three tiers:
 
 import numpy as np
 import pytest
+from conftest import groups
 
 import imfeat
-
-from conftest import groups
 
 rng = np.random.default_rng(3)
 
@@ -189,12 +188,8 @@ def test_detail_is_not_affine_invariant():
 def _sobel_int(img):
     """imfeat's exact integer Sobel with a replicate border."""
     p = np.pad(img.astype(np.int64), 1, mode="edge")
-    gx = (p[:-2, 2:] + 2 * p[1:-1, 2:] + p[2:, 2:]) - (
-        p[:-2, :-2] + 2 * p[1:-1, :-2] + p[2:, :-2]
-    )
-    gy = (p[2:, :-2] + 2 * p[2:, 1:-1] + p[2:, 2:]) - (
-        p[:-2, :-2] + 2 * p[:-2, 1:-1] + p[:-2, 2:]
-    )
+    gx = (p[:-2, 2:] + 2 * p[1:-1, 2:] + p[2:, 2:]) - (p[:-2, :-2] + 2 * p[1:-1, :-2] + p[2:, :-2])
+    gy = (p[2:, :-2] + 2 * p[2:, 1:-1] + p[2:, 2:]) - (p[:-2, :-2] + 2 * p[:-2, 1:-1] + p[:-2, 2:])
     return gx, gy
 
 
@@ -211,9 +206,7 @@ def sparse_lines(n=96, step=16):
     return img
 
 
-@pytest.mark.parametrize(
-    "img", [noise(96), ink_on_paper(96), sparse_lines(), ramp(), stripes()]
-)
+@pytest.mark.parametrize("img", [noise(96), ink_on_paper(96), sparse_lines(), ramp(), stripes()])
 def test_grad_sparsity_matches_sobel_oracle(img):
     got = groups(imfeat.FeatureComputer(img.shape, grid=[(0, 0)]), img)["desc_global"]
     assert np.isclose(got[D["grad_sparsity"]], _ref_grad_sparsity(img), rtol=1e-4, atol=1e-3)

@@ -12,13 +12,14 @@ Plus an accuracy report (relative Hamming vs stock imagehash on full-size frames
 mean/min/p50/max). Latency lives in test_bench.py.
 """
 
+from collections.abc import Callable
+from typing import Any
 
 import numpy as np
 import pytest
+from conftest import groups
 
 import imfeat
-
-from conftest import groups
 
 rng = np.random.default_rng(11)
 
@@ -204,8 +205,12 @@ def test_accuracy_report_vs_imagehash():
     import imagehash
     from PIL import Image
 
-    ref = {"ahash": imagehash.average_hash, "whash": imagehash.whash, "phash": imagehash.phash}
-    dist = {k: [] for k in ref}
+    ref: dict[str, Callable[[Any], Any]] = {
+        "ahash": imagehash.average_hash,
+        "whash": imagehash.whash,
+        "phash": imagehash.phash,
+    }
+    dist: dict[str, list[float]] = {k: [] for k in ref}
     for _ in range(60):
         g = _natural(256, 256)
         f = groups(imfeat.FeatureComputer((256, 256), grid=[(5, 5)]), g)
@@ -214,8 +219,8 @@ def test_accuracy_report_vs_imagehash():
             hd = bin(int(f[k]) ^ int(_pack(fn(im).hash))).count("1")
             dist[k].append(hd / NBITS)
     print("\nrelative Hamming vs imagehash (Lanczos), 256x256 natural frames:")
-    for k, d in dist.items():
-        d = np.array(d)
+    for k, lst in dist.items():
+        d = np.array(lst)
         print(
             f"  {k}: mean={d.mean():.3f} min={d.min():.3f} p50={np.median(d):.3f} max={d.max():.3f}"
         )

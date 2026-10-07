@@ -89,7 +89,7 @@ for name, img, grid, stride in cases.build():
         and h == w
         and h % n == 0
         and (w // n) % stride == 0
-        and NB - 4 == len(__import__("bard_oracle").LAGS)
+        and len(__import__("bard_oracle").LAGS) == NB - 4
     ):
         for ch in range(img.shape[-1]):
             d = np.abs(pool(maps(img[:, :, ch]), n, stride) - b[:, :, ch]).max()

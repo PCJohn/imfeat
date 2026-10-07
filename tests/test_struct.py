@@ -16,12 +16,9 @@ import math
 
 import numpy as np
 import pytest
-
-import imfeat
+from conftest import groups
 
 import imfeat as ss
-
-from conftest import groups
 
 rng = np.random.default_rng(0)
 
@@ -58,12 +55,8 @@ def ref_cornerness(t):  # Shi-Tomasi lambda_min (raw)
 # --------------------------------------------------------------------------
 def sobel_int(img):
     p = np.pad(img.astype(np.int64), 1, mode="edge")
-    gx = (p[:-2, 2:] + 2 * p[1:-1, 2:] + p[2:, 2:]) - (
-        p[:-2, :-2] + 2 * p[1:-1, :-2] + p[2:, :-2]
-    )
-    gy = (p[2:, :-2] + 2 * p[2:, 1:-1] + p[2:, 2:]) - (
-        p[:-2, :-2] + 2 * p[:-2, 1:-1] + p[:-2, 2:]
-    )
+    gx = (p[:-2, 2:] + 2 * p[1:-1, 2:] + p[2:, 2:]) - (p[:-2, :-2] + 2 * p[1:-1, :-2] + p[2:, :-2])
+    gy = (p[2:, :-2] + 2 * p[2:, 1:-1] + p[2:, 2:]) - (p[:-2, :-2] + 2 * p[:-2, 1:-1] + p[:-2, 2:])
     return gx, gy
 
 
@@ -275,9 +268,7 @@ def test_stride_quality(stride):
         ref_orientation(t1).ravel()[strong], ref_orientation(ts).ravel()[strong]
     )
     med_deg = math.degrees(np.median(oerr))
-    print(
-        f"\n  stride {stride}: energy corr={corr:.3f}  median orient err={med_deg:.2f} deg"
-    )
+    print(f"\n  stride {stride}: energy corr={corr:.3f}  median orient err={med_deg:.2f} deg")
     # orientation is the robust channel and gates tightly; raw energy aliases on
     # sharp edges under aggressive stride (would need INTER_AREA prefiltering),
     # so its floor loosens with stride -- documented, not silently tolerated.
@@ -300,9 +291,7 @@ def test_opencv_sanity():
     pooled = comp.reshape(g, img.shape[0] // g, g, img.shape[1] // g, 3).sum((1, 3))
     ours = t[..., :3].astype(float)
     for k in range(3):
-        c = np.corrcoef(
-            _interior(ours[..., k]).ravel(), _interior(pooled[..., k]).ravel()
-        )[0, 1]
+        c = np.corrcoef(_interior(ours[..., k]).ravel(), _interior(pooled[..., k]).ravel())[0, 1]
         assert c > 0.99, f"component {k} corr={c:.3f}"
 
 
@@ -365,12 +354,7 @@ def ref_hog_extrema(img, grid, stride):
     wgt = gx**2 + gy**2  # squared-magnitude weight
     # strict 8-neighbour extrema, replicate border
     p = np.pad(img.astype(np.int64), 1, mode="edge")
-    nbrs = [
-        p[dy : dy + h, dx : dx + w]
-        for dy in range(3)
-        for dx in range(3)
-        if (dy, dx) != (1, 1)
-    ]
+    nbrs = [p[dy : dy + h, dx : dx + w] for dy in range(3) for dx in range(3) if (dy, dx) != (1, 1)]
     mx, mn = np.maximum.reduce(nbrs), np.minimum.reduce(nbrs)
     lmax, lmin = (img.astype(np.int64) > mx), (img.astype(np.int64) < mn)
     sy, sx = stride
@@ -404,9 +388,7 @@ def ring(n=256, r=90, t=6):
 
 def impulses(n=256, step=16, bg=128):
     a = np.full((n, n), bg, np.uint8)
-    pts = [
-        (y, x) for y in range(step, n - step, step) for x in range(step, n - step, step)
-    ]
+    pts = [(y, x) for y in range(step, n - step, step) for x in range(step, n - step, step)]
     half = len(pts) // 2
     for y, x in pts[:half]:
         a[y, x] = 255  # strict local max
@@ -418,9 +400,7 @@ def impulses(n=256, step=16, bg=128):
 # ------------------------------ tier 1: exact ------------------------------
 @pytest.mark.parametrize("grid", GRIDS)
 @pytest.mark.parametrize("stride", STRIDES)
-@pytest.mark.parametrize(
-    "img", [flat(), hedge(), vedge(), diag(), checker(), noise(), ring()]
-)
+@pytest.mark.parametrize("img", [flat(), hedge(), vedge(), diag(), checker(), noise(), ring()])
 def test_hog_extrema_exact(img, grid, stride):
     sc = ss.FeatureComputer(img.shape, grid=grid, stride=stride)
     r = sc.compute(img)
@@ -457,22 +437,14 @@ def test_hog_axis_edges():
 
 
 def test_hog_noise_isotropic():
-    hg = (
-        ss.FeatureComputer((256, 256), grid=[(4, 4)])
-        .compute(noise())["hog_global"]
-        .astype(float)
-    )
+    hg = ss.FeatureComputer((256, 256), grid=[(4, 4)]).compute(noise())["hog_global"].astype(float)
     p = hg / hg.sum()
     assert (p > 0).all()
     assert p.max() / p.min() < 1.6  # no dominant orientation
 
 
 def test_hog_ring_isotropic():
-    hg = (
-        ss.FeatureComputer((256, 256), grid=[(5, 5)])
-        .compute(ring())["hog_global"]
-        .astype(float)
-    )
+    hg = ss.FeatureComputer((256, 256), grid=[(5, 5)]).compute(ring())["hog_global"].astype(float)
     p = hg / hg.sum()
     assert (p > 0).all()  # a circle spans every orientation
     assert p.max() / p.min() < 8  # far flatter than a single edge (min -> 0)
@@ -502,9 +474,7 @@ def test_hog_opencv_sanity():
 
     img = textured()
     g = 32
-    hog = (
-        ss.FeatureComputer(img.shape, grid=[(5, 5)]).compute(img)["hog_0"].astype(float)
-    )
+    hog = ss.FeatureComputer(img.shape, grid=[(5, 5)]).compute(img)["hog_0"].astype(float)
     gx = cv2.Sobel(img, cv2.CV_64F, 1, 0, ksize=3)
     gy = cv2.Sobel(img, cv2.CV_64F, 0, 1, ksize=3)
     ang = np.mod(np.arctan2(gy, gx), math.pi)  # unsigned
@@ -578,18 +548,14 @@ RECT_CASES = [
 @pytest.mark.parametrize("shape,grid", RECT_CASES)
 @pytest.mark.parametrize("stride", [(1, 1), (2, 2), (1, 3), (3, 1), (2, 4)])
 def test_exact_rectangular(shape, grid, stride):
-    rng2 = np.random.default_rng(
-        abs(hash((shape, tuple(map(tuple, grid)), stride))) % 2**32
-    )
+    rng2 = np.random.default_rng(abs(hash((shape, tuple(map(tuple, grid)), stride))) % 2**32)
     img = rng2.integers(0, 256, shape, np.uint8)
     sc = ss.FeatureComputer(shape, grid=grid, stride=stride)
     r = sc.compute(img)
     lv = ref_levels(img, grid, stride)
     refh, refc = ref_hog_extrema(img, grid, stride)
     for i in range(len(grid)):
-        assert np.array_equal(
-            r[f"struct_{i}"], lv[i]
-        ), f"struct L{i} {shape} {grid} {stride}"
+        assert np.array_equal(r[f"struct_{i}"], lv[i]), f"struct L{i} {shape} {grid} {stride}"
         assert np.array_equal(r[f"hog_{i}"], refh[i]), f"hog L{i}"
         assert np.array_equal(r[f"cnt_{i}"], refc[i]), f"cnt L{i}"
 
@@ -614,10 +580,8 @@ def test_hog_sum_equals_energy(img, stride):
     r = ss.FeatureComputer(img.shape, grid=grid, stride=stride).compute(img)
     for i in range(len(grid)):
         energy = r[f"struct_{i}"][..., 0] + r[f"struct_{i}"][..., 1]
-        assert np.array_equal(
-            r[f"hog_{i}"].sum(-1), energy
-        )  # every g^2 lands in one bin
-    eg = r["struct_global"] if "struct_global" in r else r["struct_global"]
+        assert np.array_equal(r[f"hog_{i}"].sum(-1), energy)  # every g^2 lands in one bin
+    eg = r["struct_global"]
     assert np.array_equal(r["hog_global"].sum(), eg[0] + eg[1])
 
 
@@ -634,9 +598,7 @@ def test_rot180_full_invariance():
     # per-cell: the map is a spatial flip of the cell grid (per-pixel values invariant)
     for i in range(len(grid)):
         for key in ("struct", "hog", "cnt"):
-            assert np.array_equal(
-                b[f"{key}_{i}"], a[f"{key}_{i}"][::-1, ::-1]
-            ), f"{key}_{i}"
+            assert np.array_equal(b[f"{key}_{i}"], a[f"{key}_{i}"][::-1, ::-1]), f"{key}_{i}"
 
 
 def test_extrema_flip_transpose_invariant():
@@ -689,21 +651,17 @@ def test_ramp_single_orientation_no_extrema():
 
 def test_plateau_has_no_strict_extrema():
     assert (
-        ss.FeatureComputer((256, 256), grid=[(5, 5)])
-        .compute(solid_square())["cnt_global"]
-        .sum()
+        ss.FeatureComputer((256, 256), grid=[(5, 5)]).compute(solid_square())["cnt_global"].sum()
         == 0
     )
 
 
 def test_single_impulse_one_max():
-    c = ss.FeatureComputer((256, 256), grid=[(5, 5)]).compute(single_impulse())[
+    c = ss.FeatureComputer((256, 256), grid=[(5, 5)]).compute(single_impulse())["cnt_global"]
+    assert c[0] == 1 and c[1] == 0  # one bright isolated pixel, no minima
+    d = ss.FeatureComputer((256, 256), grid=[(5, 5)]).compute(single_impulse(v=0, bg=100))[
         "cnt_global"
     ]
-    assert c[0] == 1 and c[1] == 0  # one bright isolated pixel, no minima
-    d = ss.FeatureComputer((256, 256), grid=[(5, 5)]).compute(
-        single_impulse(v=0, bg=100)
-    )["cnt_global"]
     assert d[0] == 0 and d[1] == 1  # one dark isolated pixel
 
 
@@ -720,11 +678,7 @@ def test_border_impulse_suppressed(pos):
 def test_all_white_and_black_are_zero():
     for v in (0, 255):
         r = ss.FeatureComputer((256, 256), grid=[(5, 5)]).compute(flat(v))
-        assert (
-            r["struct_global"][:3].sum() == 0
-            if "struct_global" in r
-            else r["struct_global"][:3].sum() == 0
-        )
+        assert r["struct_global"][:3].sum() == 0
         assert r["hog_global"].sum() == 0
         assert r["cnt_global"].sum() == 0
 
@@ -759,9 +713,7 @@ def test_property_bounds(img):
     ).all()  # coherence
     hs = fe["hog_0"].sum(-1)
     active = raw[..., 0] + raw[..., 1] > 0
-    assert np.allclose(
-        hs[active], 1.0, atol=1e-5
-    )  # HOG L1-normalised where there is energy
+    assert np.allclose(hs[active], 1.0, atol=1e-5)  # HOG L1-normalised where there is energy
     assert (fe["cnt_0"] >= -1e-6).all() and (fe["cnt_0"] <= 1 + 1e-6).all()
 
 
@@ -815,9 +767,9 @@ def test_stride_sampling_is_per_cell_in_columns():
     sx = 4
     img = np.zeros((h, w), np.uint8)
     img[:] = (np.arange(w) % 2) * 60 + 40  # every pixel has a gradient
-    counts = ss.FeatureComputer((h, w), grid=[(0, 5)], stride=(1, sx)).compute(img)[
-        "struct_0"
-    ][..., 3]
+    counts = ss.FeatureComputer((h, w), grid=[(0, 5)], stride=(1, sx)).compute(img)["struct_0"][
+        ..., 3
+    ]
     per_cell = sum(1 for k in range(cwf) if k % sx == 0) * h  # rows all sampled (sy=1)
     assert (counts.ravel() == per_cell).all()
     assert per_cell == 1 * h  # only the cell's left column survives sx=4 > cw=3
@@ -924,9 +876,7 @@ def test_channel_axis_variants(axis):
     hwc = stack_hwc(chan_imgs(n, c))
     moved = _c(np.moveaxis(hwc, -1, axis))  # place channels on `axis`
     ref = groups(ss.FeatureComputer((n, n, c), grid=[(4, 4), (2, 2)]), hwc)
-    got = groups(
-        ss.FeatureComputer(moved.shape, grid=[(4, 4), (2, 2)], channel_axis=axis), moved
-    )
+    got = groups(ss.FeatureComputer(moved.shape, grid=[(4, 4), (2, 2)], channel_axis=axis), moved)
     for k in ref:
         assert np.array_equal(ref[k], got[k]), k
 

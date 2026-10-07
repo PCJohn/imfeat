@@ -194,7 +194,7 @@ October 2026 because no consumer read them (`fastdet` reads `maps`; `framegate` 
 `summary` and `hashes`). Every other output is the same bytes without them. What they were,
 how the pass made them and what they cost, so that putting them back is a revert, not a
 design: the commits are *Drop the cross-channel products: nothing reads them* and *Drop the
-projection profiles* (`git log --grep`), each a pure removal.
+projection profiles; document the removed outputs* (`git log --grep`), each a pure removal.
 
 ### Cross-channel covariance — was `Pyramid.cross`
 
@@ -222,9 +222,10 @@ row it had every channel's centred pixels `w = v − 128` in 16-bit lanes and fo
 into the global); the flush restored the raw product by the binomial shift
 `Σ v_i v_j = Σ w_i w_j + 128 (Σ w_i + Σ w_j) + 128² n`, exactly in int64, and the derive step
 divided once per cell per pair (`cov` from the product and the two means, `corr` with one
-square root). Cost, measured by instruction count per fused frame on one thread (AVX2):
-3.6% at 1080p → 1024×576, 4.2% at 720p → 512×320, 6.3% at 720p → 256×256 — the products,
-their folds and roll-ups, and 6 extra float outputs per cell.
+square root). Cost, measured as the instructions the core executed per fused frame on one
+thread (AVX2 build, callgrind): 3.1% at 1080p → 1024×576, 3.8% at 720p → 512×320, 3.7% at
+720p → 256×256 — the products, their folds and roll-ups, and 6 extra float outputs per
+cell.
 
 ### Projection profiles — were `Pyramid.profiles`
 
@@ -250,7 +251,8 @@ end of the cell row. The band column sums were summed across bands after the joi
 profiles were finished as `128 + sum / count` in double. Cost: two vector adds per half block
 per row in the kernel, two load-add-stores per half block per block at the fold, one
 horizontal reduction per sampled row per channel, and `(R + K) · C` doubles of output per
-frame — a few percent of the kernel's adds; the oracle test (`test_projection_profiles`,
+frame — measured the same way as above, 2.4% of the frame at 1080p → 1024×576, 1.4% at
+720p → 512×320 and 0.7% at 720p → 256×256; the oracle test (`test_projection_profiles`,
 exact against the numpy row and column means of the sampled pixels at every stride and thread
 count) went with the feature.
 

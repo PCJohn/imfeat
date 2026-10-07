@@ -16,10 +16,9 @@ layout (n_feat, C, 4) (the C axis dropped for 2-D input). Tiers:
 
 import numpy as np
 import pytest
+from conftest import groups
 
 import imfeat
-
-from conftest import groups
 
 rng = np.random.default_rng(0)
 
@@ -58,14 +57,15 @@ def test_summary_matches_cell_reduction(grid, stride, nch):
             assert got.shape == ref.shape, f"{g}_summary_{i} shape"
             # min/max exact in the map's own dtype; mean/std to tolerance
             assert np.array_equal(got[..., :2], ref[..., :2]), f"{g}_summary_{i} min/max"
-            assert np.allclose(got[..., 2:], ref[..., 2:], rtol=1e-4, atol=1e-5), (
-                f"{g}_summary_{i} mean/std"
-            )
+            assert np.allclose(
+                got[..., 2:], ref[..., 2:], rtol=1e-4, atol=1e-5
+            ), f"{g}_summary_{i} mean/std"
 
 
 def test_only_grid_levels_have_summaries():
-    f = groups(imfeat.FeatureComputer((32, 32, 3), grid=[(5, 5), (3, 3)]),
-        rng.integers(0, 256, (32, 32, 3), np.uint8)
+    f = groups(
+        imfeat.FeatureComputer((32, 32, 3), grid=[(5, 5), (3, 3)]),
+        rng.integers(0, 256, (32, 32, 3), np.uint8),
     )
     assert "mom_summary_0" in f and "mom_summary_1" in f
     assert "mom_summary_global" not in f  # the 1-cell global reduction is trivial

@@ -4,10 +4,9 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
+from conftest import frame
 
 import imfeat
-
-from conftest import frame
 
 LAP1 = 36  # raw slots: sum(L), sum(L^2), then the six Laws sums of squares in TEXTURE order
 L3, E3, S3 = np.array([1, 2, 1]), np.array([-1, 0, 1]), np.array([-1, 2, -1])
@@ -93,4 +92,3 @@ def test_texture_features(shape, grid, stride):
         -1,
     )
     np.testing.assert_allclose(got, want, rtol=2e-6, atol=1e-6)
-

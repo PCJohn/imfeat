@@ -13,10 +13,9 @@ import time
 
 import numpy as np
 import pytest
+from conftest import frame, groups, latency
 
 import imfeat
-
-from conftest import frame, groups, latency
 
 pytestmark = pytest.mark.bench
 
@@ -109,7 +108,7 @@ def sweep(n, k, c):
         fc = imfeat.FeatureComputer(img.shape, grid=pyramid(k), stride=s, feature_space=None)
         out = groups(fc, img)
         ref = ref or out
-        ms = latency(lambda: fc.features(img), reps=50, warm=5)["min"]
+        ms = latency(lambda fc=fc: fc.features(img), reps=50, warm=5)["min"]
         base = base or ms
         rows[s] = {"ms": ms, "speedup": base / ms, **quality(ref, out)}
     return rows
@@ -167,7 +166,7 @@ def test_per_channel_cost(n, k):
     for c in CHANNELS:
         im = synth(n, c)
         fc = imfeat.FeatureComputer(im.shape, grid=pyramid(k), stride=2, feature_space=None)
-        ms = latency(lambda: fc.features(im), reps=50, warm=5)["min"]
+        ms = latency(lambda fc=fc, im=im: fc.features(im), reps=50, warm=5)["min"]
         print(f"  C={c:>2}: {ms:7.3f} ms  ({ms / c:6.3f} ms/channel)")
 
 
@@ -186,8 +185,8 @@ def test_thread_phases(n, k, stride):
             img.shape, grid=pyramid(k), stride=stride, threads=nt, feature_space=None
         )
         view = fc._view(img)
-        acc = latency(lambda: fc._impl.raw(view))["min"]
-        st = latency(lambda: fc.features(img))
+        acc = latency(lambda fc=fc, view=view: fc._impl.raw(view))["min"]
+        st = latency(lambda fc=fc: fc.features(img))
         a0, t0 = a0 or acc, t0 or st["min"]
         print(
             f"  threads={fc.threads} {acc:8.3f} {a0 / acc:5.2f}x "
@@ -228,7 +227,12 @@ def interleaved(fns, reps=100, warm=10):
         v *= 1e3
         p50, p90, p99 = np.percentile(v, [50, 90, 99])
         out[name] = {
-            "min": v.min(), "mean": v.mean(), "std": v.std(), "p50": p50, "p90": p90, "p99": p99
+            "min": v.min(),
+            "mean": v.mean(),
+            "std": v.std(),
+            "p50": p50,
+            "p90": p90,
+            "p99": p99,
         }
     return out
 
@@ -407,29 +411,50 @@ def test_resize_policy(threads):
     print(f"  {'':52s} {STATS_HEAD}   build   Mpx")
     for src in ((720, 1280), (1080, 1920), (2160, 3840)):
         bgr = frame((*src, 3))
-        kw = dict(grid=pyramid(k), threads=threads)
+        kw = {"grid": pyramid(k), "threads": threads}
         if min(src) >= fixed:  # the fixed size downscales: fused, as today
-            build = [latency(lambda: imfeat.FeatureComputer(bgr.shape, thumb=fixed, **kw), 5, 1)]
+            build = [
+                latency(
+                    lambda bgr=bgr, kw=kw: imfeat.FeatureComputer(bgr.shape, thumb=fixed, **kw),
+                    5,
+                    1,
+                )
+            ]
             on_frame = imfeat.FeatureComputer(bgr.shape, thumb=fixed, **kw)
-            fns = {f"fixed {fixed}: fused pass": lambda: on_frame.features(bgr)}
+            fns = {
+                f"fixed {fixed}: fused pass": lambda on_frame=on_frame, bgr=bgr: on_frame.features(
+                    bgr
+                )
+            }
         else:  # the fixed size upscales: cv2 (bilinear) then the pass on its output
-            build = [latency(lambda: imfeat.FeatureComputer((fixed, fixed, 3), **kw), 5, 1)]
+            build = [latency(lambda kw=kw: imfeat.FeatureComputer((fixed, fixed, 3), **kw), 5, 1)]
             on_thumb = imfeat.FeatureComputer((fixed, fixed, 3), **kw)
             fns = {
-                f"fixed {fixed}: cv2.resize up (bilinear) + pass": lambda: on_thumb.features(
-                    cv2.resize(bgr, (fixed, fixed))
+                f"fixed {fixed}: cv2.resize up (bilinear) + pass": (
+                    lambda on_thumb=on_thumb, bgr=bgr: on_thumb.features(
+                        cv2.resize(bgr, (fixed, fixed))
+                    )
                 )
             }
         pixels = [fixed * fixed]
         for policy in imfeat.THUMB_POLICIES:
             build.append(
-                latency(lambda: imfeat.FeatureComputer(bgr.shape, thumb=policy, **kw), 5, 1)
+                latency(
+                    lambda bgr=bgr, policy=policy, kw=kw: imfeat.FeatureComputer(
+                        bgr.shape, thumb=policy, **kw
+                    ),
+                    5,
+                    1,
+                )
             )
             fc = imfeat.FeatureComputer(bgr.shape, thumb=policy, **kw)
+            assert fc.thumb is not None
             rows_, cols = fc.thumb
             assert fc.thumb == imfeat.thumb_size(bgr.shape, policy) and fc.thumb_policy == policy
             same = " (the same size)" if fc.thumb == (fixed, fixed) else ""
-            fns[f"{policy} -> {cols}x{rows_}: fused pass{same}"] = lambda fc=fc: fc.features(bgr)
+            fns[f"{policy} -> {cols}x{rows_}: fused pass{same}"] = (
+                lambda fc=fc, bgr=bgr: fc.features(bgr)
+            )
             pixels.append(rows_ * cols)
         rows = interleaved(fns, reps=40, warm=5)
         for (name, st), b, px in zip(rows.items(), build, pixels):

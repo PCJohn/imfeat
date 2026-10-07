@@ -1,0 +1,10 @@
+# The style core.cpp was written in. `clang-format -i src/imfeat/core.cpp` (clang-format 18).
+BasedOnStyle: LLVM
+ColumnLimit: 100
+BreakBeforeBraces: Allman
+AlwaysBreakTemplateDeclarations: Yes
+AllowShortIfStatementsOnASingleLine: WithoutElse
+AllowShortLoopsOnASingleLine: true
+AllowShortCaseLabelsOnASingleLine: true
+IncludeBlocks: Preserve
+SortIncludes: Never

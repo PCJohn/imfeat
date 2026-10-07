@@ -248,7 +248,7 @@ def test_pass_resizes_by_policy(src, i, policy):
     fixed = imfeat.FeatureComputer(shape=frame.shape, grid=grid, stride=2, threads=2, thumb=size)
     assert by_policy.thumb == size == fixed.thumb
     assert by_policy.thumb_policy == policy and fixed.thumb_policy is None
-    out = np.empty((*by_policy.thumb, 3), np.uint8)
+    out = np.empty((*size, 3), np.uint8)
     assert_same_outputs(by_policy.features(frame, thumb_out=out), on_thumb.features(small))
     assert np.array_equal(out, small)
     assert_same_outputs(by_policy.features(frame), fixed.features(frame))
@@ -341,9 +341,13 @@ def frame_1080p() -> np.ndarray:
 def test_pass_resizes_exactly(frame_1080p, stride, threads, channels, feature_space):
     frame = frame_1080p
     thumb = cv_resize(frame, THUMB)
-    kw = dict(
-        grid=GRID, stride=stride, channels=channels, threads=threads, feature_space=feature_space
-    )
+    kw = {
+        "grid": GRID,
+        "stride": stride,
+        "channels": channels,
+        "threads": threads,
+        "feature_space": feature_space,
+    }
     on_thumb = imfeat.FeatureComputer(shape=thumb.shape, **kw)
     on_frame = imfeat.FeatureComputer(shape=frame.shape, thumb=THUMB, **kw)
     assert on_frame.thumb == THUMB and on_thumb.thumb is None
