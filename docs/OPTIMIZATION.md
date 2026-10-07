@@ -29,7 +29,8 @@ sum of its finest level, and a Highway SIMD core. What it did differently:
 | cell, cell row | a cell of the finest grid; one row of such cells |
 | block | one vector's worth of adjacent sampled columns (32 with AVX2), the unit the kernel works on |
 | lane | one element of a SIMD vector |
-| sums | the 44 additive int64 quantities accumulated per cell per channel (plus one per channel pair) |
+| sums | the 44 additive int64 quantities accumulated per cell per channel |
+| gate's operating point | what framegate runs per frame: a 720p frame thumbnailed to 512×320 (`"pow2-fit"`) or a 1080p one to 1024×576, HSV, stride 1, six levels from 64×64, two threads |
 | slots | those sums laid out cell by cell, `[cell][channel][44]`: the form the pyramid levels and `compute()` use |
 | fold | summing an accumulator's column lanes into per-cell sums |
 | derive | turning a cell's sums into its float features |
@@ -51,7 +52,8 @@ Xeon, in ms. The laptop shows the same ratios.
 | 1024×1024×1, 32×32, stride 1 | 22.5 | 2.68 | 8.4× |
 | 1024×1024×16, 32×32, stride 2 | 39.9 | 16.0 | 2.5× |
 
-"Now" also computes nine features and two profiles that the original did not.
+"Now" also computes nine features that the original did not (and, until step 9, two
+projection profiles and the channel-pair covariances).
 
 The same story in machine-independent terms: operations executed per `features()` call on a
 256×256×3 frame, 32×32 finest grid, stride 2 (AVX2 build, counted with valgrind; "vector"
@@ -102,6 +104,8 @@ Chronologically. Times are single-thread `features()`; instruction counts are pe
 | 5 | Per-cell stage reworked (details below) | instructions 6.37 M → 5.23 M (−18%); Xeon 0.58 → 0.42 ms (−28%); laptop 0.45 → 0.35 ms (−22%) |
 | 6 | BGR → HSV conversion fused into the row gather (details below) | development VM (AVX-512), 1024×1024×3 stride 1, one thread: `cvtColor` + pass 11.45 → 10.27 ms; the conversion costs 0.6 ms inside the pass, against `cvtColor`'s 1.4 ms plus a write and a read of the image. Its kernel went from 0.96 to 0.84 ns per pixel on the AVX-512 build and 1.8 to 1.2 on the AVX2 one between the first and the second version |
 | 7 | The `INTER_AREA` thumbnail resize fused into the pass (details below) | development VM, 1920×1080×3 → 1024×1024, finest-64 stride 1: `cv2.resize` + pass 17.4 → 14.4 ms on one thread and 13.0 → 8.3 ms on two; the resize costs 3.9 ms inside the pass on one thread and 2.1 on two, against `cv2.resize`'s 13.5 ms on one thread and 6.6 on its two, plus a write and a read of the thumbnail. On its own the kernel takes 0.31× `cv2.resize`'s time per thread |
+| 8 | The cross-channel products dropped: nothing read them (details below) | instructions per fused frame in the core, one thread, AVX2: 720p → 512×320 52.0 M → 50.0 M (−3.8%), 720p → 256×256 42.8 M → 41.2 M (−3.7%), 1080p → 1024×576 112.6 M → 109.1 M (−3.1%) |
+| 9 | The projection profiles dropped, likewise | 50.0 M → 49.3 M (−1.4%), 41.2 M → 40.9 M (−0.7%), 109.1 M → 106.5 M (−2.4%) at the same three points; −5.2%, −4.4% and −5.4% against step 7 for the two together |
 
 **Step 1, the kernel.** Besides the change of lane, three algebraic rewrites turn every sum
 into a plain vector add:
@@ -267,6 +271,24 @@ costs 3.7 ms as the 1024 px square, 2.5 ms as 1024×576 and 9.4 ms as 1792×1024
 and 6.8 ms as 896×512. So `"pow2-fit"` keeps the shape and costs at most what the square
 does, on landscape frames; on portrait frames the two aspect policies swap roles.
 
+**Steps 8 and 9, the outputs nothing read.** By October 2026 the pass had two consumers,
+`fastdet` (which reads `maps`) and `framegate` (which reads `maps`, `summary` and `hashes`),
+and a line-level profile of the fused pass at the gate's operating point (AVX2 build, one
+thread, 720p → 512×320: 52.0 M instructions per frame) put the frame at roughly: the
+thumbnail resize 29%, the pixel kernel 19%, the folds 11%, the per-cell derivation 10%, the
+level roll-up 8%, the summary fold 6%, the rest 10%. Two outputs ran through most of those
+stages for no reader: the channel-pair products `Σ v_i v_j` (a `pmaddwd` per pair per half
+block per row, folded, rolled up and summed into the global like every other sum, then six
+divides and three square roots per cell) and the projection profiles (two vector adds per
+half block per row, two load-add-stores per block, a horizontal reduction per sampled row).
+Both were removed as pure deletions — [FEATURES.md §10](FEATURES.md) keeps their
+definitions, the way the pass made them and what they cost, so they can be put back as a
+revert — and every remaining output was checked byte for byte against the previous build over
+four clips at six operating points (1–3 threads, strides 1–4, four thumbnail rules; 20,400 and
+18,900 arrays). The block loop still carries up to `GMAX` (8) channels through a block
+together, which is what lets a block's cells be derived on the spot; it just no longer forms
+the products on the way.
+
 ## What did not work
 
 * **Transposing cell sums into slots with SIMD** — slower, twice. The eventual answer was not
@@ -301,6 +323,44 @@ does, on landscape frames; on portrait frames the two aspect policies swap roles
   (doubles the HOG cost); LBP concentration and extrema balance (exact functions of existing
   outputs — a linear fit from the 54 features already explains 74% and 60% of their
   variance); temporal difference energy (would make `features()` stateful).
+* **A planar layout for the maps** (September 2026; not in the tree). `FeatureComputer(...,
+  planar=True)` laid each feature of each channel out as one contiguous `(cy, cx)` plane
+  (`maps[i]` the same `(cy, cx, C·F)` array with strides `(cx, 1, plane)`), so that a
+  consumer taking the maps a feature at a time — fastdet's scorer bins whole planes — could
+  read them as they lie instead of packing a copy the size of the maps (3.7 MB a frame:
+  0.4 ms on the development VM, 0.58 ms on the laptop). The derive stage stored each
+  vector of a feature's lanes straight into a per-band scratch and wrote a cell row to its
+  planes in one run per plane; the summary fold transposed eight cells of eight planes in
+  registers and, as a side effect, was split over features across bands (each feature's
+  cells still added by one thread in order), which gained at two threads in both layouts
+  (720p, 512×320, two VM threads: 2.4 ms planar against 2.6 interleaved and 2.7 before).
+  Same bits in both layouts at 1–8 threads. It was not kept: MSVC needed the fold rewritten
+  twice (lambdas over `constexpr` locals, `if constexpr` branches instantiated), it was a
+  second output layout to keep correct, and the hosts' problem was solved on their side —
+  fastdet's scorer now reads the cell-major maps in place through a base pointer and two
+  strides per column, with no change to imfeat.
+* **The resize by periods** (October 2026; not in the tree). `INTER_AREA`'s cells tile the
+  row, so for a ratio `sw/dw = p/q` in lowest terms the taps of destination column `qj + m`
+  are column `m`'s moved `pj` source columns along, with the same weights. A kernel that cut
+  a row into eight segments of whole periods, interleaved their bytes once and resampled the
+  segments in lockstep — every tap one contiguous load, widen, convert, multiply and add,
+  eight periods a step, no shuffle window — with one vertical sweep over a ring of source
+  rows and the rounding packed through the saturating narrowings, kept every byte of
+  `cv2.resize` (eighteen sizes, six kinds of content, four channel counts, 1–3 threads, GCC
+  and clang, AVX2, AVX-512 and SSE4) and took the resize from 28.7 M to 17.0 M instructions
+  of a 112.7 M-instruction pass at 1080p → 1024×576, from 48.9 M to 11.0 M at 1080p →
+  256×256 and from 16.0 M to 6.7 M at 720p → 512×320 (development VM, AVX2, one thread);
+  wall clock, the fused pass at 1080p → 256×256 went 7.3 → 4.3 ms on one development-VM
+  thread, and on the laptop the resize inside a two-thread 720p → 512×320 pass measured
+  0.32 ms. The maintainer reverted it: the periodicity plan is a second resize kernel to
+  keep correct beside the window one, for a saving that at the gate's operating point is a
+  few tenths of a millisecond. The numbers stay here because the lever is real; the commit
+  (*Resize: the horizontal pass by periods in lockstep*) can be revived if the thumbnail
+  ever dominates again.
+* **float16 anywhere.** Asked and answered rather than tried: the pass holds integers until
+  the last step, and the few float stages (derive, summary) are float64/float32 for a
+  reason; numpy float16 arithmetic on the hosts' side is 5–15× *slower* than float32 (no
+  hardware path on x86), and it would change every output. Not an optimisation on any axis.
 
 ## Lessons
 
@@ -325,6 +385,15 @@ does, on landscape frames; on portrait frames the two aspect policies swap roles
 8. **Re-measure threading after optimising.** As single-thread latency falls, the fixed cost
    of waking a parked worker dominates; two threads went from a gain to a loss at 256×256 on
    one of the two test machines.
+9. **Count instructions inside the object, not the process.** A whole-process callgrind
+   difference between a 2-frame and a 12-frame run is contaminated by anything that happens
+   in one run and not the other — the first run of a fresh build compiles and writes the
+   package's `.pyc`, the second reads it — which made a −3.8% change read as −4.2% and a
+   −1.4% one as −5.6%. Sum the self cost of the library's own object (`cg_obj.py` in the
+   session notes: per-`ob=` totals of the callgrind file); those are identical run to run.
+10. **Ask what reads an output before optimising how it is made.** Two whole stages of the
+   pass (steps 8–9) had no consumer; deleting them was worth more than most kernel work and
+   carried no risk to the rest.
 
 ## Measuring
 
@@ -342,9 +411,10 @@ it accumulator loads and stores.
 
 ## Verifying
 
-* The repository's tests, extended from 599 to 853: oracle tests for the bar detector (numpy)
+* The repository's tests, extended from 599 to 853 (805 after the cross-channel and
+  profile tests went with their outputs): oracle tests for the bar detector (numpy)
   and for the texture sums (exact), over block geometries chosen to reach every kernel path;
-  output lifetime; profiles; threads 1, 2, 3, 4 and 8; the colour conversion against
+  output lifetime; threads 1, 2, 3, 4 and 8; the colour conversion against
   `cv2.cvtColor` on every BGR value, through the vector path and the scalar tail, and the
   fused pass against the pass on the converted image, byte for byte; the thumbnail resize
   against `cv2.resize(INTER_AREA)` on frames of twelve sizes, six kinds of content, four
@@ -372,8 +442,19 @@ float64 moments move by at most one unit in the last place when the code around 
   last place, once. Not done.
 * **int32 cell sums where a level's sample count bounds them** (all but `Σw⁴` and `Σg⁴` at
   typical finest levels): halves the per-cell data volume; an estimated −8% at small cells.
-* **Level 1 derived straight from the rolled-up sums**, and **channel-pair features four
-  cells per vector** (−6,000 scalar divide / square-root operations per frame).
+* **Level 1 derived straight from the rolled-up sums.** (The channel-pair features that
+  shared this item are gone, step 8.)
+* **Batched folds with the roll-up fused in.** At the gate's operating point the folds and
+  the level roll-up are about a fifth of the instructions; folding a cell row's blocks in one
+  sweep and adding straight into the level-1 row would remove most of the per-block
+  bookkeeping. Exact by construction (integer sums). Not started.
+* **The serial tail at two threads.** The summary fold and the two wake-ups per frame are
+  serial; the laptop's scaling of the 1080p pass at 1024 px (10.5 / 5.9 / 3.5 ms on 1 / 2 / 4
+  threads) puts the serial share near 12%. The band-independent summary above is the exact
+  fix for about half of it; one wake-up per frame instead of two is the rest.
+* **Lazy outputs.** `summary` and `hashes` are read by framegate, `maps` by both hosts, and
+  nothing else is made any more; if a host ever needs only `maps`, the summary fold (6% of
+  the frame) and the hash readout could be skipped per computer. Cheap to add, exact.
 * **Thread dispatch.** Two wake-ups of parked workers per frame plus a serial tail mean
   threads pay only from about a millisecond per frame.
 * **NEON** has not been re-measured since the kernel rewrite.

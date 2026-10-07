@@ -7,8 +7,7 @@ grid pyramid, 54 classical features: intensity **moments**, gradient **structure
 **orientation histogram**, **extrema densities**, a rotation-invariant **LBP** histogram,
 nonlinear **descriptors** of those, a **bar / stroke detector** and second-order **texture**
 energies (Laplacian, Laws). It also returns a per-level **summary** of every feature over
-the cells, whole-frame **projection profiles** and three `imagehash`-compatible **perceptual
-hashes**.
+the cells and three `imagehash`-compatible **perceptual hashes**.
 
 It is a C++17 / [Highway](https://github.com/google/highway) SIMD core behind a small
 [nanobind](https://github.com/wjakob/nanobind) Python API, built for the front of a real-time
@@ -29,7 +28,6 @@ p.maps[-1]     # (162,)        float32   the whole-frame (global) level
 p.moments[0]   # (32, 32, 3, 4) float64  [mean, var, m3, m4] at full precision
 p.summary[0]   # (54, 3, 4)    float64   each feature's [min, max, mean, std] over the cells
 p.hashes       # (3, 3)        uint64    [ahash, whash, phash] x channel
-p.profiles     # (rows, cols)  float64   mean of each sampled row / column, per channel
 
 f = p.maps[0].reshape(32, 32, 3, 54)       # free view: (cy, cx, channel, feature)
 energy_v = f[..., 2, imfeat.FEATURE_NAMES.index("energy")]
@@ -94,7 +92,6 @@ written out.
 | `moments` | `(cy, cx, C, 4)` | float64 | `MOMENTS` at full precision (m3, m4 outgrow float32) |
 | `summary` | `(F, C, 4)` | float64 | each feature over the level's cells as `SUMMARY_STATS = [min, max, mean, std]`; grid levels only |
 | `hashes` | `(3, C)`, not a list | uint64 | `HASHES = [ahash, whash, phash]`, whole frame |
-| `profiles` | `((R, C), (K, C))` | float64 | mean of each sampled row and of each sampled column, whole frame |
 
 `FEATURE_NAMES` concatenates the group tuples in order — index features by name, never by
 number:
@@ -165,7 +162,7 @@ Per channel and per cell ([docs/FEATURES.md](docs/FEATURES.md) has the definitio
 | descriptors | skew, kurtosis, edge sharpness, detail, HOG concentration / cardinality, gradient sparsity, RMS contrast | ratios and products a linear model cannot form |
 | bar detector | stroke cover, stroke-width spectrum, peak width, peakedness, polarity | fires on strokes, not on step edges |
 | texture | variance of the Laplacian, focus, six Laws 3×3 energies, line anisotropy | blur / sharpness, blobs, vertical-vs-horizontal strokes |
-| profiles, hashes | row / column projection profiles; aHash, wHash, pHash | whole frame: 1-D registration, near-duplicate keys |
+| hashes | aHash, wHash, pHash | whole frame: near-duplicate keys |
 
 Every feature is normalised per sample, so no level carries a cell-area factor and one shared
 head can read every level. Standardise per feature over a dataset before training (the

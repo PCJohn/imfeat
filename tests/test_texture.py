@@ -1,4 +1,4 @@
-"""Laplacian, Laws energies and projection profiles against numpy -- the sums exactly."""
+"""Laplacian and Laws energies against numpy -- the sums exactly."""
 
 from __future__ import annotations
 
@@ -94,18 +94,3 @@ def test_texture_features(shape, grid, stride):
     )
     np.testing.assert_allclose(got, want, rtol=2e-6, atol=1e-6)
 
-
-@pytest.mark.parametrize("shape,grid,stride", CASES)
-@pytest.mark.parametrize("threads", [1, 2, 3])
-def test_projection_profiles(shape, grid, stride, threads):
-    img = np.stack([frame(shape, seed) for seed in range(3)], -1)
-    sy, sx = strides(stride)
-    fc = imfeat.FeatureComputer(
-        img.shape, grid=[grid], stride=stride, threads=threads, feature_space=None
-    )
-    rows, cols = fc.features(img).profiles
-    m = mesh(shape, 1 << grid[1], sy, sx)
-    on_rows, on_cols = m.any(1), m.any(0)
-    sampled = np.where(m[..., None], img, 0).astype(np.float64)
-    np.testing.assert_allclose(rows, sampled.sum(1)[on_rows] / on_cols.sum(), rtol=1e-12)
-    np.testing.assert_allclose(cols, sampled.sum(0)[on_cols] / on_rows.sum(), rtol=1e-12)

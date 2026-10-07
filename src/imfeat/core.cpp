@@ -228,7 +228,6 @@ constexpr int KBIAS = 128; // kernel() takes moments of v - KBIAS
 
 struct Acc // one block of one channel
 {
-  V16 col[2]; // per half: the centred pixels down each column, for the column profile
   V32 pair[2][K_NPAIR], hog[4][HB - 1];
   V64 t4[2], sg4[4];
   V8 u8[K_NU8];
@@ -302,12 +301,11 @@ HWY_INLINE void bard(const uint8_t *const *t, size_t x, V8 c, const V8 *IF_RESTR
 // rows above/centre/below by columns left/mid/right, then bard()'s taps. Replicate padding is
 // already in the planes, so there is no border logic here. MASKED zeroes the off-mesh lanes
 // (mask: 255 on the sampling mesh) before anything pairs up columns; the uint8 counts are per
-// column, so they are masked once, at the fold. `rowsum` gathers the centred pixels over the
-// row's blocks for the row profile.
+// column, so they are masked once, at the fold.
 template <bool MASKED, bool ROW0>
 HWY_INLINE void kernel(const uint8_t *const *p, size_t x, const uint8_t *IF_RESTRICT mask,
                        const uint8_t *IF_RESTRICT valid, size_t vstride, int hok, int vok,
-                       const V16 *IF_RESTRICT rays, Acc &A, V32 &rowsum)
+                       const V16 *IF_RESTRICT rays, Acc &A)
 {
   const V8 aL = hn::LoadU(d8, p[0] + x), aM = hn::LoadU(d8, p[1] + x), aR = hn::LoadU(d8, p[2] + x);
   const V8 bL = hn::LoadU(d8, p[3] + x), c = hn::LoadU(d8, p[4] + x), bR = hn::LoadU(d8, p[5] + x);
@@ -380,14 +378,11 @@ HWY_INLINE void kernel(const uint8_t *const *p, size_t x, const uint8_t *IF_REST
     add<ROW0>(P[K_LAP2], hn::WidenMulPairwiseAdd(d32, lap, lap));
     const V16 gx = on_mesh(gx0), gy = on_mesh(hn::Sub(Le, La)),
               wc = on_mesh(hn::Sub(cc, hn::Set(d16, KBIAS)));
-    add<ROW0>(A.col[h], wc);
     const V16 w2 = hn::Mul(wc, wc);
     add<ROW0>(P[K_SXX], hn::WidenMulPairwiseAdd(d32, gx, gx));
     add<ROW0>(P[K_SYY], hn::WidenMulPairwiseAdd(d32, gy, gy));
     add<ROW0>(P[K_SXY], hn::WidenMulPairwiseAdd(d32, gx, gy));
-    const V32 t1 = hn::WidenMulPairwiseAdd(d32, wc, ones);
-    add<ROW0>(P[K_T1], t1);
-    rowsum = hn::Add(rowsum, t1);
+    add<ROW0>(P[K_T1], hn::WidenMulPairwiseAdd(d32, wc, ones));
     add<ROW0>(P[K_T2], hn::WidenMulPairwiseAdd(d32, wc, wc));
     add<ROW0>(P[K_T3], hn::WidenMulPairwiseAdd(d32, w2, wc));
     add<ROW0>(A.t4[h], hn::SumsOf2(hn::WidenMulPairwiseAdd(d32, w2, w2))); // 2^29 a pair: widen now
@@ -1644,25 +1639,16 @@ class FeatureComputer
   size_t block_cells_ = 1;    // cells a block spans (multi_)
   size_t lanes_ = 0;          // lanes in a row of one phase plane: w_ / phases_
   int up_shift_ = 0;          // log2 of level 1's fy: parents are whole powers of two of cells
-  std::vector<uint32_t> mesh_lanes_; // the lanes on the sampling mesh, for the column profile
   bool multi_ = false, masked_ = false;
   std::vector<uint8_t> kmask_, ktail_; // ... and the row's last block, when it overruns the row
-  // Projection profiles: the sum of the centred pixels along every sampled row and column.
-  std::vector<int64_t> rowprof_; // [sampled row][channel]; the column sums live in each band
-  double *prow_ = nullptr, *pcol_ = nullptr; // their means, in the output block
-  size_t oprow_ = 0, opcol_ = 0;
-  std::vector<size_t> prow_shape_, pcol_shape_;
 
   // Per-band state: the plane window and everything a cell row in flight touches.
   struct Scratch
   {
     std::vector<Acc> acc;              // [channel] block accumulators
     std::vector<const uint8_t *> rows; // [sampled row][channel][KPTR] kernel() lane bases
-    std::vector<V32> rowv;             // [sampled row][channel] row sums in flight, as pair lanes
-    std::vector<int32_t> col;          // [channel][lane] the band's column sums
     std::vector<int> rslot; // the window slot of each sampled row of the cell row in hand
-    int fslot = 0;          // ... of the next row to fill,
-    size_t rowidx = 0;      // and the cell row's first sampled row, counted from the image top
+    int fslot = 0;          // ... of the next row to fill
     std::vector<int> vok;              // [sampled row] bard lags whose rows are inside the image
     std::vector<int> rws;              // the cell row's sampled rows
     std::vector<int64_t> cells;  // [channel][K_N][cell]: the cell row's sums
@@ -2015,7 +2001,6 @@ class FeatureComputer
           }
         }
       }
-      std::fill_n(s.rowv.begin(), nr * c_, hn::Zero(d32));
       for (int k0 = 0; k0 < c_; k0 += G)
         for (size_t x0 = 0, cell = 0; x0 < lanes;
              x0 += multi_ ? N : (size_t)cw_, cell += block_cells_)
@@ -2036,8 +2021,7 @@ class FeatureComputer
                 auto run = [&](auto m, auto first)
                 {
                   kernel<decltype(m)::value, decltype(first)::value>(
-                      rp, x, mask, valid, bvalid_stride_, bard_lagmask_, s.vok[q], rays, s.acc[k],
-                      s.rowv[q * c_ + k0 + k]);
+                      rp, x, mask, valid, bvalid_stride_, bard_lagmask_, s.vok[q], rays, s.acc[k]);
                 };
                 if (msk)
                   q ? run(std::true_type(), std::false_type())
@@ -2077,13 +2061,6 @@ class FeatureComputer
               {
                 const bool ad = adds[2 * h];
                 int64_t *IF_RESTRICT ch = cb + at[2 * h];
-                // the column profile: one lane per column, straight into the band's sums
-                int32_t *IF_RESTRICT cp =
-                    s.col.data() + (size_t)(k0 + k) * (lanes + N) + x + h * N / 2;
-                const V32 lo = hn::PromoteLowerTo(d32, A.col[h]),
-                          hi = hn::PromoteUpperTo(d32, A.col[h]);
-                hn::StoreU(hn::Add(hn::LoadU(d32, cp), lo), d32, cp);
-                hn::StoreU(hn::Add(hn::LoadU(d32, cp + N / 4), hi), d32, cp + N / 4);
                 for (int t = 0; t < K_NUNSIGNED; ++t)
                   fold32<false>(A.pair[h][t], g / 2, ad, ch + t * nxs);
                 for (int t = K_NUNSIGNED; t < K_NPAIR; ++t)
@@ -2110,9 +2087,6 @@ class FeatureComputer
               }
             }
           }
-      for (size_t q = 0; q < nr; ++q)
-        for (int k = 0; k < c_; ++k)
-          rowprof_[(s.rowidx + q0 + q) * c_ + k] = hn::ReduceSum(d32, s.rowv[q * c_ + k]);
     }
     if (!local) flush(s.cells.data(), nxs, 0, nfx, 0, c_, n, dst);
     if (derives && rolls) s.up_n += n * levels_[1].fx;
@@ -2255,7 +2229,6 @@ class FeatureComputer
     const size_t nfx = (size_t)fine.nx;
     Scratch &s = scr_[bi];
     int64_t *IF_RESTRICT hs = bi ? s.hsum.data() : hsum_.data();
-    std::fill(s.col.begin(), s.col.end(), 0);
     if (resize_)
     {
       // The band's rows of the thumbnail, its halo included, made up front from the frame's
@@ -2288,13 +2261,11 @@ class FeatureComputer
     // row, once the window holds those rows and their halo.
     const int chh = h_ / fine.ny;
     std::vector<int> &rows = s.rws;
-    // the band's sampled rows in order: the next one, its window slot and its index from the top
+    // the band's sampled rows in order: the next one and its window slot
     int next = (bands_[bi].cy0 * chh + sy_ - 1) / sy_ * sy_, next_slot = next % slots_;
-    s.rowidx = (size_t)(next / sy_);
     rows.clear(); // (the last frame's last cell row)
     for (int cy = bands_[bi].cy0; cy < bands_[bi].cy1; ++cy)
     {
-      s.rowidx += rows.size(); // past the previous cell row's
       rows.clear();
       s.rslot.clear();
       for (; next < (cy + 1) * chh; next += sy_)
@@ -2688,22 +2659,6 @@ class FeatureComputer
 
   // aHash/wHash/pHash from the accumulated HN x HN value-sum grid, one hash per channel.
   // A pure readout of hsum_: no image traversal. Bits are packed row-major, MSB first.
-  // Mean intensity along every sampled row, and along every sampled column (the lanes on the
-  // sampling mesh, in order), from the sums of centred pixels the kernel kept.
-  void derive_profiles()
-  {
-    const size_t nr = prow_shape_[0], nc = pcol_shape_[0], lanes = lanes_;
-    for (size_t i = 0; i < nr * c_; ++i) prow_[i] = KBIAS + (double)rowprof_[i] / (double)nc;
-    for (int k = 0; k < c_; ++k)
-      for (size_t j = 0; j < mesh_lanes_.size(); ++j)
-      {
-        int64_t sum = 0;
-        for (const Scratch &sc : scr_)
-          sum += sc.col[(size_t)k * (lanes + hn::Lanes(d8)) + mesh_lanes_[j]];
-        pcol_[j * c_ + k] = KBIAS + (double)sum / (double)nr;
-      }
-  }
-
   void derive_hashes()
   {
     const int NHC = HN * HN;
@@ -3027,9 +2982,6 @@ public:
         tapcol_[9 + 4 * j] = col(-BARD_LAGS[j]);
         tapcol_[10 + 4 * j] = col(BARD_LAGS[j]);
       }
-      mesh_lanes_.clear();
-      for (size_t l = 0; l < lanes_; ++l)
-        if ((l % cw_) % step_ == 0) mesh_lanes_.push_back((uint32_t)l);
       // when cell_row() derives by the block, and there is a level for the sums to go up to
       rolls_ = multi_ && N / cw_ >= LD && group_ == c_ && levels_.size() > 1 &&
                (h_ / levels_[0].ny + sy_ - 1) / sy_ <= KROWS;
@@ -3122,11 +3074,6 @@ public:
         dctb_[(size_t)u * HN + n] = 2.0 * std::cos(PI * u * (2 * n + 1) / (2.0 * HN));
     hsum_.assign((size_t)HN * HN * c_, 0);
     ohash_ = place((size_t)NHASH * c_ * sizeof(uint64_t));
-    prow_shape_ = {(size_t)((h_ + sy_ - 1) / sy_), (size_t)c_};
-    pcol_shape_ = {(size_t)levels_[0].nx * ((w_ / levels_[0].nx + sx_ - 1) / sx_), (size_t)c_};
-    oprow_ = place(prow_shape_[0] * c_ * sizeof(double));
-    opcol_ = place(pcol_shape_[0] * c_ * sizeof(double));
-    rowprof_.assign(prow_shape_[0] * c_, 0);
     hshape_ = {(size_t)NHASH, (size_t)c_};
 
     // Split the finest cell rows evenly, then map each band back to image rows: cell
@@ -3150,8 +3097,6 @@ public:
       s.acc.resize((size_t)group_);
       s.rows.assign(nrows * c_ * KPTR, nullptr);
       s.vok.assign(nrows, 0);
-      s.rowv.assign(nrows * c_, hn::Zero(d32));
-      s.col.assign((size_t)c_ * ((size_t)(w_ / phases_) + N), 0);
       s.cells.assign((size_t)c_ * K_N * cells_stride() + N, 0);
       s.phase_stride = (int64_t)(w_ / phases_) + PAD_L + PAD_R;
       s.row_stride = s.phase_stride * phases_;
@@ -3218,13 +3163,10 @@ public:
     at(gfeat_, ogfeat_);
     at(gmom_, ogmom_);
     at(hash_, ohash_);
-    at(prow_, oprow_);
-    at(pcol_, opcol_);
     stream_ = true;
     accumulate(img, rs, cs, chs, thumb_out);
     derive();
     derive_hashes();
-    derive_profiles();
     auto view = [&](auto *data, const std::vector<size_t> &shape)
     {
       using T = std::remove_pointer_t<decltype(data)>;
@@ -3244,8 +3186,6 @@ public:
     all.append(mom);
     all.append(sums);
     all.append(view(hash_, hshape_));
-    all.append(view(prow_, prow_shape_));
-    all.append(view(pcol_, pcol_shape_));
     return all;
   }
 };

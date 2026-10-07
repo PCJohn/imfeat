@@ -19,19 +19,20 @@ channel-major, so `maps[i].reshape(cy, cx, C, 54)` separates channel and feature
 | 7 | second-order texture | `TEXTURE_FEATURES` | 41 | 9 |
 | 8 | intensity moments | `MOMENTS` | 50 | 4 |
 
-Not per channel: cross-channel covariance (§9). Whole frame only: projection profiles (§10)
-and perceptual hashes (§11).
+Whole frame only: the perceptual hashes (§9). Two outputs the pass used to make, the
+cross-channel covariance and the projection profiles, were removed when nothing read them;
+§10 keeps their definitions, so they can be put back without rediscovering them.
 
 Where they are useful, roughly:
 
 | task | features that carry it |
 |---|---|
-| text / OCR front end | bar detector, `line_aniso`, `laws_ls` / `laws_sl`, HOG cardinality, skew and kurtosis, row profile |
+| text / OCR front end | bar detector, `line_aniso`, `laws_ls` / `laws_sl`, HOG cardinality, skew and kurtosis |
 | person / object detection | HOG, LBP, structure tensor; cell means across levels give Haar-like differences |
 | counting, blobs | extrema densities, `lap_var`, `laws_ss` |
 | texture segmentation | LBP, Laws energies, moments, HOG concentration |
-| scene classification | the HOG pyramid (GIST-like), moments, cross-channel correlation |
-| registration, stabilisation | projection profiles, cornerness (Shi–Tomasi trackability), hashes |
+| scene classification | the HOG pyramid (GIST-like), moments |
+| registration, stabilisation | cornerness (Shi–Tomasi trackability), hashes |
 | blur / quality gating | `lap_var`, `focus`, `edge_sharpness` |
 
 ---
@@ -168,22 +169,7 @@ The residual offset `d = T1/n` is at most 0.5, so `var = T2/n − d²` has nothi
 cancel: verified to rtol 1e-12 against numpy even on inputs drawn from `{250, 251}`, where the
 naive `S2/n − mean²` loses ten digits.
 
-## 9. Cross-channel covariance — `Pyramid.cross`
-
-For each unordered channel pair, `[cov, corr]` of the two channels' pixel values over the
-cell — the only feature relating channels. On RGB it separates neutral regions (all pairs ~+1)
-from saturated colour; on HSV or opponent spaces it picks up chromatic structure. One extra
-sum per pair, `Σ v_i·v_j`. Pairs are listed in `fc.channel_pairs`; the group is empty for a
-single channel and for `C > 8`, where the quadratic pair count is not paid silently.
-
-## 10. Projection profiles — `Pyramid.profiles`
-
-`(rows, cols)`: the mean intensity of every sampled row, `(R, C)`, and of every sampled column,
-`(K, C)`, over the whole frame. Correlate a frame's profiles with the previous frame's for a
-1-D shift estimate at the sampling pitch; valleys of the row profile are gaps between text
-lines. (At cell pitch the same profiles are the `mean` feature averaged along an axis.)
-
-## 11. Perceptual hashes — `Pyramid.hashes`
+## 9. Perceptual hashes — `Pyramid.hashes`
 
 Three `imagehash`-compatible hashes, one `uint64` per channel, bits packed row-major MSB first.
 All are readouts of a box-pooled mean grid, i.e. of the `S1` sums the pass already has:
@@ -200,6 +186,73 @@ over rows already in cache. `imfeat` box-pools where `imagehash` resizes with La
 bits are identical where no resize occurs (8×8 / 32×32 inputs, asserted by the tests) and on
 natural 256×256 frames the relative Hamming distance is ~0.00 (`whash`), ~0.01 (`phash`) and
 ~0.12 (`ahash`).
+
+## 10. Removed outputs: cross-channel covariance and projection profiles
+
+Both were computed in the same pass from the day the pass existed and were dropped in
+October 2026 because no consumer read them (`fastdet` reads `maps`; `framegate` reads `maps`,
+`summary` and `hashes`). Every other output is the same bytes without them. What they were,
+how the pass made them and what they cost, so that putting them back is a revert, not a
+design: the commits are *Drop the cross-channel products: nothing reads them* and *Drop the
+projection profiles* (`git log --grep`), each a pure removal.
+
+### Cross-channel covariance — was `Pyramid.cross`
+
+For each unordered channel pair `(i, j)`, `i < j`, the covariance and the Pearson
+correlation of the two channels' pixel values over the cell's samples `Ω`:
+
+```
+cov  = Σ v_i·v_j / n − mean_i·mean_j
+corr = cov / sqrt(var_i · var_j)          (0 when either variance is 0)
+```
+
+with `mean` and `var` the cell's own moments (§8). Shape per level `(cy, cx, P, 2)` float32
+over `CROSS_FEATURES = ("cov", "corr")`, `P = C(C−1)/2` pairs in lexicographic order
+(`(0,1), (0,2), (1,2)` for three channels; `fc.channel_pairs` listed them), plus a `(P, 2)`
+whole-frame entry; empty for one channel and for `C > 8` (`XMAX`), where the quadratic pair
+count was not paid silently. The only feature that related channels: on RGB it separates
+neutral regions (all pairs ≈ +1) from saturated colour, on HSV or opponent spaces it picks up
+chromatic structure. `compute()` exposed the raw sums as `xchan_i`, `(cy, cx, P)` int64.
+
+How the pass made it: one more additive int64 sum per cell per pair, `Σ v_i·v_j`. The
+kernel carries up to 8 channels through a block together, so after the per-channel work of a
+row it had every channel's centred pixels `w = v − 128` in 16-bit lanes and formed
+`Σ w_i·w_j` with one `pmaddwd` per pair per half block, accumulated like every other sum
+(assigned on the first row, folded to cells once per block, rolled up by pairwise adds, summed
+into the global); the flush restored the raw product by the binomial shift
+`Σ v_i v_j = Σ w_i w_j + 128 (Σ w_i + Σ w_j) + 128² n`, exactly in int64, and the derive step
+divided once per cell per pair (`cov` from the product and the two means, `corr` with one
+square root). Cost, measured by instruction count per fused frame on one thread (AVX2):
+3.6% at 1080p → 1024×576, 4.2% at 720p → 512×320, 6.3% at 720p → 256×256 — the products,
+their folds and roll-ups, and 6 extra float outputs per cell.
+
+### Projection profiles — were `Pyramid.profiles`
+
+`(rows, cols)`, float64: the mean intensity of every sampled row, `(R, C)`, and of every
+sampled column, `(K, C)`, over the whole frame, in image order, per channel. `R` is the number
+of sampled rows (`ceil(H / stride_y)`), `K` the number of sampled columns (the stride mesh
+restarts in every finest cell, so `K = cells_x · ceil(cell_w / stride_x)`); a row's mean is
+over the sampled columns and a column's over the sampled rows, so at stride 1 these are the
+plain row and column means of the thumbnail. At cell pitch the same profiles are the `mean`
+feature averaged along an axis; these are at pixel pitch.
+
+Intended uses: a 1-D signature of the frame — correlate a frame's profiles with another's for
+a horizontal and a vertical shift estimate at the sampling pitch (registration,
+stabilisation), or compare them for same-scene / same-location detection; the valleys of the
+row profile are the gaps between text lines.
+
+How the pass made it: the kernel already has the centred pixels `w = v − 128` of a block's
+row in 16-bit lanes; it added them into a per-column 16-bit accumulator (one add per half
+block per row, the sum of at most 128 rows fits), which the per-block fold widened and added
+into the band's int32 column sums, and it added the row's `Σ w` (the `T1` product it forms
+anyway) into a per-row int32 vector, reduced to one int64 per sampled row per channel at the
+end of the cell row. The band column sums were summed across bands after the join, and both
+profiles were finished as `128 + sum / count` in double. Cost: two vector adds per half block
+per row in the kernel, two load-add-stores per half block per block at the fold, one
+horizontal reduction per sampled row per channel, and `(R + K) · C` doubles of output per
+frame — a few percent of the kernel's adds; the oracle test (`test_projection_profiles`,
+exact against the numpy row and column means of the sampled pixels at every stride and thread
+count) went with the feature.
 
 ---
 
@@ -219,8 +272,7 @@ natural 256×256 frames the relative Hamming distance is ~0.00 (`whash`), ~0.01 
 | 36, 37 | Laplacian: `ΣL`, `ΣL²` |
 | 38..43 | squared Laws responses: EE, SS, LS, SL, ES, SE |
 
-plus one `Σ v_i·v_j` per channel pair. `compute()` exposes the first five groups and the pair
-sums by name; the rest are internal.
+`compute()` exposes the first five groups by name; the rest are internal.
 
 ## Using the pyramid
 

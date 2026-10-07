@@ -68,8 +68,6 @@ def assert_same_outputs(a: imfeat.Pyramid, b: imfeat.Pyramid) -> None:
             assert x.dtype == y.dtype and x.shape == y.shape, f"{name}[{i}]"
             assert np.array_equal(x, y), f"{name}[{i}]"
     assert np.array_equal(a.hashes, b.hashes)
-    for x, y in zip(a.profiles, b.profiles):
-        assert np.array_equal(x, y)
 
 
 # ---------------- the kernel on its own, against cv2.resize -----------------------------------

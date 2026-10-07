@@ -9,8 +9,8 @@ One traversal of the image produces, per pyramid cell per channel:
   * an LBP^riu2_{8,1} histogram          (10 rotation-invariant uniform-LBP bins)
   * derived nonlinear descriptors        (DESCRIPTOR_FEATURES, 8)
 
-plus three whole-frame perceptual hashes (aHash / wHash / pHash) per channel, the
-projection profiles, and a per-level summary of every feature over the level's cells.
+plus three whole-frame perceptual hashes (aHash / wHash / pHash) per channel and a
+per-level summary of every feature over the level's cells.
 
 Every accumulator is an additive integer sum, so coarser pyramid levels and the
 frame-wide "global" reduction are exact sums of the finest cells -- depth is free
@@ -214,16 +214,12 @@ class Pyramid(NamedTuple):
               trailing 4 channels of `maps`, kept at full precision because m3 and m4
               span a range float32 cannot hold to the accuracy the oracle tests demand
     summary : per level except global, (F, C, 4) float64 over SUMMARY_STATS
-    hashes  : (3, C) uint64 over HASHES, whole-frame
-    profiles: (rows, cols), float64 (R, C) and (K, C): mean intensity along each sampled row and
-              each sampled column, in order -- projection profiles, for 1-D shift estimates
-              and for finding text lines"""
+    hashes  : (3, C) uint64 over HASHES, whole-frame"""
 
     maps: list[np.ndarray]
     moments: list[np.ndarray]
     summary: list[np.ndarray]
     hashes: np.ndarray
-    profiles: tuple[np.ndarray, np.ndarray]
 
 
 _NS_RAW = 4  # raw structure-tensor width [Sxx, Syy, Sxy, count]
@@ -526,12 +522,8 @@ class FeatureComputer:
         cheap way to collect them.
         """
         # Every array arrives in its final layout, sharing ownership of this call's block.
-        maps, mom, summary, hashes, rows, cols = self._impl.features(
-            *self._inputs(img, thumb_out)
-        )
-        return Pyramid(
-            maps=maps, moments=mom, summary=summary, hashes=hashes, profiles=(rows, cols)
-        )
+        maps, mom, summary, hashes = self._impl.features(*self._inputs(img, thumb_out))
+        return Pyramid(maps=maps, moments=mom, summary=summary, hashes=hashes)
 
     def compute(
         self, img: np.ndarray, thumb_out: np.ndarray | None = None

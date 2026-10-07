@@ -42,7 +42,7 @@ def _keys(n_levels: int) -> list[str]:
 
 def groups(fc: imfeat.FeatureComputer, img: np.ndarray) -> dict[str, np.ndarray]:
     """Old-style dict: struct_i, hog_i, cnt_i, lbp_i, desc_i, bard_i, tex_i, mom_i,
-    *_summary_i, the three hashes and the profiles."""
+    *_summary_i and the three hashes."""
     p = fc.features(img)
     keys, out, two_d = _keys(len(p.maps)), {}, img.ndim == 2
     for i, m, mo in zip(keys, p.maps, p.moments):
@@ -60,9 +60,6 @@ def groups(fc: imfeat.FeatureComputer, img: np.ndarray) -> dict[str, np.ndarray]
             o += n
     for name, h in zip(imfeat.HASHES, p.hashes):
         out[name] = h[0] if two_d else h
-    for name, v in zip(("profile_rows", "profile_cols"), p.profiles):
-        v = v[..., None]  # (n, C, 1): the channel axis where every other group has it
-        out[name] = v[..., 0, :] if two_d else v
     return out
 
 
