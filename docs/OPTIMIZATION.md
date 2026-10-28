@@ -110,6 +110,7 @@ Chronologically. Times are single-thread `features()`; instruction counts are pe
 | 8 | The cross-channel products dropped: nothing read them (details below) | instructions per fused frame in the core, one thread, AVX2: 720p → 512×320 52.0 M → 50.0 M (−3.8%), 720p → 256×256 42.8 M → 41.2 M (−3.7%), 1080p → 1024×576 112.6 M → 109.1 M (−3.1%) |
 | 9 | The projection profiles dropped, likewise | 50.0 M → 49.3 M (−1.4%), 41.2 M → 40.9 M (−0.7%), 109.1 M → 106.5 M (−2.4%) at the same three points; −5.2%, −4.4% and −5.4% against step 7 for the two together |
 | 10 | The kernel rewritten as register-resident phases down the rows, with row responses cached and the HOG sums signed; then, from a callgrind profile, the per-block cell sums laid out kind-contiguous and the fold's whole-vector reductions through `ReduceSum` / `SumsOf8` (details below) | Ryzen 7 3700X (AVX2, GCC 11), one thread, `features()`, 4 levels: 1024×1024×3 finest-32 stride 1, 7.44 → 5.42 ms (1.37×); 1024×1024 (C=1), 2.50 → 1.85 (1.35×); 1024×1024×3 finest-64, 8.93 → 6.80 (1.31×); 512×512×3 finest-32, 2.22 → 1.71 (1.30×); 256×256×3 finest-32, 0.81 → 0.71 (1.15×); the fused BGR → HSV pass at 1024², finest-64, 9.85 → 7.74 (1.27×). Every output bit-identical |
+| 11 | The plane window made a sliding contiguous buffer (the halo copied forward when it fills, edge rows physically replicated) and the response slots affine, so every row and column tap in the kernel is a constant offset from one row pointer; one phase plane makes the column taps compile-time (`block<.., UNIT>`) | 1024×1024×3 finest-32 stride 1: 67.4 M → 61.8 M instructions per frame (−8%), wall clock unchanged within noise (the scalar work ran in parallel with the vector work, see the step); 8 px cells and 256² about −2%. Every output bit-identical |
 
 **Step 1, the kernel.** Besides the change of lane, three algebraic rewrites turn every sum
 into a plain vector add:
@@ -429,10 +430,8 @@ configuration gained little. Where a 2× would have to come from, and why it was
   `ConcatEven`/`ConcatOdd` per level) are what Highway gives. Not done.
 * **The window ring.** The bar detector's row loop carries about 20 scalar instructions of
   pointer arithmetic because the rolling window wraps, so each row's up/down taps need their
-  own offsets (and the 3×3 rows three). A window laid out so that a chunk's rows are always
-  contiguous (two cell rows deep, the halo copied forward every other chunk) would make them
-  constants: about 2–3% of the instructions for a quarter of a percent of extra copying.
-  Not done.
+  own offsets (and the 3×3 rows three). Done in step 11: the instructions went, the time did
+  not, because they had run on the integer pipes beside the vector work.
 * **Small cells** are dominated by the per-cell stages: at 4 px cells the derive is 18% of
   the instructions, the summary fold 9%, the fold 14%, the level roll-up 5%, each near its
   arithmetic floor (the summary is a min, max, sum and sum of squares in double per value).
@@ -443,6 +442,57 @@ configuration gained little. Where a 2× would have to come from, and why it was
   256×256×3 finest-32 at stride 2: −1%): a chunk is then 4 rows, and a dozen phase loops with
   their prologues cost more than the register residency saves. Those configurations are
   dominated by the per-cell stages anyway.
+
+**Step 11, the sliding window (October 2026).** The rest of the step 10 profile was
+bookkeeping: the energy loop carried 15 scalar instructions a row for its row-slot lookup
+(three index loads, six `lea`), the Laplacian loop 10, the bar detector 21 and the LBP 10 for
+the ring offsets, because the plane window was a ring of rows (image row y in slot
+`y % slots`) and so every row's above, below and lag rows had their own table entry.
+
+* *Affine response slots.* The response buffer is private to the chunk, so the slots were
+  simply laid out as `a · (q − qs) + role`, `a = min(stride, 3)`: at stride 1 a row's above
+  row is the centre of the one before and at stride 2 its below row, and the shared slot is
+  written twice with the same offset. The energy and Laplacian loops then walk one pointer
+  with constant displacements: 68 → 55 and 33 → 27 instructions a row.
+* *A contiguous window.* The ring became a buffer of `max(cell rows, 32) + 2·MAXLAG` rows
+  holding image rows `[wbase, filled)` in order at slots from 0; when a cell row's rows would
+  run past the end, the rows it keeps (the halo the two cell rows share, eight rows) are
+  moved to the front with one `memmove` per channel, a quarter of a percent of the gather.
+  Rows above and below the image are gathered as copies of the edge row (the gather clamps
+  the row index), so no tap is clamped either: the centre row of sampled row q is
+  `row0 + q · stride · rs`, its 3×3 rows `± rs`, a lag's rows `± lag · rs`. The `r3`, `ud`,
+  `r3slot` and `seen` tables went away.
+* *Compile-time column taps.* With one phase plane the column taps are −1, 0, 1 and ± the
+  lags, and the bar detector's lags are 1, 2, 4: `block<MASKED, UNIT>` hard-codes them, so a
+  lag's four taps are `[rb ± lag]` and `[m + rs · lag]` with x86's scale factors and no
+  register per tap. That mattered more than expected: with the taps runtime, GCC 11 ran out
+  of general registers in the bar detector's row loop, spilled eight tap offsets and, oddly,
+  stored each neighbour load to the stack and reloaded it twice (93 instructions a row);
+  clang kept the vectors but spent 31 scalar instructions a row on the same addresses. With
+  the constants the loop is 79 instructions, the LBP 80 (from 89), the row responses 36.
+
+Per frame at 1024×1024×3, finest-32, stride 1: 67.4 M → 61.8 M instructions, bit-identical
+on the GCC/AVX2, clang and SSE4-only builds (40,164 arrays each). The wall clock did not move
+(5.26 ms before and after, interleaved; 8 px cells and 256² about −2%): the scalar
+instructions had been executing on the integer pipes alongside the vector work, for free.
+What bounds the kernel is the vector pipes, and a microbenchmark of this core (ten
+independent register chains per instruction, inline assembly, pinned) says how: logic ops
+issue 4 a cycle, adds, min/max and compares 3, saturating subtracts, `psign`, `pshufb` and
+`punpck` 2, and every multiply (`pmaddwd`, `pmaddubsw`, `pmuldq`, `pmullw`, `psadbw`), the
+shifts and `pblendvb` 1 — one pipe for all of them. A block row issues about 78 multiplies
+(the HOG's 36 ray and energy tests, the energy phase's 18, the moments' 10, the bar
+detector's 6, `|grad|⁴`'s 8) and some 20 other single-pipe ops: about 95 cycles of that pipe
+out of the roughly 220 a block row takes, with the HOG loop within 20% of its own floor
+there (44 cycles of multiplies per block row against 59 measured by ablation). The other
+~420 vector ops a block row need at least 105 cycles over four pipes even without the
+restrictions. So the remaining slack is scheduling, not instruction count, and a 2× at one
+thread is not available from this instruction mix: it would need ~230 vector ops per block
+row, i.e. an algorithmic change of the features. What would still pay, in cycles of the
+multiply pipe rather than instructions: `|grad|⁴` in double (two converts and two FMAs, exact
+below 2⁵³, on the FMA pipes instead of two `pmuldq`), about 4% of that pipe; the widening of
+the row responses through `punpcklbw` (two pipes) instead of `pmovzxbw` (one), 6 a row,
+which changes the lane order and so the fold's cell mapping for cells under 16 px. Neither
+measurable on this shared machine, so not done.
 
 ## What did not work
 
@@ -568,6 +618,12 @@ configuration gained little. Where a 2× would have to come from, and why it was
   is useless for Highway code, since every intrinsic's cost lands on its header line, but
   per loop it gives the instruction, load, store, miss and mispredict counts of each phase
   exactly, and it is what found the cell-sum layout in step 10.
+* **Pipe widths.** Instruction counts stopped predicting time in step 11; what did was the
+  per-pipe issue width of the core, measured in five minutes with inline assembly: ten
+  independent register chains of one instruction in a counted loop, pinned to a core, ops per
+  nanosecond against the clock. It is the only way to know, without `perf`, that every
+  vector multiply shares one pipe on this core and the kernel's largest phase is within 20%
+  of that pipe's floor. Run it on the target core before trading instructions for anything.
 * **Instructions per frame**: `valgrind --tool=cachegrind` on a run of 4 frames and a run of
   24, differenced. `callgrind` with a few functions marked `noinline` gives the split by
   stage. For a fused pass driven from Python, `callgrind` on 2 and 12 frames with the self
@@ -598,7 +654,7 @@ it accumulator loads and stores.
 * AddressSanitizer over the suite. It caught a block-buffer stride that overran on tiny grids.
 * clang-format, cppcheck and `-Wall -Wextra -Wshadow`; ruff, black and mypy for the Python.
 
-Step 10 was checked the same way: 40,164 output arrays (eight shapes of 1–8 channels, five
+Steps 10 and 11 were checked the same way: 40,164 output arrays (eight shapes of 1–8 channels, five
 grids, six strides, two kinds of content, 1–3 threads, `features()` and `compute()`, the
 fused BGR → HSV and thumbnail paths) hashed on the AVX2 GCC build, the clang build and an
 SSE4-only build, each identical to the previous code's build with the same compiler and
