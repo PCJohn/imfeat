@@ -24,6 +24,13 @@
 #else
 #define IF_RESTRICT __restrict__
 #endif
+// A lambda that must be inlined (a loop body instantiated per compile-time case, whose
+// accumulators would otherwise go through memory around a call).
+#if defined(__GNUC__) || defined(__clang__)
+#define IF_LAMBDA_INLINE __attribute__((always_inline))
+#else
+#define IF_LAMBDA_INLINE // (MSVC: left to its judgement; only the speed depends on it)
+#endif
 // fold_summary() must square and add UNFUSED, as the scalar loop it replaced compiled: a fused
 // multiply-add rounds once where that rounded twice, which moves a std by an ulp. GCC would
 // contract the two intrinsics under -ffast-math, and so might clang.
@@ -331,6 +338,8 @@ struct Chunk
   const int64_t *rdist = nullptr;   // [sub * rdstride + slot]: a distinct row's plane offset
   const int *rdn = nullptr;         // [sub]: distinct rows of the sub-chunk
   size_t rdstride = 0, subrows = 0; // ... and the sampled rows a sub-chunk holds
+  bool whole = true;                // a cell is narrower than half a block: the HOG quarters
+                                    // must keep the pixels in order (see block())
   const int64_t *tapcol = nullptr;  // the column taps (KTAP)
   const uint8_t *base = nullptr;    // this channel's planes, at the block's first lane
   int16_t *resp = nullptr;          // [slot][NRESP][half][Lanes(d16)]
@@ -371,61 +380,68 @@ HWY_INLINE void block(const Chunk &C, const uint8_t *IF_RESTRICT mask,
   auto rows3 = [&](size_t q, const uint8_t *&ra, const uint8_t *&rb, const uint8_t *&re)
   { ra = C.base + C.r3[q * 3], rb = C.base + C.r3[q * 3 + 1], re = C.base + C.r3[q * 3 + 2]; };
   {
-    // strict 8-neighbour extrema: c > max  <=>  SatSub(c, max) != 0
-    V8 umax = hn::Zero(d8), umin = hn::Zero(d8);
-    for (size_t q = 0; q < C.nr; ++q)
-    {
-      const uint8_t *ra, *rb, *re;
-      rows3(q, ra, rb, re);
-      const V8 aL = hn::LoadU(d8, ra + tl), aM = hn::LoadU(d8, ra + tm),
-               aR = hn::LoadU(d8, ra + tr), bL = hn::LoadU(d8, rb + tl), c = hn::LoadU(d8, rb + tm),
-               bR = hn::LoadU(d8, rb + tr), eL = hn::LoadU(d8, re + tl),
-               eM = hn::LoadU(d8, re + tm), eR = hn::LoadU(d8, re + tr);
-      const V8 mx = hn::Max(hn::Max(hn::Max(aL, aM), hn::Max(aR, bL)),
-                            hn::Max(hn::Max(bR, eL), hn::Max(eM, eR)));
-      const V8 mn = hn::Min(hn::Min(hn::Min(aL, aM), hn::Min(aR, bL)),
-                            hn::Min(hn::Min(bR, eL), hn::Min(eM, eR)));
-      umax = hn::Add(umax, hn::Min(hn::SaturatedSub(c, mx), one));
-      umin = hn::Add(umin, hn::Min(hn::SaturatedSub(mn, c), one));
-    }
-    A.u8[K_MAX - K_U8] = umax;
-    A.u8[K_MIN - K_U8] = umin;
-  }
-  {
     // LBP^riu2: sign tests (0 / -1) in circular order NW N NE E SE S SW W, so their sum is
     // -popcount and the sum of neighbouring XORs is -transitions. Uniform (<= 2 transitions)
     // votes bin popcount; the rest vote nothing and are recovered at flush as count - sum.
-    V8 lbp[LBPB - 1];
+    // The strict 8-neighbour extrema ride on the same tests: a local maximum is a pixel no
+    // neighbour reaches, which is exactly bin 0 (popcount 0 is uniform); a local minimum is
+    // one below the neighbours' minimum, which the ring takes on the way
+    // (c < min  <=>  SatSub(min, c) != 0).
+    // The bins are counted in nibbles: five byte accumulators hold bins (0, 1), (2, 3), ...
+    // as low / high nibble counts, each row's vote a byte shuffle of the bin index (bin 9,
+    // the non-uniform codes, votes nothing), and they empty into the byte counts every
+    // LBP_NIB rows, before a nibble can overflow -- fewer accumulators and no compare per bin.
+    constexpr int LBP_NIB = 15, NPAIR = (LBPB - 1 + 1) / 2;
+    V8 lbp[LBPB - 1], umin = hn::Zero(d8), tbl[NPAIR];
     for (int j = 0; j < LBPB - 1; ++j) lbp[j] = hn::Zero(d8);
-    for (size_t q = 0; q < C.nr; ++q)
+    for (int k = 0; k < NPAIR; ++k)
     {
-      const uint8_t *ra, *rb, *re;
-      rows3(q, ra, rb, re);
-      const V8 c = hn::LoadU(d8, rb + tm);
-      auto ge = [&](const uint8_t *p)
+      uint8_t t[16] = {};
+      t[2 * k] = 1;
+      if (2 * k + 1 < LBPB - 1) t[2 * k + 1] = 16;
+      tbl[k] = hn::Dup128VecFromValues(d8, t[0], t[1], t[2], t[3], t[4], t[5], t[6], t[7], t[8],
+                                       t[9], t[10], t[11], t[12], t[13], t[14], t[15]);
+    }
+    for (size_t q0 = 0; q0 < C.nr; q0 += LBP_NIB)
+    {
+      V8 nib[NPAIR];
+      for (int k = 0; k < NPAIR; ++k) nib[k] = hn::Zero(d8);
+      for (size_t q = q0; q < std::min(C.nr, q0 + LBP_NIB); ++q)
       {
-        const V8 nb = hn::LoadU(d8, p);
-        return hn::VecFromMask(d8, hn::Eq(hn::Max(nb, c), nb));
-      };
-      const V8 s0 = ge(ra + tl);
-      V8 prev = s0, npc = s0, ntr = hn::Zero(d8);
-      auto next = [&](const uint8_t *p) // the ring, a neighbour at a time: few tests stay alive
+        const uint8_t *ra, *rb, *re;
+        rows3(q, ra, rb, re);
+        const V8 c = hn::LoadU(d8, rb + tm);
+        V8 mn = hn::LoadU(d8, ra + tl);
+        auto ge = [&](V8 nb) { return hn::VecFromMask(d8, hn::Eq(hn::Max(nb, c), nb)); };
+        const V8 s0 = ge(mn);
+        V8 prev = s0, npc = s0, ntr = hn::Zero(d8);
+        auto next = [&](const uint8_t *p) // the ring, a neighbour at a time: few tests stay alive
+        {
+          const V8 nb = hn::LoadU(d8, p), si = ge(nb);
+          mn = hn::Min(mn, nb);
+          npc = hn::Add(npc, si);
+          ntr = hn::Add(ntr, hn::Xor(prev, si));
+          prev = si;
+        };
+        next(ra + tm), next(ra + tr), next(rb + tr), next(re + tr), next(re + tm), next(re + tl),
+            next(rb + tl);
+        ntr = hn::Add(ntr, hn::Xor(prev, s0));
+        umin = hn::Add(umin, hn::Min(hn::SaturatedSub(mn, c), one));
+        const auto uniform = hn::Gt(hn::BitCast(di8, ntr), hn::Set(di8, -3));
+        const V8 bin = hn::IfThenElse(hn::RebindMask(d8, uniform), hn::Sub(hn::Zero(d8), npc),
+                                      hn::Set(d8, (uint8_t)(LBPB - 1)));
+        for (int k = 0; k < NPAIR; ++k) nib[k] = hn::Add(nib[k], hn::TableLookupBytes(tbl[k], bin));
+      }
+      for (int k = 0; k < NPAIR; ++k)
       {
-        const V8 si = ge(p);
-        npc = hn::Add(npc, si);
-        ntr = hn::Add(ntr, hn::Xor(prev, si));
-        prev = si;
-      };
-      next(ra + tm), next(ra + tr), next(rb + tr), next(re + tr), next(re + tm), next(re + tl),
-          next(rb + tl);
-      ntr = hn::Add(ntr, hn::Xor(prev, s0));
-      const auto uniform = hn::Gt(hn::BitCast(di8, ntr), hn::Set(di8, -3));
-      const V8 code =
-          hn::BitCast(d8, hn::IfThenElse(uniform, hn::BitCast(di8, npc), hn::Set(di8, 1)));
-      for (int j = 0; j < LBPB - 1; ++j)
-        lbp[j] = hn::Sub(lbp[j], hn::VecFromMask(d8, hn::Eq(code, hn::Set(d8, (uint8_t)-j))));
+        lbp[2 * k] = hn::Add(lbp[2 * k], hn::And(nib[k], hn::Set(d8, 0x0F)));
+        if (2 * k + 1 < LBPB - 1)
+          lbp[2 * k + 1] = hn::Add(lbp[2 * k + 1], hn::ShiftRight<4>(nib[k]));
+      }
     }
     for (int j = 0; j < LBPB - 1; ++j) A.u8[K_LBP - K_U8 + j] = lbp[j];
+    A.u8[K_MAX - K_U8] = lbp[0];
+    A.u8[K_MIN - K_U8] = umin;
   }
   {
     // The bar detector. Its gated maps pair up through one multiply-add by the 0 / 1 gate. The
@@ -523,36 +539,46 @@ HWY_INLINE void block(const Chunk &C, const uint8_t *IF_RESTRICT mask,
         v = on_mesh(v);
         acc = hn::Add(acc, hn::WidenMulPairwiseAdd(d32, v, v));
       };
-      for (size_t q = qs; q < qe; ++q)
+      auto rows = [&](auto kWhole) IF_LAMBDA_INLINE // the loop, once per pixel order
       {
-        const int *IF_RESTRICT sl3 = C.rsub + q * 3;
-        // A 3x3 Laws response is one 1-D mask down a column of the row responses -- Sobel
-        // included (gx = L.D, gy = E.L) -- up to a sign that the squares drop.
-        const V16 Da = resp(sl3[0], 0, h), Db = resp(sl3[1], 0, h), De = resp(sl3[2], 0, h);
-        const V16 gx0 = hn::Add(hn::Add(Da, De), hn::Add(Db, Db));
-        energy(ee, hn::Sub(De, Da));
-        energy(se, hn::Sub(gx0, hn::ShiftLeft<2>(Db)));
-        const V16 Sa = resp(sl3[0], 1, h), Sb = resp(sl3[1], 1, h), Se = resp(sl3[2], 1, h);
-        const V16 ls = hn::Add(hn::Add(Sa, Se), hn::Add(Sb, Sb));
-        energy(es, hn::Sub(Se, Sa));
-        energy(ls2, ls);
-        energy(ss, hn::Sub(ls, hn::ShiftLeft<2>(Sb)));
-        const V16 La = resp(sl3[0], 2, h), Lb = resp(sl3[1], 2, h), Le = resp(sl3[2], 2, h);
-        energy(sl, hn::Sub(hn::Add(La, Le), hn::Add(Lb, Lb)));
-        const V16 gx = on_mesh(gx0), gy = on_mesh(hn::Sub(Le, La));
-        sxx = hn::Add(sxx, hn::WidenMulPairwiseAdd(d32, gx, gx));
-        syy = hn::Add(syy, hn::WidenMulPairwiseAdd(d32, gy, gy));
-        sxy = hn::Add(sxy, hn::WidenMulPairwiseAdd(d32, gx, gy));
-        // HOG inputs: the gradient folded to the upper half-plane and interleaved as (qy, qx),
-        // so that one pmaddwd against (cx, -cy) is a whole ray test, and |grad|^2
-        const V16 neg =
-            hn::BroadcastSignBit(hn::Or(gy, hn::And(hn::VecFromMask(d16, hn::Eq(gy, zero)), gx)));
-        const V16 qx = hn::Sub(hn::Xor(gx, neg), neg), qy = hn::Abs(gy);
-        const V16 z0 = hn::InterleaveWholeLower(d16, qy, qx),
-                  z1 = hn::InterleaveWholeUpper(d16, qy, qx);
-        hn::StoreU(hn::BitCast(d32, z0), d32, hin(q - qs, h, 0));
-        hn::StoreU(hn::BitCast(d32, z1), d32, hin(q - qs, h, 1));
-      }
+        for (size_t q = qs; q < qe; ++q)
+        {
+          const int *IF_RESTRICT sl3 = C.rsub + q * 3;
+          // A 3x3 Laws response is one 1-D mask down a column of the row responses -- Sobel
+          // included (gx = L.D, gy = E.L) -- up to a sign that the squares drop.
+          const V16 Da = resp(sl3[0], 0, h), Db = resp(sl3[1], 0, h), De = resp(sl3[2], 0, h);
+          const V16 Dae = hn::Add(Da, De), Db2 = hn::Add(Db, Db), gx0 = hn::Add(Dae, Db2);
+          energy(ee, hn::Sub(De, Da));
+          energy(se, hn::Sub(Dae, Db2)); // Da + De - 2 Db == gx0 - 4 Db
+          const V16 Sa = resp(sl3[0], 1, h), Sb = resp(sl3[1], 1, h), Se = resp(sl3[2], 1, h);
+          const V16 Sae = hn::Add(Sa, Se), Sb2 = hn::Add(Sb, Sb), ls = hn::Add(Sae, Sb2);
+          energy(es, hn::Sub(Se, Sa));
+          energy(ls2, ls);
+          energy(ss, hn::Sub(Sae, Sb2)); // Sa + Se - 2 Sb == ls - 4 Sb
+          const V16 La = resp(sl3[0], 2, h), Lb = resp(sl3[1], 2, h), Le = resp(sl3[2], 2, h);
+          energy(sl, hn::Sub(hn::Add(La, Le), hn::Add(Lb, Lb)));
+          const V16 gx = on_mesh(gx0), gy = on_mesh(hn::Sub(Le, La));
+          sxx = hn::Add(sxx, hn::WidenMulPairwiseAdd(d32, gx, gx));
+          syy = hn::Add(syy, hn::WidenMulPairwiseAdd(d32, gy, gy));
+          sxy = hn::Add(sxy, hn::WidenMulPairwiseAdd(d32, gx, gy));
+          // HOG inputs: the gradient folded to the upper half-plane and interleaved as (qy, qx),
+          // so that one pmaddwd against (cx, -cy) is a whole ray test, and |grad|^2
+          const V16 neg =
+              hn::BroadcastSignBit(hn::Or(gy, hn::And(hn::VecFromMask(d16, hn::Eq(gy, zero)), gx)));
+          const V16 qx = hn::Sub(hn::Xor(gx, neg), neg), qy = hn::Abs(gy);
+          // (qy, qx) pairs, one per 32-bit lane. Which pixel lands in which lane only matters
+          // when a quarter block spans more than one cell: otherwise the cheaper in-block
+          // interleave, whose lanes hold the pixels of both quarters out of order, does
+          V16 z0, z1;
+          if constexpr (decltype(kWhole)::value)
+            z0 = hn::InterleaveWholeLower(d16, qy, qx), z1 = hn::InterleaveWholeUpper(d16, qy, qx);
+          else
+            z0 = hn::InterleaveLower(d16, qy, qx), z1 = hn::InterleaveUpper(d16, qy, qx);
+          hn::StoreU(hn::BitCast(d32, z0), d32, hin(q - qs, h, 0));
+          hn::StoreU(hn::BitCast(d32, z1), d32, hin(q - qs, h, 1));
+        }
+      };
+      C.whole ? rows(std::true_type()) : rows(std::false_type());
       P[K_LAWS + LAWS_EE] = ee, P[K_LAWS + LAWS_SE] = se, P[K_LAWS + LAWS_ES] = es;
       P[K_LAWS + LAWS_LS] = ls2, P[K_LAWS + LAWS_SS] = ss, P[K_LAWS + LAWS_SL] = sl;
       P[K_SXX] = sxx, P[K_SYY] = syy, P[K_SXY] = sxy;
@@ -2238,6 +2264,7 @@ class FeatureComputer
       C.rdn = s.rdn.data();
       C.rdstride = rd_stride_;
       C.subrows = sub_rows_;
+      C.whole = multi_ && cw_ < (int)N / 2;
       C.tapcol = tapcol_;
       C.resp = aligned64(s.resp);
       C.hbuf = aligned64(s.hbuf);

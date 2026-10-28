@@ -384,6 +384,20 @@ three channels' worth, which evicted the row-response and HOG-input buffers betw
   in one step (`SumsOf8`, a `psadbw`; `SumsOf4` for the 16-bit maps) wherever a cell is eight
   columns or wider, instead of a pair sum, two promotions and two folds: another −1.5 to −2%.
 
+A third round, measured by callgrind instruction counts since the machine was by then
+shared with a training job and wall-clock noise exceeded the effects: the extrema sweep
+folded into the LBP ring (a strict local maximum is exactly LBP bin 0 — popcount 0 is
+uniform — and the minimum rides on the ring's loads as a running min: one sweep and nine
+loads per row fewer); the LBP bins counted in nibbles, five byte accumulators each holding
+two bins, voted by one byte shuffle of the bin index and emptied into the byte counts every
+15 rows (no compare and subtract per bin, and four accumulators fewer); the Sobel and Laws
+arguments sharing two sums (`(Da + De) ± 2Db`, likewise for S); and the HOG `(qy, qx)`
+interleave in block order where a cell is at least half a block wide, since the fold then
+sums every lane of a quarter anyway (the loop is instantiated per case, forced inline). A
+1024×1024×3 stride-1 frame went from 73.4 M to 67.4 M instructions (−8%): the energy phase
+is 68 instructions per half block per row, the HOG 34 per quarter, LBP with extrema 89, the
+bar detector 86, the Laplacian and moments 33, the row responses 39.
+
 Two smaller items came out of the same profiles: the per-chunk row tables were built with a
 linear search per row (1.3% of the instructions at 32 px cells, 2.6% at 4 px); a window-slot
 lookup replaced it. And the two linear sums of the Laplacian phase (`Σ lap`, `Σ w`) ride in
@@ -413,6 +427,12 @@ configuration gained little. Where a 2× would have to come from, and why it was
   transpose-add network would roughly halve that, but its lane bookkeeping is specific to
   256-bit vectors (two 128-bit blocks); the portable reductions (`ReduceSum`, `SumsOf8`, and
   `ConcatEven`/`ConcatOdd` per level) are what Highway gives. Not done.
+* **The window ring.** The bar detector's row loop carries about 20 scalar instructions of
+  pointer arithmetic because the rolling window wraps, so each row's up/down taps need their
+  own offsets (and the 3×3 rows three). A window laid out so that a chunk's rows are always
+  contiguous (two cell rows deep, the halo copied forward every other chunk) would make them
+  constants: about 2–3% of the instructions for a quarter of a percent of extra copying.
+  Not done.
 * **Small cells** are dominated by the per-cell stages: at 4 px cells the derive is 18% of
   the instructions, the summary fold 9%, the fold 14%, the level roll-up 5%, each near its
   arithmetic floor (the summary is a min, max, sum and sum of squares in double per value).
