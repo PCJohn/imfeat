@@ -133,9 +133,11 @@ enum
 constexpr int NSUM = LAWS0 + NLAWS;    // 44 int64 sums per cell per channel
 constexpr int BARD_NF = 4 + BARD_NL;   // cover, spec*NL, peak, peaked, bal
 constexpr int BARD_NMAP = 3 + BARD_NL; // dense maps: cover, resp*NL, dark, light
-// The rolling window of planar rows block() reads. Every row of the cell row in flight plus
-// a MAXLAG halo each side stays resident (slots_ rows, set at configure time; image row y
-// lives in slot y % slots). Each phase plane carries slack at both ends for the taps that
+// The sliding window of planar rows block() reads. Every row of the cell row in flight plus
+// a MAXLAG halo each side stays resident (wrows_ rows, set at configure time; image row y
+// lives in slot y - wbase, the rows in order: see accumulate_band(), which slides them, and
+// the rows past an image edge are copies of the edge row). Each phase plane carries slack at
+// both ends for the taps that
 // reach past the row and for the last block's overrun into the next plane, whose lanes are
 // masked or folded into cells nobody reads. It is not free space: the window wants to stay
 // inside L1/L2.
@@ -257,12 +259,12 @@ struct Acc // one block of one channel
 // light base to 255 there zeroes that axis alone -- SatSub(0, c) == SatSub(c, 255) == 0. `hok`
 // drops a lag on BOTH axes when its span exceeds the smaller image side. A pixel counts only
 // if its best response over all lags reaches BARD_TAU; peak == max(dmax, lmax), so that gate
-// is one compare. `mesh` is the sampling mesh, all-ones when every lane is sampled. Returned:
-// the gate as 0 / 1 bytes and the maps (cover is the gate itself), for the caller to pair up
-// and add. `rb` is the centre row at the block's first lane, `tap` the column taps (KTAP), `ud`
-// the row's up/down offsets from it per lag. VALID and ALL (every lag's rows and columns are
-// in the image: the usual row) are known per block and per run of rows, so the branches below
-// are resolved outside the row loop.
+// is one compare. `mesh` is the sampling mesh as 0 / 1 bytes, 1 wherever every lane is sampled.
+// Returned: the gate as 0 / 1 bytes and the maps (cover is the gate itself), for the caller to pair
+// up and add. `rb` is the centre row at the block's first lane, `tap` the column taps (KTAP), `rs`
+// the window's row stride (a lag's rows are lag * rs from the centre row). VALID and ALL (every
+// lag's rows and columns are in the image: the usual row) are known per block and per run of
+// rows, so the branches below are resolved outside the row loop.
 using VU16 = hn::VFromD<DU16>;
 
 struct BardRow
@@ -270,20 +272,27 @@ struct BardRow
   V8 keep, map[BARD_NMAP - 1];
 };
 
-template <bool VALID, bool ALL>
-HWY_INLINE BardRow bard(const uint8_t *IF_RESTRICT rb, const int64_t *IF_RESTRICT tap,
-                        const int64_t *IF_RESTRICT ud, V8 c, V8 mesh,
-                        const uint8_t *IF_RESTRICT valid, size_t vstride, int hok, int vok)
+template <bool VALID, bool ALL, bool UNIT>
+HWY_INLINE BardRow bard(const uint8_t *IF_RESTRICT rb, const int64_t *IF_RESTRICT tap, int64_t rs,
+                        V8 c, V8 mesh, const uint8_t *IF_RESTRICT valid, size_t vstride, int hok,
+                        int vok)
 {
   static_assert(BARD_LAGS[0] == 1, "lag 1's column taps are the 3x3 neighbours'");
+  static_assert(BARD_NL == 3 && BARD_LAGS[1] == 2 && BARD_LAGS[2] == 4,
+                "the row taps index the centre column by the lag: one scaled index per lag");
+  // the centre column: the row taps go up and down it. UNIT: the column taps are the lags
+  // themselves (one phase plane), so every address is the row pointer plus a constant or
+  // plus the row stride scaled by a lag, and nothing is looked up per row
+  const uint8_t *IF_RESTRICT m = UNIT ? rb : rb + tap[1];
   V8 dmax = hn::Zero(d8), lmax = hn::Zero(d8), resp[BARD_NL];
   for (size_t j = 0; j < BARD_NL; ++j)
   {
     V8 dk = hn::Zero(d8), lt = hn::Zero(d8);
     if (ALL || ((hok >> j) & 1))
     {
-      const V8 l = hn::LoadU(d8, rb + tap[j ? 3 + 2 * j : 0]),
-               r = hn::LoadU(d8, rb + tap[j ? 4 + 2 * j : 2]);
+      const int64_t cl = UNIT ? -(int64_t)BARD_LAGS[j] : tap[j ? 3 + 2 * j : 0],
+                    cr = UNIT ? (int64_t)BARD_LAGS[j] : tap[j ? 4 + 2 * j : 2];
+      const V8 l = hn::LoadU(d8, rb + cl), r = hn::LoadU(d8, rb + cr);
       V8 lo = hn::Min(l, r), hi = hn::Max(l, r);
       if (VALID)
       {
@@ -293,8 +302,7 @@ HWY_INLINE BardRow bard(const uint8_t *IF_RESTRICT rb, const int64_t *IF_RESTRIC
       }
       if (ALL || ((vok >> j) & 1))
       {
-        const V8 u = hn::LoadU(d8, rb + ud[2 * j] + tap[1]),
-                 v = hn::LoadU(d8, rb + ud[2 * j + 1] + tap[1]);
+        const V8 u = hn::LoadU(d8, m - BARD_LAGS[j] * rs), v = hn::LoadU(d8, m + BARD_LAGS[j] * rs);
         lo = hn::Max(lo, hn::Min(u, v));
         hi = hn::Min(hi, hn::Max(u, v));
       }
@@ -307,9 +315,8 @@ HWY_INLINE BardRow bard(const uint8_t *IF_RESTRICT rb, const int64_t *IF_RESTRIC
   }
   const V8 peak = hn::Max(dmax, lmax);
   BardRow o;
-  o.keep =
-      hn::And(hn::And(mesh, hn::Set(d8, 1)),
-              hn::VecFromMask(d8, hn::Eq(hn::Max(peak, hn::Set(d8, (uint8_t)BARD_TAU)), peak)));
+  o.keep = hn::And(mesh, hn::VecFromMask(d8, hn::Eq(hn::Max(peak, hn::Set(d8, (uint8_t)BARD_TAU)),
+                                                    peak))); // mesh: 0 / 1 bytes
   for (int j = 0; j < BARD_NL; ++j) o.map[j] = resp[j];
   o.map[BARD_NL] = dmax;
   o.map[BARD_NL + 1] = lmax;
@@ -322,19 +329,20 @@ HWY_INLINE BardRow bard(const uint8_t *IF_RESTRICT rb, const int64_t *IF_RESTRIC
 // L = l + 2m + r = S + 4m, plus its centre m, are made once per distinct image row of a
 // sub-chunk and kept in `resp`: at stride 1 every image row serves three sampled rows (above,
 // centre, below), so the promotions and the 1-D work are done once instead of three times.
-// `rsub` says which slot each sampled row's three rows have; `rdist` their plane offsets.
+// Sampled row q's three rows are the slots a * (q - qs) + role, a = min(stride, 3): a row two
+// sampled rows share is then one slot (at stride 1 a row's above row is the centre of the one
+// before; at stride 2 its below row), and a row's slots are `rstep` elements from the next
+// row's. `rdist` holds the slots' plane offsets.
 constexpr int NRESP = 4; // D, S, L, M
 
 struct Chunk
 {
   size_t nr = 0;                    // sampled rows in the chunk
-  const int64_t *r3 = nullptr;      // [q * 3 + role]: plane offsets of row q's above, centre
-                                    // and below rows (replicated at the image edge)
-  const int64_t *ud = nullptr;      // [(q * BARD_NL + lag) * 2 + {up, down}]: offsets from
-                                    // the centre row of the bar detector's row taps
+  int64_t row0 = 0;                 // plane offset of sampled row 0 (its centre row), and
+  int64_t rowstep = 0, rs = 0;      // from a sampled row to the next, from a row to the next
   const int *vok = nullptr;         // [q]: bard lags whose rows are inside the image
   bool allok = false;               // every lag fits the image (hok is all ones)
-  const int *rsub = nullptr;        // [q * 3 + role]: offset in `resp` of that row's responses
+  size_t rstep = 0;                 // elements of `resp` from a sampled row's slots to the next's
   const int64_t *rdist = nullptr;   // [sub * rdstride + slot]: a distinct row's plane offset
   const int *rdn = nullptr;         // [sub]: distinct rows of the sub-chunk
   size_t rdstride = 0, subrows = 0; // ... and the sampled rows a sub-chunk holds
@@ -368,17 +376,17 @@ T *aligned64(std::vector<T> &v)
 // `resp`, the Laws energies and the tensor (which also write the HOG inputs to `hbuf`), the
 // Laplacian and the moments, and the HOG ray tests a quarter block at a time. Every sum is an
 // integer, so the order of the additions changes nothing.
-template <bool MASKED>
+template <bool MASKED, bool UNIT>
 HWY_INLINE void block(const Chunk &C, const uint8_t *IF_RESTRICT mask,
                       const uint8_t *IF_RESTRICT valid, size_t vstride, int hok,
                       const V16 *IF_RESTRICT rays, Acc &A)
 {
   const size_t L16 = hn::Lanes(d16), L32 = hn::Lanes(d32);
   const V8 one = hn::Set(d8, 1), m8 = MASKED ? hn::LoadU(d8, mask) : hn::Set(d8, 255);
-  const int64_t tl = C.tapcol[0], tm = C.tapcol[1], tr = C.tapcol[2];
-  // the 3x3 neighbourhood of row q: its rows at the block's first lane
-  auto rows3 = [&](size_t q, const uint8_t *&ra, const uint8_t *&rb, const uint8_t *&re)
-  { ra = C.base + C.r3[q * 3], rb = C.base + C.r3[q * 3 + 1], re = C.base + C.r3[q * 3 + 2]; };
+  // the 3x3 column taps: UNIT (one phase plane) makes them the constants -1, 0, 1
+  const int64_t tl = UNIT ? -1 : C.tapcol[0], tm = UNIT ? 0 : C.tapcol[1],
+                tr = UNIT ? 1 : C.tapcol[2];
+  const int64_t rs = C.rs; // the rows walk down the window: row q's centre is row0 + q steps
   {
     // LBP^riu2: sign tests (0 / -1) in circular order NW N NE E SE S SW W, so their sum is
     // -popcount and the sum of neighbouring XORs is -transitions. Uniform (<= 2 transitions)
@@ -402,14 +410,14 @@ HWY_INLINE void block(const Chunk &C, const uint8_t *IF_RESTRICT mask,
       tbl[k] = hn::Dup128VecFromValues(d8, t[0], t[1], t[2], t[3], t[4], t[5], t[6], t[7], t[8],
                                        t[9], t[10], t[11], t[12], t[13], t[14], t[15]);
     }
+    const uint8_t *IF_RESTRICT rb = C.base + C.row0;
     for (size_t q0 = 0; q0 < C.nr; q0 += LBP_NIB)
     {
       V8 nib[NPAIR];
       for (int k = 0; k < NPAIR; ++k) nib[k] = hn::Zero(d8);
-      for (size_t q = q0; q < std::min(C.nr, q0 + LBP_NIB); ++q)
+      for (size_t q = q0; q < std::min(C.nr, q0 + LBP_NIB); ++q, rb += C.rowstep)
       {
-        const uint8_t *ra, *rb, *re;
-        rows3(q, ra, rb, re);
+        const uint8_t *IF_RESTRICT ra = rb - rs, *IF_RESTRICT re = rb + rs;
         const V8 c = hn::LoadU(d8, rb + tm);
         V8 mn = hn::LoadU(d8, ra + tl);
         auto ge = [&](V8 nb) { return hn::VecFromMask(d8, hn::Eq(hn::Max(nb, c), nb)); };
@@ -449,11 +457,11 @@ HWY_INLINE void block(const Chunk &C, const uint8_t *IF_RESTRICT mask,
     // walked without a test per lag; the rest, at the image's top and bottom, with the tests.
     V16 b0 = hn::Zero(d16), b1 = b0, b2 = b0, b3 = b0, b4 = b0, b5 = b0; // (sums below 2^15)
     static_assert(BARD_NMAP == 6, "the bar detector's accumulators are named");
-    const auto ones8 = hn::Set(di8, 1);
+    const V8 mesh1 = hn::And(m8, one); // the mesh as 0 / 1: the gate is then the 0 / 1 multiplier
     auto gate = [&](const BardRow &r)
     {
       const auto k = hn::BitCast(di8, r.keep);
-      b0 = hn::Add(b0, hn::SatWidenMulPairwiseAdd(d16, r.keep, ones8)); // cover: the gate
+      b0 = hn::Add(b0, hn::SatWidenMulPairwiseAdd(d16, r.keep, k)); // cover: the gate (1 * 1)
       b1 = hn::Add(b1, hn::SatWidenMulPairwiseAdd(d16, r.map[0], k));
       b2 = hn::Add(b2, hn::SatWidenMulPairwiseAdd(d16, r.map[1], k));
       b3 = hn::Add(b3, hn::SatWidenMulPairwiseAdd(d16, r.map[2], k));
@@ -462,13 +470,10 @@ HWY_INLINE void block(const Chunk &C, const uint8_t *IF_RESTRICT mask,
     };
     auto run = [&](auto kValid, auto kAll, size_t q0, size_t q1)
     {
-      for (size_t q = q0; q < q1; ++q)
-      {
-        const uint8_t *IF_RESTRICT rb = C.base + C.r3[q * 3 + 1];
-        gate(bard<decltype(kValid)::value, decltype(kAll)::value>(
-            rb, C.tapcol, C.ud + q * BARD_NL * 2, hn::LoadU(d8, rb + tm), m8, valid, vstride, hok,
-            C.vok[q]));
-      }
+      const uint8_t *IF_RESTRICT rb = C.base + C.row0 + (int64_t)q0 * C.rowstep;
+      for (size_t q = q0; q < q1; ++q, rb += C.rowstep)
+        gate(bard<decltype(kValid)::value, decltype(kAll)::value, UNIT>(
+            rb, C.tapcol, rs, hn::LoadU(d8, rb + tm), mesh1, valid, vstride, hok, C.vok[q]));
     };
     size_t q0 = 0, q1 = C.nr;
     if (C.allok)
@@ -497,8 +502,8 @@ HWY_INLINE void block(const Chunk &C, const uint8_t *IF_RESTRICT mask,
   const V16 ones = hn::Set(d16, 1), zero = hn::Zero(d16);
   const V16 m16[2] = {MASKED ? hn::PromoteLowerTo(d16, hn::BitCast(di8, m8)) : zero,
                       MASKED ? hn::PromoteUpperTo(d16, hn::BitCast(di8, m8)) : zero};
-  auto resp = [&](int off, int t, int h) // off: a row's offset in C.resp (Chunk::rsub)
-  { return hn::LoadU(d16, C.resp + off + (t * 2 + h) * L16); };
+  auto resp = [&](const int16_t *rp, int i, int t) // rp: a sampled row's slots of one half
+  { return hn::LoadU(d16, rp + (i * RESP_STRIDE + t * 2) * L16); };
   auto hin = [&](size_t q, int h, int i) { return C.hbuf + (((q * 2) + h) * 2 + i) * L32; };
   for (size_t sub = 0, qs = 0; qs < C.nr; ++sub, qs += C.subrows)
   {
@@ -510,8 +515,8 @@ HWY_INLINE void block(const Chunk &C, const uint8_t *IF_RESTRICT mask,
     for (int j = 0; j < C.rdn[sub]; ++j) // the distinct rows' responses, both halves
     {
       const uint8_t *IF_RESTRICT row = C.base + dist[j];
-      const V8 l = hn::LoadU(d8, row + C.tapcol[0]), m = hn::LoadU(d8, row + C.tapcol[1]),
-               r = hn::LoadU(d8, row + C.tapcol[2]);
+      const V8 l = hn::LoadU(d8, row + tl), m = hn::LoadU(d8, row + tm),
+               r = hn::LoadU(d8, row + tr);
       for (int h = 0; h < 2; ++h)
       {
         auto wide = [&](V8 v)
@@ -541,21 +546,21 @@ HWY_INLINE void block(const Chunk &C, const uint8_t *IF_RESTRICT mask,
       };
       auto rows = [&](auto kWhole) IF_LAMBDA_INLINE // the loop, once per pixel order
       {
-        for (size_t q = qs; q < qe; ++q)
+        const int16_t *IF_RESTRICT rp = C.resp + h * L16;
+        for (size_t q = qs; q < qe; ++q, rp += C.rstep)
         {
-          const int *IF_RESTRICT sl3 = C.rsub + q * 3;
           // A 3x3 Laws response is one 1-D mask down a column of the row responses -- Sobel
           // included (gx = L.D, gy = E.L) -- up to a sign that the squares drop.
-          const V16 Da = resp(sl3[0], 0, h), Db = resp(sl3[1], 0, h), De = resp(sl3[2], 0, h);
+          const V16 Da = resp(rp, 0, 0), Db = resp(rp, 1, 0), De = resp(rp, 2, 0);
           const V16 Dae = hn::Add(Da, De), Db2 = hn::Add(Db, Db), gx0 = hn::Add(Dae, Db2);
           energy(ee, hn::Sub(De, Da));
           energy(se, hn::Sub(Dae, Db2)); // Da + De - 2 Db == gx0 - 4 Db
-          const V16 Sa = resp(sl3[0], 1, h), Sb = resp(sl3[1], 1, h), Se = resp(sl3[2], 1, h);
+          const V16 Sa = resp(rp, 0, 1), Sb = resp(rp, 1, 1), Se = resp(rp, 2, 1);
           const V16 Sae = hn::Add(Sa, Se), Sb2 = hn::Add(Sb, Sb), ls = hn::Add(Sae, Sb2);
           energy(es, hn::Sub(Se, Sa));
           energy(ls2, ls);
           energy(ss, hn::Sub(Sae, Sb2)); // Sa + Se - 2 Sb == ls - 4 Sb
-          const V16 La = resp(sl3[0], 2, h), Lb = resp(sl3[1], 2, h), Le = resp(sl3[2], 2, h);
+          const V16 La = resp(rp, 0, 2), Lb = resp(rp, 1, 2), Le = resp(rp, 2, 2);
           energy(sl, hn::Sub(hn::Add(La, Le), hn::Add(Lb, Lb)));
           const V16 gx = on_mesh(gx0), gy = on_mesh(hn::Sub(Le, La));
           sxx = hn::Add(sxx, hn::WidenMulPairwiseAdd(d32, gx, gx));
@@ -595,11 +600,11 @@ HWY_INLINE void block(const Chunk &C, const uint8_t *IF_RESTRICT mask,
       V16 lap16 = zero, w16 = zero;
       static_assert(1020 * 32 <= 32767, "a sub-chunk's Laplacian sum fits int16");
       init(t3, P[K_T3]), init(t4, A.t4[h]);
-      for (size_t q = qs; q < qe; ++q)
+      const int16_t *IF_RESTRICT rp = C.resp + h * L16;
+      for (size_t q = qs; q < qe; ++q, rp += C.rstep)
       {
-        const int *IF_RESTRICT sl3 = C.rsub + q * 3;
-        const V16 Sb = resp(sl3[1], 1, h), Ma = resp(sl3[0], 3, h), Mb = resp(sl3[1], 3, h),
-                  Me = resp(sl3[2], 3, h);
+        const V16 Sb = resp(rp, 1, 1), Ma = resp(rp, 0, 3), Mb = resp(rp, 1, 3),
+                  Me = resp(rp, 2, 3);
         const V16 lap = on_mesh(
             hn::Sub(hn::Add(Sb, hn::Add(Ma, Me)), hn::Add(Mb, Mb))); // up+down+left+right-4c
         lap16 = hn::Add(lap16, lap);
@@ -1728,7 +1733,7 @@ void deinterleave_row(const uint8_t *IF_RESTRICT img, int64_t rs, int64_t cs,
                       int64_t phs, uint8_t *IF_RESTRICT tmp, uint8_t *IF_RESTRICT dst)
 {
   const uint8_t *IF_RESTRICT src = img + (int64_t)y * rs;
-  uint8_t *IF_RESTRICT d0 = dst + (size_t)slot * (size_t)prs + PAD_L; // slot == y % slots
+  uint8_t *IF_RESTRICT d0 = dst + (size_t)slot * (size_t)prs + PAD_L;
   const size_t pstride = (size_t)slots * (size_t)prs;
   uint8_t *IF_RESTRICT scratch = tmp + (size_t)c * (size_t)w;
   // straight into the window, or into tmp's first c planes for the split below
@@ -1866,7 +1871,7 @@ class FeatureComputer
   std::vector<uint8_t> bvalid_; // per lag: 255 where both +/-d column taps are in range
   size_t bvalid_stride_ = 0;
   int phases_ = 1;       // column phases the planes are split into (1 = not split)
-  int slots_ = 9;        // rolling plane window rows (see the window comment)
+  int wrows_ = 9;        // plane window rows (see the window comment)
   int bard_lagmask_ = 0; // bit j set iff bard lag j fits the image (see bard())
   int group_ = 1;        // channels a block carries together: c_ up to GMAX, else 1
 
@@ -1877,9 +1882,9 @@ class FeatureComputer
   // Nothing per row, per block or per cell divides: what would is worked out once per
   // configuration, or carried along as a running count.
   int64_t tapcol_[KTAP] = {}; // each block() column tap, as an offset into a row of planes
-  int symod_ = 0;             // sy_ % slots_: how far the window slot moves per sampled row
   size_t sub_rows_ = 1;       // sampled rows per block() sub-chunk: their distinct rows' responses
   size_t rd_stride_ = 3;      // stay in L1; and the most distinct rows a sub-chunk can have
+  size_t rslots_ = 3;         // response slots a sampled row advances: min(sy_, 3)
   size_t block_cells_ = 1;    // cells a block spans (multi_)
   size_t lanes_ = 0;          // lanes in a row of one phase plane: w_ / phases_
   int up_shift_ = 0;          // log2 of level 1's fy: parents are whole powers of two of cells
@@ -1889,21 +1894,15 @@ class FeatureComputer
   // Per-band state: the plane window and everything a cell row in flight touches.
   struct Scratch
   {
-    Acc acc;                    // the block accumulators (one block of one channel at a time)
-    std::vector<int64_t> ud;    // [sampled row][BARD_NL][2]: bard's up/down row offsets
-    std::vector<int> rslot;     // the window slot of each sampled row of the cell row in hand
-    int fslot = 0;              // ... of the next row to fill
-    std::vector<int> vok;       // [sampled row] bard lags whose rows are inside the image
-    std::vector<int> rws;       // the cell row's sampled rows
-    std::vector<int64_t> r3;    // [sampled row][3] window offsets of its above/centre/below rows
-    std::vector<int> rsub, rdn; // block()'s row tables (Chunk::rsub, rdn)
-    std::vector<int> r3slot;    // [sampled row][3] window slots of its rows, and the lookup
-    std::vector<int> seen;      // from a window slot to its slot in rdist (-1: none yet)
-    std::vector<int64_t> rdist; // ... and the distinct rows of each sub-chunk (Chunk::rdist)
-    std::vector<int16_t> resp;  // the sub-chunk's row responses (Chunk::resp)
-    std::vector<int32_t> hbuf;  // ... and HOG inputs (Chunk::hbuf)
-    std::vector<int64_t> cells; // [channel][K_N][cell]: the cell row's sums
-    std::vector<int64_t> hsum;  // private hash partial; bands >0 only
+    Acc acc;                        // the block accumulators (one block of one channel at a time)
+    std::vector<int> vok;           // [sampled row] bard lags whose rows are inside the image
+    std::vector<int> rws;           // the cell row's sampled rows
+    std::vector<int> rdn;           // block()'s row tables: the distinct rows of each sub-chunk
+    std::vector<int64_t> rdist;     // (Chunk::rdn) and their plane offsets (Chunk::rdist)
+    std::vector<int16_t> resp;      // the sub-chunk's row responses (Chunk::resp)
+    std::vector<int32_t> hbuf;      // ... and HOG inputs (Chunk::hbuf)
+    std::vector<int64_t> cells;     // [channel][K_N][cell]: the cell row's sums
+    std::vector<int64_t> hsum;      // private hash partial; bands >0 only
     std::vector<int64_t> row, graw; // features(): the cell row in flight, and the band's share
                                     // of the global sums
     std::vector<int64_t>
@@ -1918,7 +1917,7 @@ class FeatureComputer
     int line0 = 0;               // each, the row gather's input
     int64_t row_stride = 0;      // padded plane row stride
     int64_t phase_stride = 0;    // stride between a row's phase planes
-    int filled = 0;              // rows [.., filled) of the window are loaded
+    int wbase = 0, filled = 0;   // rows [wbase, filled) of the window are loaded, wbase at slot 0
   };
   std::vector<Scratch> scr_;
 
@@ -2214,7 +2213,7 @@ class FeatureComputer
     // that the fold touches five cache lines per block and not one per kind (which, over a cell
     // row, evicted block()'s row buffers from L1).
     const size_t kst = multi_ ? nxs : 1, cst = multi_ ? 1 : (size_t)K_N;
-    const size_t pstride = (size_t)slots_ * (size_t)s.row_stride, lanes = lanes_;
+    const size_t pstride = (size_t)wrows_ * (size_t)s.row_stride, lanes = lanes_;
     V16 rays[HB - 1];
     for (int j = 0; j < HB - 1; ++j)
       rays[j] = hn::InterleaveLower(d16, hn::Set(d16, ray_[j][0]), hn::Set(d16, ray_[j][1]));
@@ -2222,44 +2221,24 @@ class FeatureComputer
     for (size_t q0 = 0; q0 < rws.size(); q0 += KROWS)
     {
       const size_t nr = std::min<size_t>(KROWS, rws.size() - q0);
-      for (size_t q = 0; q < nr; ++q)
+      for (size_t q = 0; q < nr; ++q) // (a lag's rows are read only where they are in the image)
       {
-        // A tap is a row of the window plus its column offset (tapcol_). The rows are r-1, r,
-        // r+1, replicated at the image edge, and r -/+ each bard lag: all within r's halo, so
-        // their slots are r's moved by as much, wrapped.
-        const int r = rws[q0 + q], sr = s.rslot[q0 + q];
-        auto slot = [&](int y)
-        {
-          int v = sr + (y - r);
-          v += v < 0 ? slots_ : 0;
-          v -= v >= slots_ ? slots_ : 0;
-          return v;
-        };
-        auto row = [&](int y) { return (size_t)slot(y) * s.row_stride + PAD_L; };
+        const int r = rws[q0 + q];
         s.vok[q] = 0;
         for (int j = 0; j < BARD_NL; ++j)
           if (r >= BARD_LAGS[j] && r < h_ - BARD_LAGS[j]) s.vok[q] |= bard_lagmask_ & (1 << j);
-        for (int i = 0; i < 3; ++i)
-        {
-          s.r3slot[q * 3 + i] = slot(clampi(r - 1 + i, h_ - 1));
-          s.r3[q * 3 + i] = (int64_t)s.r3slot[q * 3 + i] * s.row_stride + PAD_L;
-        }
-        for (int j = 0; j < BARD_NL; ++j) // (read only where the lag's rows are in the image)
-        {
-          const int d = (s.vok[q] >> j) & 1 ? BARD_LAGS[j] : 0;
-          s.ud[(q * BARD_NL + j) * 2] = (int64_t)row(r - d) - s.r3[q * 3 + 1];
-          s.ud[(q * BARD_NL + j) * 2 + 1] = (int64_t)row(r + d) - s.r3[q * 3 + 1];
-        }
       }
-      // block()'s row tables: per sub-chunk, the distinct rows its sampled rows read, in order
-      // of first use, and each sampled row's three slots among them
+      // A tap is a row of the window plus its column offset (tapcol_): the window holds the
+      // chunk's rows in order, sy_ rows from a sampled row to the next, the rows past the image
+      // edge copies of the edge row, so every row tap is a constant offset from the centre row.
       Chunk C;
       C.nr = nr;
-      C.r3 = s.r3.data();
-      C.ud = s.ud.data();
+      C.row0 = (int64_t)(rws[q0] - s.wbase) * s.row_stride + PAD_L;
+      C.rs = s.row_stride;
+      C.rowstep = (int64_t)sy_ * s.row_stride;
       C.vok = s.vok.data();
       C.allok = bard_lagmask_ == (1 << BARD_NL) - 1;
-      C.rsub = s.rsub.data();
+      C.rstep = rslots_ * RESP_STRIDE * hn::Lanes(d16);
       C.rdist = s.rdist.data();
       C.rdn = s.rdn.data();
       C.rdstride = rd_stride_;
@@ -2271,19 +2250,13 @@ class FeatureComputer
       for (size_t sub = 0, qs = 0; qs < nr; ++sub, qs += sub_rows_)
       {
         int64_t *IF_RESTRICT dist = &s.rdist[sub * rd_stride_];
-        int *IF_RESTRICT seen = s.seen.data(); // [window slot] -> its slot in `dist`, or -1
         const size_t qe = std::min(nr, qs + sub_rows_);
-        int nd = 0;
+        // block()'s row tables: per sub-chunk, the distinct rows its sampled rows read, a row's
+        // three at slots rslots_ apart (see Chunk): a slot two rows share is written twice, alike
         for (size_t q = qs; q < qe; ++q)
           for (int i = 0; i < 3; ++i)
-          {
-            const int v = s.r3slot[q * 3 + i];
-            if (seen[v] < 0) dist[seen[v] = nd++] = s.r3[q * 3 + i];
-            s.rsub[q * 3 + i] = seen[v] * RESP_STRIDE * (int)hn::Lanes(d16);
-          }
-        s.rdn[sub] = nd;
-        for (size_t q = qs; q < qe; ++q) // (nd entries at most: cheaper than a fill of slots_)
-          for (int i = 0; i < 3; ++i) seen[s.r3slot[q * 3 + i]] = -1;
+            dist[rslots_ * (q - qs) + i] = C.row0 + (int64_t)q * C.rowstep + (i - 1) * C.rs;
+        s.rdn[sub] = (int)(rslots_ * (qe - qs - 1) + 3);
       }
       for (int k0 = 0; k0 < c_; k0 += G)
         for (size_t x0 = 0, cell = 0; x0 < lanes;
@@ -2317,9 +2290,13 @@ class FeatureComputer
               C.base = s.planes.data() + (size_t)(k0 + k) * pstride + x;
               const uint8_t *IF_RESTRICT vx = valid ? valid + x : nullptr;
               if (msk)
-                block<true>(C, mask, vx, bvalid_stride_, bard_lagmask_, rays, A);
+                phases_ == 1
+                    ? block<true, true>(C, mask, vx, bvalid_stride_, bard_lagmask_, rays, A)
+                    : block<true, false>(C, mask, vx, bvalid_stride_, bard_lagmask_, rays, A);
               else
-                block<false>(C, mask, vx, bvalid_stride_, bard_lagmask_, rays, A);
+                phases_ == 1
+                    ? block<false, true>(C, mask, vx, bvalid_stride_, bard_lagmask_, rays, A)
+                    : block<false, false>(C, mask, vx, bvalid_stride_, bard_lagmask_, rays, A);
               int64_t *IF_RESTRICT cb = s.cells.data() + (size_t)(k0 + k) * K_N * nxs;
               for (int t = K_U8; t < K_N; ++t)
               {
@@ -2548,26 +2525,19 @@ class FeatureComputer
       if (bands_.size() == 1) summary_reset();
     }
     // The rolling window fills as the cell rows advance, from the first row any tap can reach.
-    s.filled = std::max(0, bands_[bi].r0 - BARD_MAXLAG);
-    s.fslot = s.filled % slots_;
+    s.wbase = s.filled = bands_[bi].r0 - BARD_MAXLAG; // (rows above the image: copies of row 0)
+    const size_t pstride = (size_t)wrows_ * (size_t)s.row_stride;
     // A cell row's sampled rows all fold into the same cells, so everything runs per cell
     // row, once the window holds those rows and their halo.
     const int chh = h_ / fine.ny;
     std::vector<int> &rows = s.rws;
     // the band's sampled rows in order: the next one and its window slot
-    int next = (bands_[bi].cy0 * chh + sy_ - 1) / sy_ * sy_, next_slot = next % slots_;
+    int next = (bands_[bi].cy0 * chh + sy_ - 1) / sy_ * sy_;
     rows.clear(); // (the last frame's last cell row)
     for (int cy = bands_[bi].cy0; cy < bands_[bi].cy1; ++cy)
     {
       rows.clear();
-      s.rslot.clear();
-      for (; next < (cy + 1) * chh; next += sy_)
-      {
-        rows.push_back(next);
-        s.rslot.push_back(next_slot);
-        next_slot += symod_;
-        next_slot -= next_slot >= slots_ ? slots_ : 0;
-      }
+      for (; next < (cy + 1) * chh; next += sy_) rows.push_back(next);
       // raw(): the row goes into the pyramid. features(): into a row buffer that stays in cache
       // while stream_row() derives it and rolls it up, so the finest level is never stored.
       int64_t *IF_RESTRICT dst = stream_ ? s.row.data() : fine.buf.data() + cy * nfx * c_ * NSUM;
@@ -2582,26 +2552,45 @@ class FeatureComputer
       }
       else
       {
-        for (; s.filled <= std::min(h_ - 1, rows.back() + BARD_MAXLAG); ++s.filled)
+        // The window holds rows [wbase, filled) at slots from 0: the cell row's rows and their
+        // halo among them. When the next cell row's would run past its end, the rows it keeps
+        // (the halo the two share) slide to the front, so block() reads every row of a chunk at
+        // a constant offset from the one before, with no wrap to look up. Rows past the image
+        // are copies of its edge rows, so the taps need no clamping either.
+        const int lo = rows.front() - BARD_MAXLAG, hi = rows.back() + BARD_MAXLAG + 1;
+        if (hi - s.wbase > wrows_)
         {
-          if (resize_) // the thumbnail row the band made, read as a planar row
-            deinterleave_row(s.line.data() + (size_t)(s.filled - s.line0) * need_.size() * w_, 0, 1,
-                             coff_rz_.data(), chan_.data(), conv_, c_, w_, 0, false, s.row_stride,
-                             slots_, s.fslot, phases_, s.phase_stride, s.lin.data(),
-                             s.planes.data());
+          const int keep = s.filled - lo;
+          if (keep > 0)
+            for (int k = 0; k < c_; ++k)
+            {
+              uint8_t *IF_RESTRICT p = s.planes.data() + (size_t)k * pstride;
+              std::memmove(p, p + (size_t)(lo - s.wbase) * s.row_stride,
+                           (size_t)keep * s.row_stride);
+            }
           else
-            deinterleave_row(img, rs, cs, coff_.data(), chan_.data(), conv_, c_, w_, s.filled,
-                             interleaved_, s.row_stride, slots_, s.fslot, phases_, s.phase_stride,
+            s.filled = lo;
+          s.wbase = lo;
+        }
+        for (; s.filled < hi; ++s.filled)
+        {
+          const int y = clampi(s.filled, h_ - 1), slot = s.filled - s.wbase;
+          if (resize_) // the thumbnail row the band made, read as a planar row
+            deinterleave_row(s.line.data() + (size_t)(y - s.line0) * need_.size() * w_, 0, 1,
+                             coff_rz_.data(), chan_.data(), conv_, c_, w_, 0, false, s.row_stride,
+                             wrows_, slot, phases_, s.phase_stride, s.lin.data(), s.planes.data());
+          else
+            deinterleave_row(img, rs, cs, coff_.data(), chan_.data(), conv_, c_, w_, y,
+                             interleaved_, s.row_stride, wrows_, slot, phases_, s.phase_stride,
                              s.lin.data(), s.planes.data());
-          s.fslot = s.fslot + 1 == slots_ ? 0 : s.fslot + 1;
         }
         derived = cell_row(s, rows, (size_t)cy, rolls, hs, dst);
         if (!hfast_)
           for (size_t i = 0; i < rows.size(); ++i)
-            accumulate_hash_row(s.planes.data() + (size_t)s.rslot[i] * s.row_stride + PAD_L,
-                                (size_t)slots_ * (size_t)s.row_stride, c_, step_, hrbeg_.data(),
-                                hrend_.data(), hrhc_.data(), (int)hrhc_.size(),
-                                hs + (size_t)hrow_[rows[i]] * HN * c_);
+            accumulate_hash_row(s.planes.data() + (size_t)(rows[i] - s.wbase) * s.row_stride +
+                                    PAD_L,
+                                pstride, c_, step_, hrbeg_.data(), hrend_.data(), hrhc_.data(),
+                                (int)hrhc_.size(), hs + (size_t)hrow_[rows[i]] * HN * c_);
       }
       if (rolls)
       {
@@ -3271,7 +3260,9 @@ public:
         const int f = ((d % phases_) + phases_) % phases_;
         return f * phase_stride + (d - f) / phases_;
       };
-      for (int i = 0; i < 3; ++i) tapcol_[i] = col(i - 1);
+      for (int i = 0; i < 3; ++i)
+        tapcol_[i] = col(i - 1); // (col(d) == d with one phase:
+                                 // block<.., UNIT> then hard-codes them)
       for (int j = 0; j < BARD_NL; ++j)
       {
         tapcol_[3 + 2 * j] = col(-BARD_LAGS[j]);
@@ -3298,13 +3289,15 @@ public:
     // The whole cell row is processed at once, not a fixed slice of it. That measured
     // strictly faster at every size tried: each plane row's vector serves more of the
     // centres that use it as a tap while it is still hot, and the per-block reduction
-    // amortizes over more rows. The window has to span the cell row plus a halo.
-    slots_ = std::max(2 * BARD_MAXLAG + 1, h_ / levels_[0].ny + 2 * BARD_MAXLAG + 1);
-    symod_ = sy_ % slots_;
+    // amortizes over more rows. The window has to span the cell row plus a halo; it has room
+    // for a few cell rows of small cells, so that the slide (see accumulate_band) moves a halo
+    // per 32 rows at most.
+    wrows_ = std::max(h_ / levels_[0].ny, 32) + 2 * BARD_MAXLAG;
     // A sub-chunk's sampled rows read at most about 34 distinct image rows (adjacent rows at
     // stride 1, every other one at stride 2, three apiece beyond), whose responses then fit L1.
     sub_rows_ = sy_ == 1 ? 32 : sy_ == 2 ? 16 : 11;
     rd_stride_ = 3 * sub_rows_;
+    rslots_ = (size_t)std::min(sy_, 3);
     for (up_shift_ = 0; levels_.size() > 1 && (1 << up_shift_) < levels_[1].fy;) ++up_shift_;
     coff_.assign((size_t)std::max(c_, conv_ != CONV_NONE ? 3 : 0), 0);
 
@@ -3388,12 +3381,7 @@ public:
     for (size_t b = 0; b < scr_.size(); ++b)
     {
       Scratch &s = scr_[b];
-      s.ud.assign(nrows * BARD_NL * 2, 0);
       s.vok.assign(nrows, 0);
-      s.r3.assign(nrows * 3, 0);
-      s.rsub.assign(nrows * 3, 0);
-      s.r3slot.assign(nrows * 3, 0);
-      s.seen.assign((size_t)slots_, -1);
       s.rdn.assign((nrows + sub_rows_ - 1) / sub_rows_, 0);
       s.rdist.assign(s.rdn.size() * rd_stride_, 0);
       s.resp.assign(rd_stride_ * NRESP * 2 * hn::Lanes(d16) + 32, 0); // (+ alignment slack)
@@ -3403,7 +3391,7 @@ public:
       s.row_stride = s.phase_stride * phases_;
       // a slack row and block so the final vector's overrun stays inside the allocation
       s.planes.assign(
-          (size_t)c_ * (size_t)slots_ * (size_t)s.row_stride + (size_t)s.row_stride + 2 * N, 0);
+          (size_t)c_ * (size_t)wrows_ * (size_t)s.row_stride + (size_t)s.row_stride + 2 * N, 0);
       // a row of gathered planes, the phase split's scratch, and the conversion's source planes
       s.lin.assign((size_t)(3 * c_ + (conv_ != CONV_NONE ? 3 : 0)) * (size_t)w_ + N, 0);
       if (resize_)
