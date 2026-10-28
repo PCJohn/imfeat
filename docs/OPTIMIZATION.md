@@ -111,6 +111,7 @@ Chronologically. Times are single-thread `features()`; instruction counts are pe
 | 9 | The projection profiles dropped, likewise | 50.0 M → 49.3 M (−1.4%), 41.2 M → 40.9 M (−0.7%), 109.1 M → 106.5 M (−2.4%) at the same three points; −5.2%, −4.4% and −5.4% against step 7 for the two together |
 | 10 | The kernel rewritten as register-resident phases down the rows, with row responses cached and the HOG sums signed; then, from a callgrind profile, the per-block cell sums laid out kind-contiguous and the fold's whole-vector reductions through `ReduceSum` / `SumsOf8` (details below) | Ryzen 7 3700X (AVX2, GCC 11), one thread, `features()`, 4 levels: 1024×1024×3 finest-32 stride 1, 7.44 → 5.42 ms (1.37×); 1024×1024 (C=1), 2.50 → 1.85 (1.35×); 1024×1024×3 finest-64, 8.93 → 6.80 (1.31×); 512×512×3 finest-32, 2.22 → 1.71 (1.30×); 256×256×3 finest-32, 0.81 → 0.71 (1.15×); the fused BGR → HSV pass at 1024², finest-64, 9.85 → 7.74 (1.27×). Every output bit-identical |
 | 12 | A batch of small items chosen by the per-instruction cost table of step 11 and kept or dropped by pinned A/B timing: plane rows aligned to cache lines (the left pad half a line, the stride a whole number of lines, the buffer 64-byte aligned); the 16-bit halves of a one-cell block widened by interleaving with zero instead of `pmovzx`; the bar detector's gate as a saturating subtract and min; the one-cell fold's sign extension through promotes; the moments' fourth-power pair sums widened every two rows; HOG sign masks from a compare instead of a shift | Pinned to a core, interleaved: 1024×1024×3 finest-32 stride 1, 5.38 → 4.84 ms (−10%); stride 2, 2.48 → 2.04 (−18%); 1024×1024 (C=1), 2.42 → 2.13 (−12%); finest-64, 6.81 → 6.45 (−5%); 512×512×3, 1.68 → 1.62 (−4%); 256×256×3, −1%. Every output bit-identical |
+| 13 | The per-cell stages, from profiles of the small-cell and coarse-grid configurations: a batched fold for one-cell blocks (four kinds reduced together through two interleave levels into one four-lane store); the hash grid's per-row byte sums through `psadbw` where the finest grid does not tile the hash grid; batched folds for blocks of several cells (a cell's lanes added in 32 bits as 128-bit vectors, four cells reduced together) for the HOG and pair kinds; level 1 derived in its band from the rolled-up sums through `derive_block`, its slots written by a vector flush four cells at a time | Pinned, interleaved, against step 12: 1024×1024×3 finest-32 stride 1, 4.72 → 4.49 ms (−5%); 64 and 128 px cells at stride 1, −8%; 8 px cells at stride 2, −6% (folds) and −7.7% of the instructions (level 1), the time of the latter within noise with three channels and −4 to −6% with one channel or at 512²; 16 px cells at stride 2, −6%; 256×256×3, −8%. Every output bit-identical |
 | 11 | The plane window made a sliding contiguous buffer (the halo copied forward when it fills, edge rows physically replicated) and the response slots affine, so every row and column tap in the kernel is a constant offset from one row pointer; one phase plane makes the column taps compile-time (`block<.., UNIT>`) | 1024×1024×3 finest-32 stride 1: 67.4 M → 61.8 M instructions per frame (−8%), wall clock unchanged within noise (the scalar work ran in parallel with the vector work, see the step); 8 px cells and 256² about −2%. Every output bit-identical |
 
 **Step 1, the kernel.** Besides the change of lane, three algebraic rewrites turn every sum
@@ -549,6 +550,60 @@ which is the time measured; the kernel is at the practical floor of this instruc
 and the whole frame at 1024×1024×3, finest-32, stride 1 is 1.60× the starting point
 (7.74 → 4.84 ms pinned; 7.34 → 4.6 expected on a quiet core).
 
+**Step 13, the per-cell stages (October 2026).** The small-cell configurations had gained
+little: at 8 px cells and stride 2 (the hosts' operating point; at 1024² that is a grid of
+128 cells a side) a 1024×1024×3 frame is three-quarters per-cell work, and a profile put the
+summary fold at 11%, the level-0 derive at 12%, the multi-cell folds at 9.5%, the level-1
+flush and its scalar re-gather at 6%, the roll-up at 4%, the feature transposes at 4%, the
+row gather and phase split at 5%, the six kernel loops at 25%. (A note on the benchmark
+names: the grid parameter is log2 of the cells per side, so at 1024² "k5" is 32 px cells,
+"k7" 8 px cells and "k3" 128 px cells; the log's "finest-32" is 32 cells a side.)
+
+* *A batched fold for one-cell blocks.* The 76 accumulators of a 32 px block were each
+  reduced horizontally, an extract and shuffles apiece, and stored one at a time. Now the
+  halves and quarters of a kind add in registers (any two lanes of an accumulator sum within
+  32 bits at KROWS = 128, the four HOG quarters within 2³⁰), widen once, and four kinds
+  reduce together: two interleave levels pair the lanes of four vectors into one vector of
+  their four sums, stored to four consecutive slots of the kind-contiguous layout. All
+  portable Highway ops (`InterleaveLower/Upper`, `ConcatLowerLower/UpperUpper`), so the
+  AVX2-specific version the open ideas had in mind was not needed; other lane widths than
+  four int64 lanes (eight reduce to four first) take a per-kind reduction. −5% at 1024²,
+  32 px cells, stride 1; −2.6% at 256².
+* *The hash grid's row sums.* Where the finest grid does not tile the 32×32 hash grid, the
+  hash means come from a per-row byte sum that GCC had vectorized by widening every byte to
+  int64. A `psadbw` per vector of the run: −8% at 1024² with 64 or 128 px cells.
+* *Batched folds for blocks of several cells.* For 4, 8 or 16 lanes a cell, a cell's lanes
+  add in 32 bits as 128-bit vectors (a HOG lane is below 2²⁸; the unsigned pair kinds' four
+  lanes reach 2³² − 2²⁵, which unsigned arithmetic holds exactly), four cells reduce through
+  the same two interleave levels, widen and store to four consecutive cells. The HOG kinds:
+  −4.8% at 8 px cells stride 2, −3% at 16 px stride 2, −3.3% at 256²; the fourteen pair
+  kinds: another −1.5% and −2.5%. The first version of the pair fold reduced the lanes of the
+  4-lane case once too often and the harness caught it in one array of 40,164; the second
+  stored four cells' sums into cell 0 and the harness's count line, not its tail, said so.
+  Read the whole compare output.
+* *Level 1 derived in its band.* The level-1 row in flight is rolled up as kernel sums,
+  flushed to slots one scalar slot at a time (225 instructions a cell-channel) and, after
+  the join, derived again from those slots through scalar gathers and converts. When every
+  finest row of a level-1 row is the band's, the row now derives at once from its sums
+  through `derive_block`, the one compiled body level 0 uses (its double re-centring of the
+  moments is exact below 2²⁰ samples, which gates it); the slots, which the coarser levels'
+  roll-up still needs, are written by `flush4`: each slot as a vector of four cells, the
+  binomial expansion of the power sums as shifts and adds (KBIAS is 2⁷), and the slots
+  transposed four at a time into the records. Rows straddling two bands keep the slot path.
+  −7.7% of the instructions at 8 px cells stride 2; in time −3.7% with one channel, −6.3% at
+  512² with 16 px cells, −2.6% at stride 1, and within noise with three channels at 1024²,
+  where the frame writes 16 MB of features.
+
+That last case was looked at: a write microbenchmark puts 16 MB of regular stores at
+0.83 ms on this machine and streaming stores at 0.66 ms, so streaming the feature output
+would save at most 2–3% of that frame and would slow the consumer's first read of it, while
+for a 2 MB output (the usual sizes) regular stores are 2.6× faster than streaming ones. Not
+done. An ablation of the feature stores was attempted twice and gave nothing usable: a tiny
+scratch target serializes the stores on the same lines, and the second run coincided with a
+rebuild on the same machine. Then the other session's training jobs filled every core (load
+average 42), which ended wall-clock measurement for the day; everything after is checked
+bit-exact and counted, not timed.
+
 ## What did not work
 
 * **Transposing cell sums into slots with SIMD** — slower, twice. The eventual answer was not
@@ -718,7 +773,7 @@ it accumulator loads and stores.
 * AddressSanitizer over the suite. It caught a block-buffer stride that overran on tiny grids.
 * clang-format, cppcheck and `-Wall -Wextra -Wshadow`; ruff, black and mypy for the Python.
 
-Steps 10 to 12 were checked the same way: 40,164 output arrays (eight shapes of 1–8 channels, five
+Steps 10 to 13 were checked the same way: 40,164 output arrays (eight shapes of 1–8 channels, five
 grids, six strides, two kinds of content, 1–3 threads, `features()` and `compute()`, the
 fused BGR → HSV and thumbnail paths) hashed on the AVX2 GCC build, the clang build and an
 SSE4-only build, each identical to the previous code's build with the same compiler and
@@ -738,16 +793,15 @@ float64 moments move by at most one unit in the last place when the code around 
   last place, once. Not done.
 * **int32 cell sums where a level's sample count bounds them** (all but `Σw⁴` and `Σg⁴` at
   typical finest levels): halves the per-cell data volume; an estimated −8% at small cells.
-* **A batched fold.** Four accumulators reduced together through interleaves and 128-bit
-  concatenations, one 64-bit level after one 32-bit level (any two lanes of any accumulator
-  sum within 32 bits at `KROWS = 128`), writing four kinds' sums with one store into a
-  kind-contiguous layout for the one-cell-per-block case. About half the fold, so 5–10% of a
-  frame; it needs a lane layout per vector width, so it would be an AVX2 (and AVX-512) path
-  beside the portable one.
+* **A batched fold.** Done in step 13, with portable ops after all (`fold_cell`,
+  `fold_hog_multi`, `fold_pair_multi`); the remaining single kinds (`Σw⁴`, `|grad|⁴`, the
+  bytes and the bar maps of multi-cell blocks) still fold one at a time.
 * **Merging the 16-bit phases for small chunks.** At 4 px cells the per-phase overhead shows
   (step 10); a single-loop variant of the energy, Laplacian and moment phases for chunks under
   about 8 rows would recover it, at the cost of a second copy of that code.
-* **Level 1 derived straight from the rolled-up sums.** (The channel-pair features that
+* **Level 1 derived straight from the rolled-up sums.** Done in step 13 for rows complete
+  within a band; the coarser levels still go through slots and scalar gathers, a few percent
+  at 8 px cells. (The channel-pair features that
   shared this item are gone, step 8.)
 * **Batched folds with the roll-up fused in.** At the gate's operating point the folds and
   the level roll-up are about a fifth of the instructions; folding a cell row's blocks in one

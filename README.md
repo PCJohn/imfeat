@@ -361,8 +361,11 @@ bar-detector corner cases that were bugs. The short version, with the full log i
   timing (cache-line-aligned plane rows, the one-cell block's 16-bit halves widened by
   interleave instead of `pmovzx`, a cheaper bar-detector gate and fold): another −10% at
   that configuration and −18% at stride 2, for 1.60× over the starting point (7.7 → 4.8 ms
-  pinned), bit-identical. The log says what each stage costs now and why the kernel is at
-  the practical floor of this core.
+  pinned), bit-identical. Step 13 then took the per-cell stages: batched folds (four kinds,
+  or four cells, reduced together through portable interleaves), vector hash row sums, and
+  level 1 derived from its rolled-up sums: another −5% at that configuration, −6% at 8 and
+  16 px cells with stride 2, −8% at 256² and at coarse grids. The log says what each stage
+  costs now and why the kernel is at the practical floor of this core.
 
 ---
 
