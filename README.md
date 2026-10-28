@@ -364,8 +364,11 @@ bar-detector corner cases that were bugs. The short version, with the full log i
   pinned), bit-identical. Step 13 then took the per-cell stages: batched folds (four kinds,
   or four cells, reduced together through portable interleaves), vector hash row sums, and
   level 1 derived from its rolled-up sums: another −5% at that configuration, −6% at 8 and
-  16 px cells with stride 2, −8% at 256² and at coarse grids. The log says what each stage
-  costs now and why the kernel is at the practical floor of this core.
+  16 px cells with stride 2, −8% at 256² and at coarse grids. Step 14 derives and rolls up
+  cells in groups of four whatever the block width, which takes the last per-cell slot path
+  out of the stride-1 frame (63.6 M → 52.5 M instructions at 1024²). The log says what each
+  stage costs now, why the kernel is at the practical floor of this core, and how to measure
+  on a machine that is not quiet.
 
 ---
 

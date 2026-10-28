@@ -111,6 +111,7 @@ Chronologically. Times are single-thread `features()`; instruction counts are pe
 | 9 | The projection profiles dropped, likewise | 50.0 M → 49.3 M (−1.4%), 41.2 M → 40.9 M (−0.7%), 109.1 M → 106.5 M (−2.4%) at the same three points; −5.2%, −4.4% and −5.4% against step 7 for the two together |
 | 10 | The kernel rewritten as register-resident phases down the rows, with row responses cached and the HOG sums signed; then, from a callgrind profile, the per-block cell sums laid out kind-contiguous and the fold's whole-vector reductions through `ReduceSum` / `SumsOf8` (details below) | Ryzen 7 3700X (AVX2, GCC 11), one thread, `features()`, 4 levels: 1024×1024×3 finest-32 stride 1, 7.44 → 5.42 ms (1.37×); 1024×1024 (C=1), 2.50 → 1.85 (1.35×); 1024×1024×3 finest-64, 8.93 → 6.80 (1.31×); 512×512×3 finest-32, 2.22 → 1.71 (1.30×); 256×256×3 finest-32, 0.81 → 0.71 (1.15×); the fused BGR → HSV pass at 1024², finest-64, 9.85 → 7.74 (1.27×). Every output bit-identical |
 | 12 | A batch of small items chosen by the per-instruction cost table of step 11 and kept or dropped by pinned A/B timing: plane rows aligned to cache lines (the left pad half a line, the stride a whole number of lines, the buffer 64-byte aligned); the 16-bit halves of a one-cell block widened by interleaving with zero instead of `pmovzx`; the bar detector's gate as a saturating subtract and min; the one-cell fold's sign extension through promotes; the moments' fourth-power pair sums widened every two rows; HOG sign masks from a compare instead of a shift | Pinned to a core, interleaved: 1024×1024×3 finest-32 stride 1, 5.38 → 4.84 ms (−10%); stride 2, 2.48 → 2.04 (−18%); 1024×1024 (C=1), 2.42 → 2.13 (−12%); finest-64, 6.81 → 6.45 (−5%); 512×512×3, 1.68 → 1.62 (−4%); 256×256×3, −1%. Every output bit-identical |
+| 14 | Cells derived and rolled up in groups of four whatever the block width (two two-cell blocks or four one-cell blocks share one kind-major sums group), so that blocks of one or two cells no longer go to slots through the scalar flush and back through scalar gathers; the two phases of a raw row split as it is gathered | Instructions per frame: 1024×1024×3 finest-32 stride 1, 63.6 M → 52.5 M (−17%); 16 px cells, −3.6%; 8 px cells at stride 2, −2.2% (the gather). Wall clock, measured only on a machine at load 20–25 with A/B/B/A ordering: within ±2% of the build before at every configuration tried. Every output bit-identical |
 | 13 | The per-cell stages, from profiles of the small-cell and coarse-grid configurations: a batched fold for one-cell blocks (four kinds reduced together through two interleave levels into one four-lane store); the hash grid's per-row byte sums through `psadbw` where the finest grid does not tile the hash grid; batched folds for blocks of several cells (a cell's lanes added in 32 bits as 128-bit vectors, four cells reduced together) for the HOG and pair kinds; level 1 derived in its band from the rolled-up sums through `derive_block`, its slots written by a vector flush four cells at a time | Pinned, interleaved, against step 12: 1024×1024×3 finest-32 stride 1, 4.72 → 4.49 ms (−5%); 64 and 128 px cells at stride 1, −8%; 8 px cells at stride 2, −6% (folds) and −7.7% of the instructions (level 1), the time of the latter within noise with three channels and −4 to −6% with one channel or at 512²; 16 px cells at stride 2, −6%; 256×256×3, −8%. Every output bit-identical |
 | 11 | The plane window made a sliding contiguous buffer (the halo copied forward when it fills, edge rows physically replicated) and the response slots affine, so every row and column tap in the kernel is a constant offset from one row pointer; one phase plane makes the column taps compile-time (`block<.., UNIT>`) | 1024×1024×3 finest-32 stride 1: 67.4 M → 61.8 M instructions per frame (−8%), wall clock unchanged within noise (the scalar work ran in parallel with the vector work, see the step); 8 px cells and 256² about −2%. Every output bit-identical |
 
@@ -604,6 +605,35 @@ rebuild on the same machine. Then the other session's training jobs filled every
 average 42), which ended wall-clock measurement for the day; everything after is checked
 bit-exact and counted, not timed.
 
+**Step 14, cell groups, and measuring on a busy machine (October 2026).** Blocks of one cell
+(32 px cells and up at stride 1) or two (16 px at stride 1, 32 px at stride 2) had never
+derived in `cell_row()`: their cells went to slots through the scalar flush (225 instructions
+a cell-channel) and, after the row, through `derive_run`'s scalar gathers and `roll_row`.
+A first attempt simply let every block derive and roll up alone, and cost 21 M instructions
+more per frame at 16 px cells: the generic roll-up of a two-cell block is 3.7 K instructions,
+and a half-empty derive vector is still a whole derive. The version kept groups cells for
+the per-block stages: a block's, or as many blocks' as fill derive's four lanes, sharing one
+kind-major sums group (`nxs = group | 1`; the one-cell fold stores its four-kind batches a
+lane at a time into it), derived through `derive_block` after the group's last block and
+rolled up through the vector pair path. At the headline configuration that removed the
+whole per-cell slot path: 63.6 M → 52.5 M instructions a frame, the six kernel loops now 82%
+of what is left, the folds 4%, the gather 2%.
+
+The wall clock could only be measured on a machine running someone else's training jobs on
+every core (load average 20–25), and that produced two findings about measurement worth
+more than the item. First, with two builds interleaved pinned to one core, whichever runs
+second in a round measures 2–3.5% slower at the minimum, consistently, even for two copies
+of the same build; the earlier pinned A/B (step 12 onwards) ran at load 1–5, where this did
+not show. An A/B/B/A order within each round cancels it (`pcmp3.sh`). Second, at that load
+the median of the per-run minima swings by ±25% between two identical builds, so only the
+minimum carries information, and it is good to about ±2%. With the order cancelled, the
+grouped build is within ±2% of the build before it at 32 px stride 1 (+1.5%), 16 px stride 1
+(−1.8%), 8 px stride 2 (−1.0%) and 32 px stride 2 (−0.4%): time-neutral under that
+contention, for 17% fewer instructions. On the quiet machine of the morning the same removal
+of per-cell work had measured as the step-13 numbers; which of the two a deployment sees
+depends on what shares its cores, and the instruction count is the one number that does not
+depend on that.
+
 ## What did not work
 
 * **Transposing cell sums into slots with SIMD** — slower, twice. The eventual answer was not
@@ -728,6 +758,12 @@ bit-exact and counted, not timed.
   is useless for Highway code, since every intrinsic's cost lands on its header line, but
   per loop it gives the instruction, load, store, miss and mispredict counts of each phase
   exactly, and it is what found the cell-sum layout in step 10.
+* **A busy machine.** When the cores are shared, interleave the builds A/B/B/A within each
+  round (the second of a pair measures 2–3.5% slower otherwise), pin to the core pair with
+  the least recent busy time, take the minimum over many rounds and ignore the median. Count
+  instructions with callgrind on the symbol build (the module's own count: a whole-process
+  count through Python varies by 5% between runs even with a fixed hash seed) as the
+  load-independent number, and never time while a build runs on the same machine.
 * **Variants and pinned A/B.** For items under 2%: build each as its own variant (a copy of
   the source with the other items reverted by exact text, its own build directory, the
   Python package copied around the new module), check it bit-exact, then time all the
@@ -773,7 +809,7 @@ it accumulator loads and stores.
 * AddressSanitizer over the suite. It caught a block-buffer stride that overran on tiny grids.
 * clang-format, cppcheck and `-Wall -Wextra -Wshadow`; ruff, black and mypy for the Python.
 
-Steps 10 to 13 were checked the same way: 40,164 output arrays (eight shapes of 1–8 channels, five
+Steps 10 to 14 were checked the same way: 40,164 output arrays (eight shapes of 1–8 channels, five
 grids, six strides, two kinds of content, 1–3 threads, `features()` and `compute()`, the
 fused BGR → HSV and thumbnail paths) hashed on the AVX2 GCC build, the clang build and an
 SSE4-only build, each identical to the previous code's build with the same compiler and
