@@ -826,6 +826,15 @@ this build do the frame in 0.29× the original's single-thread time.
 10. **Ask what reads an output before optimising how it is made.** Two whole stages of the
    pass (steps 8–9) had no consumer; deleting them was worth more than most kernel work and
    carried no risk to the rest.
+11. **Read the hot loops' assembly; the compiler's spills are a cost-table item.** Find the
+   back edges of the kernel in the object's listing and count stack stores and
+   register-to-register copies per loop. Three loops here carried 10–20 such instructions a
+   row for the same reason: accumulators captured by reference in a lambda have a home in
+   memory, the `may_alias` vector loads may read it, so GCC stores them every row. Passing
+   the accumulators through the loop by value, and giving a phase a function of its own when
+   the enclosing function's live values crowd the registers, took them out (step 15).
+12. **Symmetries of the constants are algebra too.** The HOG rays' mirror symmetry halved
+   the kernel's largest loop's multiplies (step 15); it had been in the table since step 1.
 
 ## Measuring
 
