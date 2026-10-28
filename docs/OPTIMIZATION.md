@@ -112,6 +112,7 @@ Chronologically. Times are single-thread `features()`; instruction counts are pe
 | 10 | The kernel rewritten as register-resident phases down the rows, with row responses cached and the HOG sums signed; then, from a callgrind profile, the per-block cell sums laid out kind-contiguous and the fold's whole-vector reductions through `ReduceSum` / `SumsOf8` (details below) | Ryzen 7 3700X (AVX2, GCC 11), one thread, `features()`, 4 levels: 1024×1024×3 finest-32 stride 1, 7.44 → 5.42 ms (1.37×); 1024×1024 (C=1), 2.50 → 1.85 (1.35×); 1024×1024×3 finest-64, 8.93 → 6.80 (1.31×); 512×512×3 finest-32, 2.22 → 1.71 (1.30×); 256×256×3 finest-32, 0.81 → 0.71 (1.15×); the fused BGR → HSV pass at 1024², finest-64, 9.85 → 7.74 (1.27×). Every output bit-identical |
 | 12 | A batch of small items chosen by the per-instruction cost table of step 11 and kept or dropped by pinned A/B timing: plane rows aligned to cache lines (the left pad half a line, the stride a whole number of lines, the buffer 64-byte aligned); the 16-bit halves of a one-cell block widened by interleaving with zero instead of `pmovzx`; the bar detector's gate as a saturating subtract and min; the one-cell fold's sign extension through promotes; the moments' fourth-power pair sums widened every two rows; HOG sign masks from a compare instead of a shift | Pinned to a core, interleaved: 1024×1024×3 finest-32 stride 1, 5.38 → 4.84 ms (−10%); stride 2, 2.48 → 2.04 (−18%); 1024×1024 (C=1), 2.42 → 2.13 (−12%); finest-64, 6.81 → 6.45 (−5%); 512×512×3, 1.68 → 1.62 (−4%); 256×256×3, −1%. Every output bit-identical |
 | 14 | Cells derived and rolled up in groups of four whatever the block width (two two-cell blocks or four one-cell blocks share one kind-major sums group), so that blocks of one or two cells no longer go to slots through the scalar flush and back through scalar gathers; the two phases of a raw row split as it is gathered | Instructions per frame: 1024×1024×3 finest-32 stride 1, 63.6 M → 52.5 M (−17%); 16 px cells, −3.6%; 8 px cells at stride 2, −2.2% (the gather). Wall clock, measured only on a machine at load 20–25 with A/B/B/A ordering: within ±2% of the build before at every configuration tried. Every output bit-identical |
+| 15 | The HOG ray tests halved by a mirror symmetry of the rays: a gradient is reflected into the first quadrant and tested against the four low rays only, with the energy summed by the test's sign and by that sign times the side of the vertical the gradient came from, which the flush turns back into the energy past all eight rays; the half-plane fold of the gradient in the energy phase becomes an `abs` and a `psign`; the bar detector's sums passed through its runs by value (GCC had stored them every row) and its first lag's maxima taken as is | Pinned, A/B/B/A, against step 14, load 2.5: 1024×1024×3 finest-32 stride 1, 4.69 → 4.45 ms (−5.1%); 16 px cells, −5.5%; 32 px cells stride 2, −6.1%; 8 px cells stride 2, −4.1%; 1024×1024 (C=1), −4.8%; 512×512×3, −4.1%; 256×256×3, −0.9%. Against the original build on the same quiet core: 7.37 → 4.36 ms at the first (1.69×), 16 px cells 8.80 → 5.59 (1.57×), C=1 2.50 → 1.49 (1.68×), 32 px cells stride 2 2.41 → 1.65 (1.46×). Instructions per frame at the first, 58.4 M → 55.5 M (−5.0%); the kernel's multiplies per block row 78 → 62. Every output bit-identical on the three builds |
 | 13 | The per-cell stages, from profiles of the small-cell and coarse-grid configurations: a batched fold for one-cell blocks (four kinds reduced together through two interleave levels into one four-lane store); the hash grid's per-row byte sums through `psadbw` where the finest grid does not tile the hash grid; batched folds for blocks of several cells (a cell's lanes added in 32 bits as 128-bit vectors, four cells reduced together) for the HOG and pair kinds; level 1 derived in its band from the rolled-up sums through `derive_block`, its slots written by a vector flush four cells at a time | Pinned, interleaved, against step 12: 1024×1024×3 finest-32 stride 1, 4.72 → 4.49 ms (−5%); 64 and 128 px cells at stride 1, −8%; 8 px cells at stride 2, −6% (folds) and −7.7% of the instructions (level 1), the time of the latter within noise with three channels and −4 to −6% with one channel or at 512²; 16 px cells at stride 2, −6%; 256×256×3, −8%. Every output bit-identical |
 | 11 | The plane window made a sliding contiguous buffer (the halo copied forward when it fills, edge rows physically replicated) and the response slots affine, so every row and column tap in the kernel is a constant offset from one row pointer; one phase plane makes the column taps compile-time (`block<.., UNIT>`) | 1024×1024×3 finest-32 stride 1: 67.4 M → 61.8 M instructions per frame (−8%), wall clock unchanged within noise (the scalar work ran in parallel with the vector work, see the step); 8 px cells and 256² about −2%. Every output bit-identical |
 
@@ -644,6 +645,48 @@ moves, the Laplacian from 92 per two rows to 101 with 22, the energies from 110 
 rolled inner loop over the quarters (`_Pragma("GCC unroll 1")`) has no spills but 42
 instructions a quarter row for its addressing. The separate loops stay. Also measured and
 not taken: clang 14 on the same source (equal at 32 px cells, +15% at 8 px cells, stride 2).
+
+
+**Step 15, the HOG tests halved by symmetry (October 2026).** The hot loop since step 10 has
+been the HOG ray tests: 35 instructions a quarter block per row, of which 11 on the one
+multiply pipe (eight ray tests, `|grad|²`, two for `|grad|⁴`), and a microbenchmark of that
+loop alone runs it at 16.7 cycles a row, well above the 12 or so its 35 ops would take on
+the pipes they could use: the multiplies bind. The eight bin-boundary rays come in mirror
+pairs, ray `HB − i` being ray `i` with the cosine negated (the table is built that way now,
+and was bit-identical before), and reflecting a gradient across the vertical maps "past ray
+`HB − i`" onto "short of ray `i`" exactly: `t_{HB−i}(q) = −t_i(q')` for the reflection `q'`.
+So the kernel tests every gradient's reflection into the first quadrant — simply
+`(|gx|, |gy|)`, one `pabsw` — against the four low rays only, and keeps three signed sums
+instead of eight: per low ray `S_i = Σ sgn(t_i) |grad|²` and `D_i = Σ s · sgn(t_i) |grad|²`,
+plus once `E = Σ s |grad|²`, where `s` is the side of the vertical the folded gradient lies
+on. The side rides in the sign of the stored `y` lane (`gy · sgn(gx)`, with `sgn(0) = 1`), so
+`s · |grad|²` is one `psignd` by the loaded pair, and the half-plane fold in the energy
+phase, previously seven ops (compare, and, or, compare, xor, subtract, abs), is an `abs`, an
+`or` and a `psign`. With the total `T = Σ_xx + Σ_yy`, the energy past ray `i` is
+`(S_i + D_i + 3T − E) / 4` and past ray `HB − i` is `(T − E − S_i + D_i) / 4`, both multiples
+of four computed in the flush (`hog_cum4`); the sums are one kind more (`K_NHOG = 9`), and
+every fold and roll-up takes that in its stride. The loop is now 33 instructions with 7
+multiplies, 14.4 cycles a row in the microbenchmark (−14%), and the energy phase 56 → 52.
+Instructions per frame 58.4 M → 56.9 M; pinned A/B/B/A on a quiet core, −4.7% at the
+headline configuration and −4 to −5% wherever the kernel dominates. The first version of the
+flush recomputed the shared terms for every ray and cost +1.7% at 8 px cells, stride 2, where
+the per-cell stages dominate; computing each mirror pair once made that −4.1%.
+
+Reading the loops' assembly for the first time since step 11 (a script that finds the back
+edges of the kernel and counts stack stores and register copies per loop) then found that
+GCC stored the bar detector's six accumulators to the stack every row and copied them back:
+12 of the loop's 76 instructions. They were captured by reference in a lambda called for the
+three runs of a chunk, which gives them a home in memory that the `may_alias` byte loads
+could alias. Passed through the runs by value in a small struct, they stay in registers;
+the first lag's `Max(0, ·)` pair, which GCC cannot fold for unsigned bytes, went with it:
+76 → 70 instructions a row, 55.5 M a frame. GCC still spills the lag-2 and lag-4 row loads
+of that loop and reloads their offsets from the stack (about 8 instructions a row), and the
+LBP loop carries five register copies and five table reloads a row — 12% of its 80 — that
+the register-to-register moves of this core likely eliminate at rename; neither was
+measurable. The kernel's multiplies are 62 a block row now (the HOG's 28, the energies' 18,
+the moments' 10, the bar detector's 6), 20% of a block row's cycles instead of 40%, and the
+µop count is what binds again: at about 530 vector µops per block row and the three a cycle a
+real loop reaches, the ~190 cycles a block row measured are within 10% of the floor.
 
 ## What did not work
 

@@ -86,7 +86,9 @@ constexpr int SXX = 0, SYY = 1, SXY = 2, CNT = 3, NCOMP = 4;
 // hot loop (~17% measured). Everything below is DERIVED from it -- change HB here
 // and rebuild to retune bin count; no other constant is independently hardcoded.
 constexpr int HB = 9;
-constexpr int HOG0 = NCOMP;                      // 4
+static_assert(HB % 2 == 1, "block() pairs the bin-boundary rays up as mirror images");
+constexpr int HRAYS = (HB - 1) / 2; // the rays block() tests; the rest are their mirror images
+constexpr int HOG0 = NCOMP;         // 4
 constexpr int NMAX = HOG0 + HB, NMIN = NMAX + 1; // 13, 14
 constexpr int PS0 = NMIN + 1;                    // 15: S1 S2 S3 S4
 constexpr int NMOM = 4;
@@ -218,10 +220,15 @@ constexpr DU64 du64;
 //         inputs); the flush shifts them back to raw power sums, exactly.
 //   T4:   sum w^4, one int64 lane per four columns, per half block.
 //   SG4:  sum |grad|^4, one int64 lane per two columns, per quarter block.
-//   HOG:  per bin-boundary ray, the gradient energy of the pixels past it MINUS that of the
-//         pixels short of it (one sign flip per test, see block()), one int32 lane per column,
-//         per quarter block. With the total energy T, the cumulative energy past ray j is
-//         (P_j + T) / 2, and the ray tests are nested, so bin b = cum[b-1] - cum[b].
+//   HOG:  the ray tests, one int32 lane per column, per quarter block. The bin-boundary rays
+//         come in mirror pairs (i, HB-i) across the vertical, and a gradient left of it
+//         passes ray HB-i exactly when its reflection fails ray i, so block() tests every
+//         gradient's reflection against the HRAYS low rays only: per low ray i, S_i = sum of
+//         |grad|^2 by the test's sign, D_i = the same by the test's sign times the side (+1
+//         right of the vertical), and once E = the energy by the side alone. With the total
+//         energy T = SXX + SYY, the energy past ray i is (S_i + D_i + 3T - E) / 4 and past
+//         ray HB-i is (T - E - S_i + D_i) / 4 (hog_cum4), and the ray tests are nested, so
+//         bin b = cum[b-1] - cum[b].
 //   U8:   counts, one uint8 lane per column over the whole block.
 //   BARD: the bar detector's gated maps, one uint16 lane per two columns over the whole block.
 // clang-format off
@@ -230,7 +237,7 @@ enum
   K_SXX, K_SYY, K_T2, K_LAP2, K_LAWS, K_NUNSIGNED = K_LAWS + NLAWS, // squares first,
   K_SXY = K_NUNSIGNED, K_T1, K_T3, K_LAP1, K_NPAIR,                 // then what can go negative
   K_T4 = K_NPAIR, K_SG4, K_HOG,
-  K_U8 = K_HOG + HB - 1, K_MAX = K_U8, K_MIN, K_LBP, // LBP bins 0..LBPB-2; the last is the rest
+  K_NHOG = 2 * HRAYS + 1, K_U8 = K_HOG + K_NHOG, K_MAX = K_U8, K_MIN, K_LBP, // LBP bins 0..LBPB-2; the last is the rest
   K_BARD = K_LBP + LBPB - 1,
   K_N = K_BARD + BARD_NMAP,
   K_NU8 = K_BARD - K_U8
@@ -245,7 +252,7 @@ constexpr int KBIAS = 128; // block() takes moments of v - KBIAS
 
 struct Acc // one block of one channel
 {
-  V32 pair[2][K_NPAIR], hog[4][HB - 1];
+  V32 pair[2][K_NPAIR], hog[4][K_NHOG];
   V64 t4[2], sg4[4];
   V8 u8[K_NU8];
   hn::VFromD<DU16> bard[BARD_NMAP];
@@ -287,7 +294,7 @@ HWY_INLINE BardRow bard(const uint8_t *IF_RESTRICT rb, const int64_t *IF_RESTRIC
   // themselves (one phase plane), so every address is the row pointer plus a constant or
   // plus the row stride scaled by a lag, and nothing is looked up per row
   const uint8_t *IF_RESTRICT m = UNIT ? rb : rb + tap[1];
-  V8 dmax = hn::Zero(d8), lmax = hn::Zero(d8), resp[BARD_NL];
+  V8 dmax, lmax, resp[BARD_NL];
   for (size_t j = 0; j < BARD_NL; ++j)
   {
     V8 dk = hn::Zero(d8), lt = hn::Zero(d8);
@@ -313,8 +320,8 @@ HWY_INLINE BardRow bard(const uint8_t *IF_RESTRICT rb, const int64_t *IF_RESTRIC
       lt = hn::SaturatedSub(c, hi);
     }
     resp[j] = hn::Max(dk, lt);
-    dmax = hn::Max(dmax, dk);
-    lmax = hn::Max(lmax, lt);
+    dmax = j ? hn::Max(dmax, dk) : dk; // (the first lag's are the maxima so far)
+    lmax = j ? hn::Max(lmax, lt) : lt;
   }
   const V8 peak = hn::Max(dmax, lmax);
   BardRow o;
@@ -460,26 +467,29 @@ HWY_INLINE void block(const Chunk &C, const uint8_t *IF_RESTRICT mask,
     // The bar detector. Its gated maps pair up through one multiply-add by the 0 / 1 gate. The
     // rows whose lags all fit the image are one run (vok is monotone in from each image edge),
     // walked without a test per lag; the rest, at the image's top and bottom, with the tests.
-    V16 b0 = hn::Zero(d16), b1 = b0, b2 = b0, b3 = b0, b4 = b0, b5 = b0; // (sums below 2^15)
-    static_assert(BARD_NMAP == 6, "the bar detector's accumulators are named");
-    const V8 mesh1 = hn::And(m8, one); // the mesh as 0 / 1: the gate is then the 0 / 1 multiplier
-    auto gate = [&](const BardRow &r)
+    // The sums (below 2^15) go through the runs by value: by reference they would have a
+    // home in memory that the byte loads may alias, and GCC then stored them every row.
+    struct Sums
     {
-      const auto k = hn::BitCast(di8, r.keep);
-      b0 = hn::Add(b0, hn::SatWidenMulPairwiseAdd(d16, r.keep, k)); // cover: the gate (1 * 1)
-      b1 = hn::Add(b1, hn::SatWidenMulPairwiseAdd(d16, r.map[0], k));
-      b2 = hn::Add(b2, hn::SatWidenMulPairwiseAdd(d16, r.map[1], k));
-      b3 = hn::Add(b3, hn::SatWidenMulPairwiseAdd(d16, r.map[2], k));
-      b4 = hn::Add(b4, hn::SatWidenMulPairwiseAdd(d16, r.map[3], k));
-      b5 = hn::Add(b5, hn::SatWidenMulPairwiseAdd(d16, r.map[4], k));
+      V16 b[BARD_NMAP];
     };
-    auto run = [&](auto kValid, auto kAll, size_t q0, size_t q1)
+    const V8 mesh1 = hn::And(m8, one); // the mesh as 0 / 1: the gate is then the 0 / 1 multiplier
+    auto run = [&](auto kValid, auto kAll, size_t q0, size_t q1, Sums acc) IF_LAMBDA_INLINE
     {
       const uint8_t *IF_RESTRICT rb = C.base + C.row0 + (int64_t)q0 * C.rowstep;
       for (size_t q = q0; q < q1; ++q, rb += C.rowstep)
-        gate(bard<decltype(kValid)::value, decltype(kAll)::value, UNIT>(
-            rb, C.tapcol, rs, hn::LoadU(d8, rb + tm), mesh1, valid, vstride, hok, C.vok[q]));
+      {
+        const BardRow r = bard<decltype(kValid)::value, decltype(kAll)::value, UNIT>(
+            rb, C.tapcol, rs, hn::LoadU(d8, rb + tm), mesh1, valid, vstride, hok, C.vok[q]);
+        const auto k = hn::BitCast(di8, r.keep);
+        acc.b[0] = hn::Add(acc.b[0], hn::SatWidenMulPairwiseAdd(d16, r.keep, k)); // cover: 1 * 1
+        for (int j = 1; j < BARD_NMAP; ++j)
+          acc.b[j] = hn::Add(acc.b[j], hn::SatWidenMulPairwiseAdd(d16, r.map[j - 1], k));
+      }
+      return acc;
     };
+    Sums acc;
+    for (int j = 0; j < BARD_NMAP; ++j) acc.b[j] = hn::Zero(d16);
     size_t q0 = 0, q1 = C.nr;
     if (C.allok)
     {
@@ -490,19 +500,17 @@ HWY_INLINE void block(const Chunk &C, const uint8_t *IF_RESTRICT mask,
       q1 = q0; // no run without a test
     if (valid)
     {
-      run(std::true_type(), std::false_type(), 0, q0);
-      run(std::true_type(), std::true_type(), q0, q1);
-      run(std::true_type(), std::false_type(), q1, C.nr);
+      acc = run(std::true_type(), std::false_type(), 0, q0, acc);
+      acc = run(std::true_type(), std::true_type(), q0, q1, acc);
+      acc = run(std::true_type(), std::false_type(), q1, C.nr, acc);
     }
     else
     {
-      run(std::false_type(), std::false_type(), 0, q0);
-      run(std::false_type(), std::true_type(), q0, q1);
-      run(std::false_type(), std::false_type(), q1, C.nr);
+      acc = run(std::false_type(), std::false_type(), 0, q0, acc);
+      acc = run(std::false_type(), std::true_type(), q0, q1, acc);
+      acc = run(std::false_type(), std::false_type(), q1, C.nr, acc);
     }
-    A.bard[0] = hn::BitCast(du16, b0), A.bard[1] = hn::BitCast(du16, b1);
-    A.bard[2] = hn::BitCast(du16, b2), A.bard[3] = hn::BitCast(du16, b3);
-    A.bard[4] = hn::BitCast(du16, b4), A.bard[5] = hn::BitCast(du16, b5);
+    for (int j = 0; j < BARD_NMAP; ++j) A.bard[j] = hn::BitCast(du16, acc.b[j]);
   }
   const V16 ones = hn::Set(d16, 1), zero = hn::Zero(d16);
   // Bytes widen to the 16-bit halves by promotion (the first 16 pixels, then the rest) or,
@@ -593,19 +601,18 @@ HWY_INLINE void block(const Chunk &C, const uint8_t *IF_RESTRICT mask,
           sxx = hn::Add(sxx, hn::WidenMulPairwiseAdd(d32, gx, gx));
           syy = hn::Add(syy, hn::WidenMulPairwiseAdd(d32, gy, gy));
           sxy = hn::Add(sxy, hn::WidenMulPairwiseAdd(d32, gx, gy));
-          // HOG inputs: the gradient folded to the upper half-plane and interleaved as (qy, qx),
-          // so that one pmaddwd against (cx, -cy) is a whole ray test, and |grad|^2
-          const V16 neg = hn::VecFromMask(
-              d16, hn::Lt(hn::Or(gy, hn::And(hn::VecFromMask(d16, hn::Eq(gy, zero)), gx)), zero));
-          const V16 qx = hn::Sub(hn::Xor(gx, neg), neg), qy = hn::Abs(gy);
-          // (qy, qx) pairs, one per 32-bit lane. Which pixel lands in which lane only matters
-          // when a quarter block spans more than one cell: otherwise the cheaper in-block
-          // interleave, whose lanes hold the pixels of both quarters out of order, does
+          // HOG inputs: (|gx|, gy * sgn(gx)), sgn(0) = 1. The absolute values are the
+          // gradient reflected into the first quadrant; the sign of the second lane (that of
+          // gx * gy) says whether the gradient, folded to the upper half-plane, points left
+          // of the vertical. Pairs, one per 32-bit lane: which pixel lands in which lane only
+          // matters when a quarter block spans more than one cell; otherwise the cheaper
+          // in-block interleave, whose lanes hold the pixels of both quarters out of order, does
+          const V16 ax = hn::Abs(gx), sy = hn::IfNegativeThenNegOrUndefIfZero(hn::Or(gx, ones), gy);
           V16 z0, z1;
           if constexpr (decltype(kWhole)::value)
-            z0 = hn::InterleaveWholeLower(d16, qy, qx), z1 = hn::InterleaveWholeUpper(d16, qy, qx);
+            z0 = hn::InterleaveWholeLower(d16, ax, sy), z1 = hn::InterleaveWholeUpper(d16, ax, sy);
           else
-            z0 = hn::InterleaveLower(d16, qy, qx), z1 = hn::InterleaveUpper(d16, qy, qx);
+            z0 = hn::InterleaveLower(d16, ax, sy), z1 = hn::InterleaveUpper(d16, ax, sy);
           hn::StoreU(hn::BitCast(d32, z0), d32, hin(q - qs, h, 0));
           hn::StoreU(hn::BitCast(d32, z1), d32, hin(q - qs, h, 1));
         }
@@ -660,26 +667,64 @@ HWY_INLINE void block(const Chunk &C, const uint8_t *IF_RESTRICT mask,
     }
     for (int k = 0; k < 4; ++k) // the int32 quarter blocks: |grad|^4 and the HOG ray tests
     {
-      V32 hog[HB - 1];
+      V32 hog[K_NHOG];
       V64 sg4;
-      for (int j = 0; j < HB - 1; ++j) init(hog[j], A.hog[k][j]);
+      for (int j = 0; j < K_NHOG; ++j) init(hog[j], A.hog[k][j]);
       init(sg4, A.sg4[k]);
       for (size_t q = qs; q < qe; ++q)
       {
-        const V16 z = hn::BitCast(d16, hn::LoadU(d32, hin(q - qs, k >> 1, k & 1)));
+        const V32 zl = hn::LoadU(d32, hin(q - qs, k >> 1, k & 1)); // negative: left of the vertical
+        const V16 z = hn::BitCast(d16, zl), za = hn::Abs(z);       // (|gx|, |gy|)
         const V32 g2 = hn::WidenMulPairwiseAdd(d32, z, z); // |grad|^2: cheaper than a store + load
         sg4 = hn::Add(sg4, hn::BitCast(d64, hn::Add(hn::MulEven(g2, g2), hn::MulOdd(g2, g2))));
-        for (int j = 0; j < HB - 1; ++j)
+        // A gradient left of the vertical passes every low ray, and passes a low ray's mirror
+        // image exactly when its reflection (|gx|, |gy|) fails the low ray. So the low rays are
+        // tested against the reflection, with + |grad|^2 past the ray (t > 0) and - |grad|^2
+        // short of it (t < 0), one sign flip, into S; the same by the side into D; and the
+        // energy by the side alone into E, from which the flush has the energy past every ray
+        // (see K_HOG). A test is 0 only for a zero gradient (set_config checks), where
+        // |grad|^2 is 0 whatever the flip makes of it.
+        const V32 g2s = hn::IfNegativeThenNegOrUndefIfZero(zl, g2);
+        hog[2 * HRAYS] = hn::Add(hog[2 * HRAYS], g2s);
+        for (int j = 0; j < HRAYS; ++j)
         {
-          // + |grad|^2 past the ray (t > 0), - |grad|^2 short of it (t < 0): one sign flip. The
-          // rays are such that t == 0 only for a zero gradient (set_config checks), where
-          // |grad|^2 is 0 whatever the flip makes of it.
-          const V32 t = hn::WidenMulPairwiseAdd(d32, z, rays[j]);
+          const V32 t = hn::WidenMulPairwiseAdd(d32, za, rays[j]);
           hog[j] = hn::Add(hog[j], hn::IfNegativeThenNegOrUndefIfZero(t, g2));
+          hog[HRAYS + j] = hn::Add(hog[HRAYS + j], hn::IfNegativeThenNegOrUndefIfZero(t, g2s));
         }
       }
-      for (int j = 0; j < HB - 1; ++j) A.hog[k][j] = hog[j];
+      for (int j = 0; j < K_NHOG; ++j) A.hog[k][j] = hog[j];
       A.sg4[k] = sg4;
+    }
+  }
+}
+
+// Four times the |grad|^2 past each bin-boundary ray of a cell, in ray order, from its ray
+// sums (see K_HOG) through `sum(kind)` and its total |grad|^2: multiples of four, never
+// negative, so a shift or a multiply by 0.25 recovers them exactly. For vectors of int64 or of
+// doubles, and for scalars.
+template <class T, class F>
+HWY_INLINE void hog_cum4(F sum, T tot, T *IF_RESTRICT cum4)
+{
+  const T e = sum(K_HOG + 2 * HRAYS);
+  if constexpr (std::is_same_v<T, int64_t>)
+  {
+    const T t3e = 3 * tot - e, te = tot - e;
+    for (int i = 0; i < HRAYS; ++i)
+    {
+      const T s = sum(K_HOG + i), d = sum(K_HOG + HRAYS + i);
+      cum4[i] = s + d + t3e;                // past low ray i
+      cum4[2 * HRAYS - 1 - i] = d - s + te; // past its mirror image
+    }
+  }
+  else
+  {
+    const T t3e = hn::Sub(hn::Add(tot, hn::Add(tot, tot)), e), te = hn::Sub(tot, e);
+    for (int i = 0; i < HRAYS; ++i)
+    {
+      const T s = sum(K_HOG + i), d = sum(K_HOG + HRAYS + i);
+      cum4[i] = hn::Add(hn::Add(s, d), t3e);
+      cum4[2 * HRAYS - 1 - i] = hn::Add(hn::Sub(d, s), te);
     }
   }
 }
@@ -894,7 +939,7 @@ HWY_INLINE void fold_hog_multi(const Acc &A, size_t g, const bool *IF_RESTRICT a
   auto store = [&](auto v, auto d, bool add, int64_t *IF_RESTRICT dst)
   { hn::StoreU(add ? hn::Add(v, hn::LoadU(d, dst)) : v, d, dst); };
   auto halves = [&](V32 v) { return hn::Add(hn::LowerHalf(d4, v), hn::UpperHalf(d4, v)); };
-  for (int j = 0; j < HB - 1; ++j)
+  for (int j = 0; j < K_NHOG; ++j)
   {
     int64_t *IF_RESTRICT dst = cb + (K_HOG + j) * kst + at[0] * cst; // cells cst == 1 apart
     if (g == 8)                                                      // a cell a quarter
@@ -2162,7 +2207,7 @@ class FeatureComputer
   uint8_t *thumb_out_ = nullptr;  // features(): where to write the thumbnail, if asked
   int64_t thumb_rs_ = 0;
   std::vector<Level> levels_;
-  int16_t ray_[HB - 1][2] = {}; // bin-boundary ray j as (cx, -cy): t = cx*qy - cy*qx in one pmaddwd
+  int16_t ray_[HB - 1][2] = {}; // bin-boundary ray j as (cx, -cy); block() tests the low HRAYS
   int hog_card_[HB] = {};       // 1 for the axis-aligned (cardinal) orientation bins
   std::vector<uint8_t> bvalid_; // per lag: 255 where both +/-d column taps are in range
   size_t bvalid_stride_ = 0;
@@ -2324,9 +2369,11 @@ class FeatureComputer
         S[CNT] = hn::Set(dd, (double)n);
         const V tot = hn::Add(S[SXX], S[SYY]);
         V past = tot, rest = S[CNT]; // as the flush derives these slots
+        V cum4[HB - 1];
+        hog_cum4(sum_signed, tot, cum4);
         for (int j = 0; j < HB - 1; ++j)
-        { // (P + tot) / 2: an even integer halved, exact
-          const V cum = hn::Mul(hn::Add(sum_signed(K_HOG + j), tot), hn::Set(dd, 0.5));
+        { // a multiple of four quartered: exact
+          const V cum = hn::Mul(cum4[j], hn::Set(dd, 0.25));
           S[HOG0 + j] = hn::Sub(past, cum);
           past = cum;
         }
@@ -2518,9 +2565,9 @@ class FeatureComputer
     const size_t nxs = local ? group | 1 : cells_stride(); // never above cells_stride()
     const size_t kst = multi_ || local ? nxs : 1, cst = multi_ || local ? 1 : (size_t)K_N;
     const size_t pstride = (size_t)wrows_ * (size_t)s.row_stride, lanes = lanes_;
-    V16 rays[HB - 1];
-    for (int j = 0; j < HB - 1; ++j)
-      rays[j] = hn::InterleaveLower(d16, hn::Set(d16, ray_[j][0]), hn::Set(d16, ray_[j][1]));
+    V16 rays[HRAYS]; // the low rays as (-cy, cx), against block()'s (|gx|, |gy|) lanes
+    for (int j = 0; j < HRAYS; ++j)
+      rays[j] = hn::InterleaveLower(d16, hn::Set(d16, ray_[j][1]), hn::Set(d16, ray_[j][0]));
     const int G = group_;
     for (size_t q0 = 0; q0 < rws.size(); q0 += KROWS)
     {
@@ -2662,7 +2709,7 @@ class FeatureComputer
                 int64_t *IF_RESTRICT cq = cb + at[q] * cst;
                 fold(d64, A.sg4[q], gq / 2, adds[q], cq + K_SG4 * kst);
                 if (FOLDH) continue; // the HOG sums of all four quarters fold together below
-                for (int j = 0; j < HB - 1; ++j) // signed: energy past minus energy short
+                for (int j = 0; j < K_NHOG; ++j) // signed sums
                   fold32<true>(A.hog[q][j], gq, adds[q], cq + (K_HOG + j) * kst);
               }
 #if HWY_MAX_BYTES >= 32 && !HWY_HAVE_SCALABLE
@@ -2806,10 +2853,11 @@ class FeatureComputer
         a[SXX] = sum(K_SXX), a[SYY] = sum(K_SYY), a[SXY] = sum(K_SXY);
         a[CNT] = hn::Set(d64, n);
         const V64 tot = hn::Add(a[SXX], a[SYY]);
-        V64 past = tot;
+        V64 past = tot, cum4[HB - 1];
+        hog_cum4(sum, tot, cum4);
         for (int j = 0; j < HB - 1; ++j)
         {
-          const V64 cum = hn::ShiftRight<1>(hn::Add(sum(K_HOG + j), tot)); // (never negative)
+          const V64 cum = hn::ShiftRight<2>(cum4[j]); // (never negative)
           a[HOG0 + j] = hn::Sub(past, cum);
           past = cum;
         }
@@ -2871,10 +2919,11 @@ class FeatureComputer
         a[SXY] = sum(K_SXY);
         a[CNT] = n;
         const int64_t tot = a[SXX] + a[SYY]; // every pixel is past "ray -1": the total |grad|^2
-        int64_t past = tot;
+        int64_t past = tot, cum4[HB - 1];
+        hog_cum4(sum, tot, cum4);
         for (int j = 0; j < HB - 1; ++j)
         {
-          const int64_t cum = (sum(K_HOG + j) + tot) >> 1; // (past - short + past + short) / 2
+          const int64_t cum = cum4[j] >> 2;
           a[HOG0 + j] = past - cum;
           past = cum;
         }
@@ -3592,8 +3641,10 @@ public:
 
     for (int k = 1; k < HB; ++k)
     {
-      const double a = PI * k / HB;
-      ray_[k - 1][0] = (int16_t)std::llround(RAYSCALE * std::cos(a));
+      // ray HB-k is ray k's mirror image across the vertical, to the bit (block() relies on it)
+      const double a = PI * std::min(k, HB - k) / HB;
+      const int64_t c = std::llround(RAYSCALE * std::cos(a));
+      ray_[k - 1][0] = (int16_t)(k <= HRAYS ? c : -c);
       ray_[k - 1][1] = (int16_t)-std::llround(RAYSCALE * std::sin(a));
       // block() sums the energy past a ray minus the energy short of it, with the pixels ON the
       // ray (t == 0) going either way: that is exact only if no nonzero gradient lies on a ray,

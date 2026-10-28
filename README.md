@@ -366,9 +366,13 @@ bar-detector corner cases that were bugs. The short version, with the full log i
   level 1 derived from its rolled-up sums: another −5% at that configuration, −6% at 8 and
   16 px cells with stride 2, −8% at 256² and at coarse grids. Step 14 derives and rolls up
   cells in groups of four whatever the block width, which takes the last per-cell slot path
-  out of the stride-1 frame (63.6 M → 52.5 M instructions at 1024²). The log says what each
-  stage costs now, why the kernel is at the practical floor of this core, and how to measure
-  on a machine that is not quiet.
+  out of the stride-1 frame (63.6 M → 52.5 M instructions at 1024²). Step 15 halves the HOG
+  ray tests by a mirror symmetry of the rays (a gradient reflected into the first quadrant
+  is tested against four rays, the flush recovers all eight sums exactly) and takes the bar
+  detector's accumulators out of memory: another −5% at that configuration, for 1.69× over
+  the starting point on a quiet core (7.37 → 4.36 ms pinned), bit-identical. The log says what
+  each stage costs now, why the kernel is at the practical floor of this core, and how to
+  measure on a machine that is not quiet.
 
 ---
 
