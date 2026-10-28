@@ -110,6 +110,7 @@ Chronologically. Times are single-thread `features()`; instruction counts are pe
 | 8 | The cross-channel products dropped: nothing read them (details below) | instructions per fused frame in the core, one thread, AVX2: 720p → 512×320 52.0 M → 50.0 M (−3.8%), 720p → 256×256 42.8 M → 41.2 M (−3.7%), 1080p → 1024×576 112.6 M → 109.1 M (−3.1%) |
 | 9 | The projection profiles dropped, likewise | 50.0 M → 49.3 M (−1.4%), 41.2 M → 40.9 M (−0.7%), 109.1 M → 106.5 M (−2.4%) at the same three points; −5.2%, −4.4% and −5.4% against step 7 for the two together |
 | 10 | The kernel rewritten as register-resident phases down the rows, with row responses cached and the HOG sums signed; then, from a callgrind profile, the per-block cell sums laid out kind-contiguous and the fold's whole-vector reductions through `ReduceSum` / `SumsOf8` (details below) | Ryzen 7 3700X (AVX2, GCC 11), one thread, `features()`, 4 levels: 1024×1024×3 finest-32 stride 1, 7.44 → 5.42 ms (1.37×); 1024×1024 (C=1), 2.50 → 1.85 (1.35×); 1024×1024×3 finest-64, 8.93 → 6.80 (1.31×); 512×512×3 finest-32, 2.22 → 1.71 (1.30×); 256×256×3 finest-32, 0.81 → 0.71 (1.15×); the fused BGR → HSV pass at 1024², finest-64, 9.85 → 7.74 (1.27×). Every output bit-identical |
+| 12 | A batch of small items chosen by the per-instruction cost table of step 11 and kept or dropped by pinned A/B timing: plane rows aligned to cache lines (the left pad half a line, the stride a whole number of lines, the buffer 64-byte aligned); the 16-bit halves of a one-cell block widened by interleaving with zero instead of `pmovzx`; the bar detector's gate as a saturating subtract and min; the one-cell fold's sign extension through promotes; the moments' fourth-power pair sums widened every two rows; HOG sign masks from a compare instead of a shift | Pinned to a core, interleaved: 1024×1024×3 finest-32 stride 1, 5.38 → 4.84 ms (−10%); stride 2, 2.48 → 2.04 (−18%); 1024×1024 (C=1), 2.42 → 2.13 (−12%); finest-64, 6.81 → 6.45 (−5%); 512×512×3, 1.68 → 1.62 (−4%); 256×256×3, −1%. Every output bit-identical |
 | 11 | The plane window made a sliding contiguous buffer (the halo copied forward when it fills, edge rows physically replicated) and the response slots affine, so every row and column tap in the kernel is a constant offset from one row pointer; one phase plane makes the column taps compile-time (`block<.., UNIT>`) | 1024×1024×3 finest-32 stride 1: 67.4 M → 61.8 M instructions per frame (−8%), wall clock unchanged within noise (the scalar work ran in parallel with the vector work, see the step); 8 px cells and 256² about −2%. Every output bit-identical |
 
 **Step 1, the kernel.** Besides the change of lane, three algebraic rewrites turn every sum
@@ -494,6 +495,60 @@ the row responses through `punpcklbw` (two pipes) instead of `pmovzxbw` (one), 6
 which changes the lane order and so the fold's cell mapping for cells under 16 px. Neither
 measurable on this shared machine, so not done.
 
+**Step 12, a batch of small items (October 2026).** The question was whether many changes,
+each too small to measure, add up. They do, but only the ones that touch what the core is
+actually short of, and the way to tell is the per-instruction cost table of step 11, not the
+instruction count. Each item was built as its own variant on top of the batch so far (a
+script that reverts the others by text), checked bit-exact, and A/B timed pinned to the
+idlest core pair (eight interleaved rounds, the minimum), which brought the noise under
+±0.5% and made 1% items visible.
+
+* *Cache-line alignment of the plane rows* (left pad 32 bytes, a phase plane's stride a
+  multiple of 64, the buffer 64-byte aligned): −3.2%. Half of every centre-row load, lag-row
+  load and response-build load had straddled a line and cost two load slots. The column taps
+  one to four pixels off still straddle (a 40-byte span cannot sit in one 64-byte line on
+  both halves of it); about seven a row remain, inherent.
+* *In-lane widening for one-cell blocks*: −4.0 to −4.5%, the largest item. The row
+  responses widened bytes to 16 bits by `pmovzx`, which on this core issues at 0.64 a cycle
+  (two µops on the shuffle pipes), and the upper half needed a 128-bit extract (one pipe,
+  one a cycle): about twelve cycles per image row. Interleaving with zero is one two-pipe
+  shuffle per half. It changes which pixel lands in which 16-bit lane, which is nobody's
+  business when the whole block is one cell (every fold is a full reduction), so it is used
+  exactly then (`Chunk::inlane`); blocks of several cells keep the promotions. The masks for
+  the masked variant widen the same way.
+* *The bar detector's gate as `Min(SaturatedSub(peak, TAU − 1), mesh)`*: −0.7% alone, one
+  µop and one register fewer. *The one-cell fold's sign extension through
+  `PromoteLowerTo`/`PromoteUpperTo` and `ReduceSum`* (two shuffles and a reduction instead of
+  Highway's `SumsOf2` of ten shifts and compares): −0.45% alone. Together with the alignment
+  the three measured −2.2 to −2.5% against alignment alone, more than their sum.
+* *The moments' fourth-power pair sums widened every two rows* (two rows' pair sums add in 32
+  bits, one `SumsOf2` instead of two): +0.5% on its own on top of alignment, −0.5 to −1.1% on
+  top of the full batch. Kept. *HOG sign masks by a compare instead of an arithmetic shift*
+  (`vpcmpgtw` on three pipes, `vpsraw` on one): ±0.3%, kept as free.
+* *Dropped on measurement:* the LBP bin as a max instead of `vpblendvb` (+0.6% alone, −0.4%
+  on the batch: noise either way, and one µop more); `|grad|⁴` accumulated in double on the
+  FMA pipes (exact below 2⁵³; the two `pmuldq` became two converts, an extract and two FMAs,
+  the loop stayed 34 instructions with no spill, and it measured +0.5%: the converts and the
+  extract share one pipe, and the FMAs half-share the multiply pipe); a software prefetch of
+  the next block-channel's rows from the energy loop (+0.7 to +1.3%, as the step 10 attempt
+  had found: the stride prefetcher already has them).
+
+Why the ALU trims did so little and the memory ones so much came out of a microbenchmark of
+the HOG inner loop alone (its 32 rows in L1, the real rays): 16.2–16.9 cycles per quarter
+row for 34 µops, against a 9-cycle floor on the multiply pipe. Two rows an iteration, two
+passes of four rays, and a compare-and-mask in place of `psign` all land at 16 to 18; the
+same loop with its multiplies replaced by adds runs at 11, and bare multiply-and-accumulate
+(9 `pmaddwd`, 8 adds, nothing else) at 12.5. Smaller probes put the practical ceiling at
+2.5–3 vector µops a cycle in any accumulate loop here, not 4, with each `pmaddwd` costing
+1.15–1.5 cycles in context (the one skeleton that does better shares each ray load between
+two rows, 9.2 against 10.6 cycles, and in the full loop that gain goes to register
+pressure). So one ALU µop is worth 0.3–0.5 cycles of a 200-cycle block row, a line-split
+load about one, a `pmovzx` 1.5 and an extract 1: that is the table to cost the next item
+against. With it, a block row is about 420 vector µops at ~2.5 a cycle plus the loop exits,
+which is the time measured; the kernel is at the practical floor of this instruction mix,
+and the whole frame at 1024×1024×3, finest-32, stride 1 is 1.60× the starting point
+(7.74 → 4.84 ms pinned; 7.34 → 4.6 expected on a quiet core).
+
 ## What did not work
 
 * **Transposing cell sums into slots with SIMD** — slower, twice. The eventual answer was not
@@ -618,6 +673,15 @@ measurable on this shared machine, so not done.
   is useless for Highway code, since every intrinsic's cost lands on its header line, but
   per loop it gives the instruction, load, store, miss and mispredict counts of each phase
   exactly, and it is what found the cell-sum layout in step 10.
+* **Variants and pinned A/B.** For items under 2%: build each as its own variant (a copy of
+  the source with the other items reverted by exact text, its own build directory, the
+  Python package copied around the new module), check it bit-exact, then time all the
+  variants interleaved and pinned with `taskset` to the core pair with the least recent busy
+  time (`/proc/stat` over half a second, SMT siblings summed), eight rounds, the minimum.
+  That held the noise under ±0.5% on a machine running someone else's training job, where
+  unpinned runs wandered by 3%. Interactions are real (three items measured more together
+  than apart, one flipped sign), so retest the dropped ones on top of the batch before
+  discarding them.
 * **Pipe widths.** Instruction counts stopped predicting time in step 11; what did was the
   per-pipe issue width of the core, measured in five minutes with inline assembly: ten
   independent register chains of one instruction in a counted loop, pinned to a core, ops per
@@ -654,7 +718,7 @@ it accumulator loads and stores.
 * AddressSanitizer over the suite. It caught a block-buffer stride that overran on tiny grids.
 * clang-format, cppcheck and `-Wall -Wextra -Wshadow`; ruff, black and mypy for the Python.
 
-Steps 10 and 11 were checked the same way: 40,164 output arrays (eight shapes of 1–8 channels, five
+Steps 10 to 12 were checked the same way: 40,164 output arrays (eight shapes of 1–8 channels, five
 grids, six strides, two kinds of content, 1–3 threads, `features()` and `compute()`, the
 fused BGR → HSV and thumbnail paths) hashed on the AVX2 GCC build, the clang build and an
 SSE4-only build, each identical to the previous code's build with the same compiler and

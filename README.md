@@ -357,8 +357,12 @@ bar-detector corner cases that were bugs. The short version, with the full log i
   AVX2 Ryzen (1024×1024×3, finest-32: 7.3 → 5.1 ms), every output bit-identical. Step 11 then
   made the plane window a sliding contiguous buffer so every kernel tap is a constant offset
   (−8% instructions, no time: they had run beside the vector work) and measured the core's
-  vector pipes: every multiply shares one pipe, and the kernel sits within 20% of that floor,
-  which is why a 2× at one thread is not there. The log says what each stage costs now.
+  vector pipes. Step 12 then batched small items costed by that table and kept by pinned A/B
+  timing (cache-line-aligned plane rows, the one-cell block's 16-bit halves widened by
+  interleave instead of `pmovzx`, a cheaper bar-detector gate and fold): another −10% at
+  that configuration and −18% at stride 2, for 1.60× over the starting point (7.7 → 4.8 ms
+  pinned), bit-identical. The log says what each stage costs now and why the kernel is at
+  the practical floor of this core.
 
 ---
 
