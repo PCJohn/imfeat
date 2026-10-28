@@ -2193,9 +2193,10 @@ class FeatureComputer
   std::vector<int> hrow_, hcol_;     // row -> hash row (h_), col -> hash col (w_)
   std::vector<int> hrbeg_, hrend_, hrhc_; // per-run column range [beg,end) and its hash col
   std::vector<double> dctb_;              // HS*HN : DCT-II basis rows (scipy type-2, norm=None)
-  uint64_t *hash_ = nullptr;   // (NHASH, c_) in the output block: aHash, wHash, pHash rows
-  std::vector<size_t> hshape_; // {NHASH, c_}
-  bool hfast_ = false;         // finest grid tiles HN -> hashes reuse its S1
+  uint64_t *hash_ = nullptr;     // (NHASH, c_) in the output block: aHash, wHash, pHash rows
+  std::vector<size_t> hshape_;   // {NHASH, c_}
+  bool hfast_ = false;           // finest grid tiles HN -> hashes reuse its S1
+  std::vector<uint8_t> up_done_; // features(): level-1 rows derived in their band (flush_up)
 
   std::vector<int64_t> graw_;
   float *gfeat_ = nullptr; // the global outputs, in the output block
@@ -2237,14 +2238,13 @@ class FeatureComputer
   // conversions are exact: a sum below 2^52 is planted in the mantissa of 2^52 and that is
   // subtracted back off; a signed one is biased by 2^51 first; sum|grad|^4 can be wider, so its
   // halves convert separately and meet in one rounding. `cell` is the first cell's index.
-  void derive_block(const int64_t *IF_RESTRICT sums, size_t nxs, size_t cell, size_t cells,
-                    int64_t n)
+  void derive_block(const Level &L, const int64_t *IF_RESTRICT sums, size_t nxs, size_t cell,
+                    size_t cells, int64_t n)
   {
     const DDV dd;
     const hn::RebindToSigned<DDV> di;
     const hn::Rebind<float, DDV> df;
     using V = hn::VFromD<DDV>;
-    const Level &L = levels_[0];
     const double invn = 1.0 / (double)n;
     const V two52 = hn::Set(dd, 4503599627370496.0), two51 = hn::Set(dd, 2251799813685248.0);
     for (int k = 0; k < c_; ++k)
@@ -2607,7 +2607,7 @@ class FeatureComputer
               if (!(derives && rolls)) flush(s.cells.data(), nxs, nxs, 1, e, cells, k0, G, n, dst);
               if (derives)
               {
-                derive_block(s.cells.data(), nxs, cy * nfx + e, cells, n);
+                derive_block(levels_[0], s.cells.data(), nxs, cy * nfx + e, cells, n);
                 if (bands_.size() == 1) summary_fold(levels_[0], cy * nfx + e, cells);
                 if (rolls) roll_block(s, s.cells.data(), nxs, cy, e, cells, n, hs);
               }
@@ -2694,12 +2694,92 @@ class FeatureComputer
     }
   }
   // The level-1 row in flight is complete (or the band ends): its sums become slots.
-  void flush_up(Scratch &s, size_t cy)
+  // `complete`: every finest row of this level-1 row was this band's, so its cells are final
+  // and derive now, from the sums while they are in cache; otherwise (and for the coarser
+  // levels) derive_cells() derives them from their slots after the join.
+  void flush_up(Scratch &s, size_t cy, bool complete)
   {
     Level &lv = levels_[1];
-    flush(s.up.data(), (size_t)lv.nx + hn::Lanes(d64), (size_t)lv.nx + hn::Lanes(d64), 1, 0,
-          (size_t)lv.nx, 0, c_, s.up_n, lv.buf.data() + (cy >> up_shift_) * lv.nx * c_ * NSUM);
+    const size_t nxu = (size_t)lv.nx + hn::Lanes(d64), row = cy >> up_shift_;
+    int64_t *IF_RESTRICT dst = lv.buf.data() + row * lv.nx * c_ * NSUM;
+    if (FLUSH4)
+      flush4(s.up.data(), nxu, (size_t)lv.nx, s.up_n, dst);
+    else
+      flush(s.up.data(), nxu, nxu, 1, 0, (size_t)lv.nx, 0, c_, s.up_n, dst);
+    // (the double re-centring of the moments is exact below 2^20 samples; derive_cells()'s
+    // integer one takes anything)
+    if (complete && s.up_n > 0 && s.up_n < (int64_t{1} << 20))
+    {
+      derive_block(lv, s.up.data(), nxu, row * lv.nx, (size_t)lv.nx, s.up_n);
+      up_done_[row] = 1;
+    }
     s.up_n = 0;
+  }
+  // flush() for a kind-major source (cells contiguous, kinds `kst` apart), four cells at a
+  // time: each slot as a vector of four cells, the slots then transposed into the records
+  // four at a time. The same integer arithmetic as flush(); KBIAS is a power of two, so the
+  // binomial coefficients are shifts and adds.
+  static constexpr bool FLUSH4 = HWY_MAX_LANES_D(D64) == 4 && !HWY_HAVE_SCALABLE;
+  void flush4(const int64_t *IF_RESTRICT sums, size_t kst, size_t cells, int64_t n,
+              int64_t *IF_RESTRICT dst) const
+  {
+#if HWY_MAX_BYTES >= 32 && !HWY_HAVE_SCALABLE
+    static_assert(KBIAS == 128 && NSUM % 4 == 0, "flush4 shifts by KBIAS and transposes 4x4");
+    const int64_t B = KBIAS;
+    size_t i = 0;
+    for (; i + 4 <= cells; i += 4)
+      for (int k = 0; k < c_; ++k)
+      {
+        const int64_t *IF_RESTRICT cb = sums + (size_t)k * K_N * kst + i;
+        auto sum = [&](int t) { return hn::LoadU(d64, cb + (size_t)t * kst); };
+        auto times3 = [](V64 v) { return hn::Add(v, hn::Add(v, v)); };
+        V64 a[NSUM];
+        a[SXX] = sum(K_SXX), a[SYY] = sum(K_SYY), a[SXY] = sum(K_SXY);
+        a[CNT] = hn::Set(d64, n);
+        const V64 tot = hn::Add(a[SXX], a[SYY]);
+        V64 past = tot;
+        for (int j = 0; j < HB - 1; ++j)
+        {
+          const V64 cum = hn::ShiftRight<1>(hn::Add(sum(K_HOG + j), tot)); // (never negative)
+          a[HOG0 + j] = hn::Sub(past, cum);
+          past = cum;
+        }
+        a[HOG0 + HB - 1] = past;
+        a[NMAX] = sum(K_MAX), a[NMIN] = sum(K_MIN);
+        const V64 t1 = sum(K_T1), t2 = sum(K_T2), t3 = sum(K_T3), t4 = sum(K_T4);
+        a[PS0] = hn::Add(t1, hn::Set(d64, B * n));
+        a[PS0 + 1] = hn::Add(hn::Add(t2, hn::ShiftLeft<8>(t1)), hn::Set(d64, B * B * n));
+        a[PS0 + 2] = hn::Add(hn::Add(t3, times3(hn::ShiftLeft<7>(t2))),
+                             hn::Add(times3(hn::ShiftLeft<14>(t1)), hn::Set(d64, B * B * B * n)));
+        a[PS0 + 3] =
+            hn::Add(hn::Add(hn::Add(t4, hn::ShiftLeft<9>(t3)),
+                            hn::Add(hn::ShiftLeft<15>(t2), hn::ShiftLeft<16>(t2))), // 6 B^2 t2
+                    hn::Add(hn::ShiftLeft<23>(t1), hn::Set(d64, B * B * B * B * n)));
+        V64 rest = a[CNT];
+        for (int j = 0; j < LBPB - 1; ++j) rest = hn::Sub(rest, a[LBP0 + j] = sum(K_LBP + j));
+        a[LBP0 + LBPB - 1] = rest;
+        a[SG4] = sum(K_SG4);
+        for (int t = 0; t < BARD_NMAP; ++t) a[BARD0 + t] = sum(K_BARD + t);
+        a[LAP1] = sum(K_LAP1), a[LAP2] = sum(K_LAP2);
+        for (int t = 0; t < NLAWS; ++t) a[LAWS0 + t] = sum(K_LAWS + t);
+        int64_t *IF_RESTRICT rec[4]; // the four cells' records
+        for (size_t c = 0; c < 4; ++c) rec[c] = dst + ((i + c) * (size_t)c_ + (size_t)k) * NSUM;
+        for (int g = 0; g < NSUM; g += 4) // four slots of four cells -> four cells' four slots
+        {
+          const V64 t01 = hn::InterleaveLower(d64, a[g], a[g + 1]),
+                    u01 = hn::InterleaveUpper(d64, a[g], a[g + 1]),
+                    t23 = hn::InterleaveLower(d64, a[g + 2], a[g + 3]),
+                    u23 = hn::InterleaveUpper(d64, a[g + 2], a[g + 3]);
+          hn::StoreU(hn::ConcatLowerLower(d64, t23, t01), d64, rec[0] + g);
+          hn::StoreU(hn::ConcatLowerLower(d64, u23, u01), d64, rec[1] + g);
+          hn::StoreU(hn::ConcatUpperUpper(d64, t23, t01), d64, rec[2] + g);
+          hn::StoreU(hn::ConcatUpperUpper(d64, u23, u01), d64, rec[3] + g);
+        }
+      }
+    if (i < cells) flush(sums + i, kst, kst, 1, i, cells - i, 0, c_, n, dst);
+#else
+    flush(sums, kst, kst, 1, 0, cells, 0, c_, n, dst);
+#endif
   }
 
   // Cell sums -> accumulator slots, for the `cells` cells from cell0 on that the sums hold (a
@@ -2857,7 +2937,8 @@ class FeatureComputer
           derive_run(fine, (size_t)cy * nfx, nfx, dst, bands_.size() == 1);
           if ((cy & (fy1 - 1)) == 0) std::fill(s.up.begin(), s.up.end(), (int64_t)0);
         }
-        if ((cy & (fy1 - 1)) == fy1 - 1 || cy == bands_[bi].cy1 - 1) flush_up(s, (size_t)cy);
+        if ((cy & (fy1 - 1)) == fy1 - 1 || cy == bands_[bi].cy1 - 1)
+          flush_up(s, (size_t)cy, (cy & (fy1 - 1)) == fy1 - 1); // (rolls: the first row is ours)
       }
       else if (stream_)
         stream_row(s, cy, owner, derived, hs);
@@ -3036,6 +3117,7 @@ class FeatureComputer
     task_img_ = img;
     task_rs_ = rs;
     task_cs_ = cs;
+    std::fill(up_done_.begin(), up_done_.end(), (uint8_t)0);
     run_job(JOB_ACC);
 
     if (hashing) // fold the bands' private hash partials; int64 sums, so still exact
@@ -3357,7 +3439,20 @@ class FeatureComputer
       const size_t nc = (size_t)L.ny * L.nx, c0 = nc * (size_t)bi / nb,
                    c1 = nc * (size_t)(bi + 1) / nb;
       if (nb == 1) summary_reset();
-      derive_run(L, c0, c1 - c0, L.buf.data() + c0 * c_ * NSUM, nb == 1);
+      if (lvl == 1 && stream_) // rows flush_up() derived in their band are done: the rest
+      {                        // from their slots, then the summary over all of them
+        for (size_t r = c0 / L.nx; r * L.nx < c1; ++r)
+          if (!up_done_[r])
+          {
+            const size_t a = std::max(c0, r * L.nx), b = std::min(c1, (r + 1) * L.nx);
+            derive_run(L, a, b - a, L.buf.data() + a * c_ * NSUM, false);
+          }
+        if (nb == 1)
+          for (size_t cell = 0; cell < nc; cell += SB)
+            summary_fold(L, cell, std::min(SB, nc - cell));
+      }
+      else
+        derive_run(L, c0, c1 - c0, L.buf.data() + c0 * c_ * NSUM, nb == 1);
       if (nb == 1) summary_write(L);
     }
   }
@@ -3664,6 +3759,7 @@ public:
       if (b) s.hsum.assign((size_t)HN * HN * c_, 0);
       s.row.assign((size_t)levels_[0].nx * c_ * NSUM, 0);
       if (levels_.size() > 1) s.up.assign((size_t)c_ * K_N * ((size_t)levels_[1].nx + N), 0);
+      if (levels_.size() > 1) up_done_.assign((size_t)levels_[1].ny, 0);
       s.graw.assign((size_t)c_ * NSUM, 0);
     }
     for (size_t b = 1; b < bands_.size(); ++b) workers_.emplace_back([this, b] { worker((int)b); });
