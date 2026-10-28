@@ -73,10 +73,13 @@ operations process four doubles each):
    rows. With an even stride the planes are also split by column phase (up to 8 phases), so
    the sampled columns are adjacent: a stride of 2 walks half as many blocks instead of
    masking half of each one.
-2. **Kernel: columns as lanes.** One kernel takes a block of columns from rows `r−1, r, r+1`
-   (plus the bar detector's taps) and computes every per-pixel quantity in registers, with no
-   intermediate row buffers. About 76 vector accumulators per channel are updated per row of a
-   block. The first row of a cell row *assigns* them, so nothing is ever zeroed.
+2. **Kernel: columns as lanes.** One kernel (`block()`) takes a block of columns down all the
+   sampled rows of a cell row and computes every per-pixel quantity in registers, in phases
+   (step 10): bytes first (extrema and LBP, then the bar detector), then, a sub-chunk of rows
+   at a time, each image row's three 1-D responses once into a small L1 buffer, the Laws
+   energies and the tensor (which also write the HOG inputs), the Laplacian and the moments,
+   and the HOG ray tests a quarter block at a time. Each phase carries its few accumulators in
+   registers for the whole chunk; the 76 vectors of per-block sums are written once per chunk.
 3. **Fold: lanes → cells.** Once per block per cell row, each accumulator's lanes are summed
    into per-cell sums with widening pairwise adds. When a block holds whole cells, those sums
    live in a block-sized buffer, contiguous per kind of sum, that never leaves the L1 cache.
@@ -106,6 +109,7 @@ Chronologically. Times are single-thread `features()`; instruction counts are pe
 | 7 | The `INTER_AREA` thumbnail resize fused into the pass (details below) | development VM, 1920×1080×3 → 1024×1024, finest-64 stride 1: `cv2.resize` + pass 17.4 → 14.4 ms on one thread and 13.0 → 8.3 ms on two; the resize costs 3.9 ms inside the pass on one thread and 2.1 on two, against `cv2.resize`'s 13.5 ms on one thread and 6.6 on its two, plus a write and a read of the thumbnail. On its own the kernel takes 0.31× `cv2.resize`'s time per thread |
 | 8 | The cross-channel products dropped: nothing read them (details below) | instructions per fused frame in the core, one thread, AVX2: 720p → 512×320 52.0 M → 50.0 M (−3.8%), 720p → 256×256 42.8 M → 41.2 M (−3.7%), 1080p → 1024×576 112.6 M → 109.1 M (−3.1%) |
 | 9 | The projection profiles dropped, likewise | 50.0 M → 49.3 M (−1.4%), 41.2 M → 40.9 M (−0.7%), 109.1 M → 106.5 M (−2.4%) at the same three points; −5.2%, −4.4% and −5.4% against step 7 for the two together |
+| 10 | The kernel rewritten as register-resident phases down the rows, with row responses cached and the HOG sums signed; then, from a callgrind profile, the per-block cell sums laid out kind-contiguous and the fold's whole-vector reductions through `ReduceSum` / `SumsOf8` (details below) | Ryzen 7 3700X (AVX2, GCC 11), one thread, `features()`, 4 levels: 1024×1024×3 finest-32 stride 1, 7.44 → 5.42 ms (1.37×); 1024×1024 (C=1), 2.50 → 1.85 (1.35×); 1024×1024×3 finest-64, 8.93 → 6.80 (1.31×); 512×512×3 finest-32, 2.22 → 1.71 (1.30×); 256×256×3 finest-32, 0.81 → 0.71 (1.15×); the fused BGR → HSV pass at 1024², finest-64, 9.85 → 7.74 (1.27×). Every output bit-identical |
 
 **Step 1, the kernel.** Besides the change of lane, three algebraic rewrites turn every sum
 into a plain vector add:
@@ -290,6 +294,136 @@ four clips at six operating points (1–3 threads, strides 1, 2 and 4, four thum
 together, which is what lets a block's cells be derived on the spot; it just no longer forms
 the products on the way.
 
+**Step 10, the kernel as phases (October 2026).** The brief was 2× at stride 1 with the output
+unchanged; this step got 1.3–1.4× where the kernel dominates and is written up with the
+reasons the rest is out of reach, so that nobody re-derives them. Measured on an AMD Ryzen 7
+3700X (AVX2, 16 vector registers, GCC 11). `perf` is locked on that machine
+(`perf_event_paranoid = 4`) and valgrind was not installed, so the first half of the work
+went by *ablations* — the same build with one stage deleted, timed against the whole, the
+difference being that stage's share — and by reading the generated code; the second half by
+callgrind, after valgrind was built from source into the user's prefix (no root needed).
+
+Where a stride-1 frame went before the change (1024×1024×3, finest-32, 7.4 ms): the pixel
+kernel 80–86%, the fold 8–12%, everything else (row gather, derive, summary, hashes) under
+10%. Inside the kernel: the HOG ray tests 27%, the bar detector 9%, the moments 7%, the Laws
+energies 6%, and the rest — loads, promotions, the 1-D row responses, the `(qy, qx)`
+interleave, and above all the accumulator traffic — about 40%. Deleting every accumulator
+update (keeping the arithmetic) saved 22% of the frame: with 76 accumulators per block and 16
+registers, every one of them was a load, an add and a store per row.
+
+What was done, each part exact by construction (every sum is still an integer sum of the same
+per-pixel integers; only the order of the additions changes):
+
+* *Phases down the rows.* `kernel()` (one call per row per channel, everything at once) became
+  `block()`: one call per block per channel per chunk of rows, which walks the rows several
+  times, once per phase, each phase holding only its own accumulators — extrema (2), LBP (9),
+  the bar detector (6), the energies and tensor (9 per half block), the Laplacian and moments
+  (6), the HOG (9 per quarter block). Those stay in registers for the whole chunk; the Acc
+  block is written once. The HOG phase compiles to 34 instructions per quarter block per row
+  (8 multiply-adds, 8 sign flips, 8 adds, 2 loads, the |grad|⁴ term and the loop), the
+  energy phase to 77 per half block per row, with no spills in either.
+* *Row responses once per image row.* At stride 1 each image row is the row above, the centre
+  and the row below of three consecutive sampled rows, and the old kernel promoted it to
+  16 bits and formed its three 1-D responses three times. A sub-chunk of up to 32 sampled rows
+  now computes `D = r − l`, `S = l + r − 2m`, `L = S + 4m` and `m` once per distinct row into
+  an 8.7 KB L1 buffer (the distinct rows are listed per chunk by `cell_row()`, so replicated
+  edge rows are computed once too), and the 16-bit phases load them. At strides above 1 there
+  is no reuse and the cost is the same as before, just in a different place.
+* *Signed HOG sums.* The cumulative energy past ray `j` was `Σ |grad|² · [t_j ≥ 0]`, a mask
+  and an AND per ray (a compare, a min and an AND as GCC compiled it). Now the kernel sums
+  `+|grad|²` where `t_j > 0` and `−|grad|²` where `t_j < 0` — one sign-flip instruction
+  (`IfNegativeThenNegOrUndefIfZero`, `vpsignd` on x86) — and the flush recovers the
+  cumulative sum as `(P_j + T) / 2` with `T = Sxx + Syy`, exact because `P_j + T` is even.
+  This is exact only if no nonzero gradient lies *on* a ray (`t_j = 0`): the rays' reduced
+  directions all have a component above 1020 (the smallest is 1283, so `(cx, cy)/gcd` is out
+  of the gradient's range `|gx|, |gy| ≤ 4·255`), and `set_config()` checks that, so a retuned
+  bin count or ray scale cannot silently break it. The `t = 0` case then only happens for a
+  zero gradient, whose energy is 0 whatever the flip makes of it. On targets without a sign
+  flip Highway's fallback costs about what the mask did.
+* *The bar detector's gate as a multiply-add.* Its six gated maps were each `AND`ed with the
+  gate and pair-summed with a generic widening that compiled to four instructions; the gate is
+  now 0 / 1 bytes and each map pairs up through one `pmaddubsw` against it. The block- and
+  row-constant branches (`valid` for a block at a row end, the lags whose rows are inside the
+  image) are resolved outside the row loop: the rows with every lag in the image are one run,
+  walked without a test per lag.
+* *Taps as offsets.* The per-row, per-channel table of 21 tap pointers became three row
+  offsets and six up/down offsets per row, shared by the channels, with the column taps as
+  loop-invariant registers; the energy phase's row-slot indices are precomputed as element
+  offsets. Ten to twenty scalar instructions per row of address arithmetic went away.
+* *`Σ w⁴` widened unsigned* (its pair sums cannot be negative): three instructions instead of
+  ten. *Small trims*: the row responses `S` and `L` as `(l + r) ∓ 2m`, one op fewer; the
+  half-plane sign of the gradient from the sign bit of `gy | (gx & [gy = 0])`, one op fewer.
+
+The frame after that (1024×1024×3, finest-32, stride 1, 5.8 ms): the kernel 80%, of which
+the HOG tests 22%, the energies and tensor 15%, the bar detector 16%, LBP and extrema 12%,
+the row responses 8%, the Laplacian and moments 6%; the fold 12%.
+
+*With a profiler.* Callgrind on one such frame (per-instruction costs attributed to the
+innermost loop, with cache and branch simulation) counted 74 M instructions in the module:
+the energy phase 20%, the HOG phase 18%, LBP 11.5%, the bar detector 10%, the Laplacian and
+moments 9%, the row responses 5.5%, extrema 5%, the fold under 5%. The kernel therefore
+executes about 600 instructions per block row (32 columns, one channel) at 3.2 per cycle,
+some 410 of them vector arithmetic, and it is at the floor of this formulation: one
+multiply-add per energy and per ray test, and each of the eight ray tests needs its own
+sign-and-add into its own accumulator. What the profile did show was the cache: 1.04 M L1
+data misses per frame, 586 K of them on stores, where the planes' first touch explains
+250 K. The rest came from the per-block cell sums: with one cell per block (32 px cells at
+stride 1) each block wrote its 39 kinds at a 33-cell stride, 117 cache lines for 936 bytes,
+three channels' worth, which evicted the row-response and HOG-input buffers between phases
+(a fifth of their lines missed on every block). Three changes followed, each exact:
+
+* the one-cell-per-block case writes its kinds contiguously (`flush()` takes a kind and a
+  cell stride), five lines per block; each channel's block is folded as soon as it is done,
+  so one set of accumulators serves all channels (7.5 → 2.5 KB); the HOG phase recomputes
+  `|grad|²` from `(qy, qx)` instead of loading it, which halves that buffer. Misses per
+  frame 1.04 M → 0.41 M, the stride-1 frame −4 to −5%;
+* a vector whose lanes all belong to one cell is reduced with `ReduceSum` instead of a
+  `ConcatEven` / `ConcatOdd` level per halving — every accumulator at 16 px cells and up, the
+  HOG and `|grad|⁴` ones at 8 px: −6% at finest-64, −4.5% at finest-32;
+* the byte-count kinds (extrema, LBP) and the bar maps sum to 64-bit lanes of eight columns
+  in one step (`SumsOf8`, a `psadbw`; `SumsOf4` for the 16-bit maps) wherever a cell is eight
+  columns or wider, instead of a pair sum, two promotions and two folds: another −1.5 to −2%.
+
+Two smaller items came out of the same profiles: the per-chunk row tables were built with a
+linear search per row (1.3% of the instructions at 32 px cells, 2.6% at 4 px); a window-slot
+lookup replaced it. And the two linear sums of the Laplacian phase (`Σ lap`, `Σ w`) ride in
+16-bit lanes for a sub-chunk (`|lap| ≤ 1020` over at most 32 rows fits int16) and pair up
+once, two instructions a row fewer. Tried and rejected on measurement: a software prefetch of
+the next block's rows (−1 to −3%: the hardware prefetcher already follows the row stride) and
+unrolling the HOG and energy loops by two (no change: the loops are throughput-bound, not
+latency-bound). Branch simulation put the mispredictions at one per loop exit (about 30
+loops per block, 85 K a frame, 5–7% of the cycles if the real predictor did as badly); the
+loops cannot be fused without spilling, and whether the hardware predicts a 32-iteration exit
+was not measurable here. At stride 2 on 8 px cells (the hosts' operating point) the profile
+is 60% per-cell stages — derive 17%, fold 13%, summary 8%, roll-up 4%, the level-1 flush
+4% — each within a few instructions of its arithmetic floor (the derive is two instructions
+per feature, the summary a min, max, sum and sum of squares in double per value), so that
+configuration gained little. Where a 2× would have to come from, and why it was not taken:
+
+* **Fewer ray tests.** Mirroring the gradient about 90° halves the multiply-adds (four rays)
+  but not the masked adds (each test now feeds two accumulators, one per half-plane), and
+  needs a ninth accumulator; on paper it saves 4 of 35 instructions per quarter block per
+  row, about 2% of the frame. A coarse 16-bit test with an exact fallback was costed and
+  rejected: with the rays at 2¹⁴ the rounding leaves a test ambiguous whenever
+  `|grad| · sin(angle to the ray) < 4`, which at typical gradients is a few percent of the
+  pixels per ray, so almost every vector of 16 pixels would take the fallback. Exact 16-bit
+  comparison of the products' halves costs more than the 32-bit test it would replace.
+* **The fold.** What is left of it is the partial reductions (several cells per vector, at
+  8 px cells and below). A rewrite that reduces four accumulators at once through a
+  transpose-add network would roughly halve that, but its lane bookkeeping is specific to
+  256-bit vectors (two 128-bit blocks); the portable reductions (`ReduceSum`, `SumsOf8`, and
+  `ConcatEven`/`ConcatOdd` per level) are what Highway gives. Not done.
+* **Small cells** are dominated by the per-cell stages: at 4 px cells the derive is 18% of
+  the instructions, the summary fold 9%, the fold 14%, the level roll-up 5%, each near its
+  arithmetic floor (the summary is a min, max, sum and sum of squares in double per value).
+* **What was tried and reverted:** folding the extrema into the bar detector's row sweep (one
+  sweep fewer, but the registers ran out: +2%); 64-byte alignment of the response buffers (no
+  measurable change, kept since it is free); the extrema and LBP in one sweep (spills: split).
+* **Small cells regress slightly** (256×256×3 finest-64, 4 px cells at stride 1: −3%;
+  256×256×3 finest-32 at stride 2: −1%): a chunk is then 4 rows, and a dozen phase loops with
+  their prologues cost more than the register residency saves. Those configurations are
+  dominated by the per-cell stages anyway.
+
 ## What did not work
 
 * **Transposing cell sums into slots with SIMD** — slower, twice. The eventual answer was not
@@ -400,6 +534,20 @@ the products on the way.
 
 * **Wall clock**: minimum over many frames, builds interleaved in one session. The first tool
   and the least trustworthy; ±5% on a shared machine is noise.
+* **Ablations**, where no profiler is available: the same build with one stage deleted, timed
+  in its own process against the full build in an interleaved loop, the minimum of several
+  rounds; the difference is that stage's share of the frame under real scheduling, which an
+  instruction count cannot give (the LBP's 60 instructions a row cost 2% of the frame, the
+  HOG's 160 cost 27%). The deleted stage's outputs are wrong, so the variant is never
+  installed; `objdump -d` on the result shows what the compiler made of each loop.
+* **Callgrind per loop.** On a machine without root, valgrind builds from its tarball into
+  `~/.local` in a few minutes; `perf` needs `kernel.perf_event_paranoid` lowered by root.
+  Run on a build with `-g` and nanobind's `NOSTRIP`, with `--dump-instr=yes --cache-sim=yes
+  --branch-sim=yes`, then attribute each instruction's counts to the innermost loop that
+  contains it (backward jumps within a function, from `objdump -d -l`): the per-line view
+  is useless for Highway code, since every intrinsic's cost lands on its header line, but
+  per loop it gives the instruction, load, store, miss and mispredict counts of each phase
+  exactly, and it is what found the cell-sum layout in step 10.
 * **Instructions per frame**: `valgrind --tool=cachegrind` on a run of 4 frames and a run of
   24, differenced. `callgrind` with a few functions marked `noinline` gives the split by
   stage. For a fused pass driven from Python, `callgrind` on 2 and 12 frames with the self
@@ -430,6 +578,12 @@ it accumulator loads and stores.
 * AddressSanitizer over the suite. It caught a block-buffer stride that overran on tiny grids.
 * clang-format, cppcheck and `-Wall -Wextra -Wshadow`; ruff, black and mypy for the Python.
 
+Step 10 was checked the same way: 40,164 output arrays (eight shapes of 1–8 channels, five
+grids, six strides, two kinds of content, 1–3 threads, `features()` and `compute()`, the
+fused BGR → HSV and thumbnail paths) hashed on the AVX2 GCC build, the clang build and an
+SSE4-only build, each identical to the previous code's build with the same compiler and
+target; and the 740 tests of the suite, cross-checks included.
+
 Differences observed against the original: none on AVX2 or AVX-512 builds, apart from two
 bar-detector corner cases that were bugs in the original (its results depended on the
 instruction set for large cells at an even stride, and its sampling mesh did not restart per
@@ -444,6 +598,15 @@ float64 moments move by at most one unit in the last place when the code around 
   last place, once. Not done.
 * **int32 cell sums where a level's sample count bounds them** (all but `Σw⁴` and `Σg⁴` at
   typical finest levels): halves the per-cell data volume; an estimated −8% at small cells.
+* **A batched fold.** Four accumulators reduced together through interleaves and 128-bit
+  concatenations, one 64-bit level after one 32-bit level (any two lanes of any accumulator
+  sum within 32 bits at `KROWS = 128`), writing four kinds' sums with one store into a
+  kind-contiguous layout for the one-cell-per-block case. About half the fold, so 5–10% of a
+  frame; it needs a lane layout per vector width, so it would be an AVX2 (and AVX-512) path
+  beside the portable one.
+* **Merging the 16-bit phases for small chunks.** At 4 px cells the per-phase overhead shows
+  (step 10); a single-loop variant of the energy, Laplacian and moment phases for chunks under
+  about 8 rows would recover it, at the cost of a second copy of that code.
 * **Level 1 derived straight from the rolled-up sums.** (The channel-pair features that
   shared this item are gone, step 8.)
 * **Batched folds with the roll-up fused in.** At the gate's operating point the folds and

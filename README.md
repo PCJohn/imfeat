@@ -348,6 +348,14 @@ bar-detector corner cases that were bugs. The short version, with the full log i
 * **Lessons:** count work (instructions and divider operations), not just milliseconds —
   timings hid a 10% cost in integer divides and flattered a change that removed nothing; and
   bit-exactness across code paths comes from sharing one compiled routine, not from flags.
+* **October 2026, the kernel as phases** (step 10 of the log): the per-row kernel became
+  per-block phases down the rows, each with its few accumulators in registers, with each
+  image row's 1-D responses computed once and the HOG sums accumulated signed (one sign flip
+  per ray test, the cumulative sums recovered at the flush); then a callgrind profile found
+  the per-block cell sums evicting the kernel's row buffers from L1, and the fold went
+  through `ReduceSum` / `SumsOf8`. Stride-1 frames with 16–32 px cells got 1.3–1.4× faster
+  on an AVX2 Ryzen (1024×1024×3, finest-32: 7.4 → 5.4 ms), every output bit-identical; the
+  log says what each stage costs now and why a 2× is not there.
 
 ---
 
