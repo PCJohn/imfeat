@@ -368,6 +368,7 @@ struct Chunk
   int32_t *hbuf = nullptr;          // [q - qs][half][z0 z1][Lanes(d32)]
   bool inlane = false;              // the block is one cell: the 16-bit halves may hold the
                                     // pixels in interleave order (see block())
+  bool rows1 = false;               // stride 1: consecutive slots are consecutive image rows
 };
 constexpr int RESP_STRIDE = NRESP * 2; // a slot's responses, in vectors of Lanes(d16)
 
@@ -502,12 +503,35 @@ HWY_INLINE void block(const Chunk &C, const uint8_t *IF_RESTRICT mask,
   auto resp = [&](const int16_t *rp, int i, int t) // rp: a sampled row's slots of one half
   { return hn::LoadU(d16, rp + (i * RESP_STRIDE + t * 2) * L16); };
   auto hin = [&](size_t q, int h, int i) { return C.hbuf + (((q * 2) + h) * 2 + i) * L32; };
+  struct Gram // the stride-1 energy phase's chunk-wide sums (see there)
+  {
+    V32 a[10];
+  };
+  Gram gram[2];
+  V32 head[2][9];
   for (size_t sub = 0, qs = 0; qs < C.nr; ++sub, qs += C.subrows)
   {
     const size_t qe = std::min(C.nr, qs + C.subrows);
     // a sub-chunk's accumulators start from zero and continue from what the chunk has so far
     auto init = [&](auto &acc, const auto &sofar)
     { acc = sub ? sofar : hn::Zero(hn::DFromV<std::remove_reference_t<decltype(acc)>>()); };
+    // HOG inputs: (|gx|, gy * sgn(gx)), sgn(0) = 1. The absolute values are the gradient
+    // reflected into the first quadrant; the sign of the second lane (that of gx * gy) says
+    // whether the gradient, folded to the upper half-plane, points left of the vertical.
+    // Pairs, one per 32-bit lane: which pixel lands in which lane only matters when a quarter
+    // block spans more than one cell; otherwise the cheaper in-block interleave, whose lanes
+    // hold the pixels of both quarters out of order, does
+    auto hog_in = [&](auto kWhole, size_t q, int h, V16 gx, V16 gy) IF_LAMBDA_INLINE
+    {
+      const V16 ax = hn::Abs(gx), sy = hn::IfNegativeThenNegOrUndefIfZero(hn::Or(gx, ones), gy);
+      V16 z0, z1;
+      if constexpr (decltype(kWhole)::value)
+        z0 = hn::InterleaveWholeLower(d16, ax, sy), z1 = hn::InterleaveWholeUpper(d16, ax, sy);
+      else
+        z0 = hn::InterleaveLower(d16, ax, sy), z1 = hn::InterleaveUpper(d16, ax, sy);
+      hn::StoreU(hn::BitCast(d32, z0), d32, hin(q - qs, h, 0));
+      hn::StoreU(hn::BitCast(d32, z1), d32, hin(q - qs, h, 1));
+    };
     const int64_t *IF_RESTRICT dist = C.rdist + sub * C.rdstride;
     auto responses = [&](auto kInlane) IF_LAMBDA_INLINE
     {
@@ -533,6 +557,78 @@ HWY_INLINE void block(const Chunk &C, const uint8_t *IF_RESTRICT mask,
     {
       V32 *IF_RESTRICT P = A.pair[h];
       auto on_mesh = [&](V16 v) { return MASKED ? hn::And(v, m16[h]) : v; };
+      if constexpr (!MASKED)
+        if (C.rows1)
+        {
+          // Stride 1: the slots are consecutive image rows, so the energy of each 3-tap
+          // vertical filter over the chunk is a combination of three sums per column X of
+          // responses over its rows r: the squares P = Σ X(r)², the products Q = Σ X(r) X(r+1)
+          // and R = Σ X(r) X(r+2), the sums over the chunk's sampled rows, plus the products of
+          // its first two rows (P0, P1, Q0) and the two past its last (Pn, Pn1, Qn): with
+          // B = 2P − P0 − P1 + Pn + Pn1, M = 4 (P − P0 + Pn) and Qc = 2Q − Q0 + Qn, the E,
+          // S and L filters' energies are B − 2R, B + M + 2R − 4Qc and B + M + 2R + 4Qc. Nine
+          // products a row instead of nine squares of fourteen sums; the corrections cost once
+          // per chunk. Every sum wraps in 32 bits and every result is in range, so it is exact.
+          auto prod = [&](V16 a, V16 b) { return hn::WidenMulPairwiseAdd(d32, a, b); };
+          const int16_t *IF_RESTRICT rp = C.resp + h * L16;
+          if (sub == 0)
+          {
+            for (int t = 0; t < 3; ++t)
+            {
+              const V16 x0 = resp(rp, 0, t), x1 = resp(rp, 1, t);
+              head[h][3 * t] = prod(x0, x0), head[h][3 * t + 1] = prod(x1, x1);
+              head[h][3 * t + 2] = prod(x0, x1);
+            }
+            for (auto &v : gram[h].a) v = hn::Zero(d32);
+          }
+          // the sums (P, Q, R of D, of S, of L, then Σ gx gy) go through the loop by value: by
+          // reference they would have a home in memory that the loads may alias, and GCC
+          // then stored them every row
+          auto grows = [&](auto kWhole, Gram g) IF_LAMBDA_INLINE
+          {
+            V32 *IF_RESTRICT a = g.a;
+            for (size_t q = qs; q < qe; ++q, rp += C.rstep)
+            {
+              const V16 d0 = resp(rp, 0, 0), d1 = resp(rp, 1, 0), d2 = resp(rp, 2, 0);
+              a[0] = hn::Add(a[0], prod(d0, d0)), a[1] = hn::Add(a[1], prod(d0, d1));
+              a[2] = hn::Add(a[2], prod(d0, d2));
+              const V16 s0 = resp(rp, 0, 1), s1 = resp(rp, 1, 1), s2 = resp(rp, 2, 1);
+              a[3] = hn::Add(a[3], prod(s0, s0)), a[4] = hn::Add(a[4], prod(s0, s1));
+              a[5] = hn::Add(a[5], prod(s0, s2));
+              const V16 l0 = resp(rp, 0, 2), l1 = resp(rp, 1, 2), l2 = resp(rp, 2, 2);
+              a[6] = hn::Add(a[6], prod(l0, l0)), a[7] = hn::Add(a[7], prod(l0, l1));
+              a[8] = hn::Add(a[8], prod(l0, l2));
+              const V16 gx = hn::Add(hn::Add(d0, d2), hn::Add(d1, d1)), gy = hn::Sub(l2, l0);
+              a[9] = hn::Add(a[9], prod(gx, gy));
+              hog_in(kWhole, q, h, gx, gy);
+            }
+            return g;
+          };
+          gram[h] = C.whole ? grows(std::true_type(), gram[h]) : grows(std::false_type(), gram[h]);
+          if (qe < C.nr) continue;
+          // the chunk's last sub-chunk: rp is at the row past its sampled rows
+          const V32 *IF_RESTRICT a = gram[h].a;
+          auto energies = [&](int t, V32 &e, V32 &s2, V32 *l)
+          {
+            const V16 xn = resp(rp, 0, t), xn1 = resp(rp, 1, t);
+            const V32 pn = prod(xn, xn), pn1 = prod(xn1, xn1), qn = prod(xn, xn1);
+            const V32 *IF_RESTRICT hd = head[h] + 3 * t;
+            const V32 pf = a[3 * t], qf = a[3 * t + 1], rf2 = hn::Add(a[3 * t + 2], a[3 * t + 2]);
+            const V32 b =
+                hn::Add(hn::Sub(hn::Add(pf, pf), hn::Add(hd[0], hd[1])), hn::Add(pn, pn1));
+            const V32 m = hn::ShiftLeft<2>(hn::Add(hn::Sub(pf, hd[0]), pn));
+            const V32 qc4 = hn::ShiftLeft<2>(hn::Add(hn::Sub(hn::Add(qf, qf), hd[2]), qn));
+            const V32 bm = hn::Add(hn::Add(b, m), rf2);
+            e = hn::Sub(b, rf2);
+            s2 = hn::Sub(bm, qc4);
+            if (l) *l = hn::Add(bm, qc4);
+          };
+          energies(0, P[K_LAWS + LAWS_EE], P[K_LAWS + LAWS_SE], &P[K_SXX]);
+          energies(1, P[K_LAWS + LAWS_ES], P[K_LAWS + LAWS_SS], &P[K_LAWS + LAWS_LS]);
+          energies(2, P[K_SYY], P[K_LAWS + LAWS_SL], nullptr);
+          P[K_SXY] = a[9];
+          continue;
+        }
       V32 ee, se, es, ls2, ss, sl, sxx, syy, sxy;
       init(ee, P[K_LAWS + LAWS_EE]), init(se, P[K_LAWS + LAWS_SE]), init(es, P[K_LAWS + LAWS_ES]);
       init(ls2, P[K_LAWS + LAWS_LS]), init(ss, P[K_LAWS + LAWS_SS]), init(sl, P[K_LAWS + LAWS_SL]);
@@ -565,20 +661,7 @@ HWY_INLINE void block(const Chunk &C, const uint8_t *IF_RESTRICT mask,
           sxx = hn::Add(sxx, hn::WidenMulPairwiseAdd(d32, gx, gx));
           syy = hn::Add(syy, hn::WidenMulPairwiseAdd(d32, gy, gy));
           sxy = hn::Add(sxy, hn::WidenMulPairwiseAdd(d32, gx, gy));
-          // HOG inputs: (|gx|, gy * sgn(gx)), sgn(0) = 1. The absolute values are the
-          // gradient reflected into the first quadrant; the sign of the second lane (that of
-          // gx * gy) says whether the gradient, folded to the upper half-plane, points left
-          // of the vertical. Pairs, one per 32-bit lane: which pixel lands in which lane only
-          // matters when a quarter block spans more than one cell; otherwise the cheaper
-          // in-block interleave, whose lanes hold the pixels of both quarters out of order, does
-          const V16 ax = hn::Abs(gx), sy = hn::IfNegativeThenNegOrUndefIfZero(hn::Or(gx, ones), gy);
-          V16 z0, z1;
-          if constexpr (decltype(kWhole)::value)
-            z0 = hn::InterleaveWholeLower(d16, ax, sy), z1 = hn::InterleaveWholeUpper(d16, ax, sy);
-          else
-            z0 = hn::InterleaveLower(d16, ax, sy), z1 = hn::InterleaveUpper(d16, ax, sy);
-          hn::StoreU(hn::BitCast(d32, z0), d32, hin(q - qs, h, 0));
-          hn::StoreU(hn::BitCast(d32, z1), d32, hin(q - qs, h, 1));
+          hog_in(kWhole, q, h, gx, gy);
         }
       };
       C.whole ? rows(std::true_type()) : rows(std::false_type());
@@ -2610,6 +2693,7 @@ class FeatureComputer
       C.resp = aligned64(s.resp);
       C.hbuf = aligned64(s.hbuf);
       C.inlane = block_cells_ == 1;
+      C.rows1 = rslots_ == 1;
       for (size_t sub = 0, qs = 0; qs < nr; ++sub, qs += sub_rows_)
       {
         int64_t *IF_RESTRICT dist = &s.rdist[sub * rd_stride_];
