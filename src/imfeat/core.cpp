@@ -810,6 +810,105 @@ HWY_INLINE void fold_cell(const Acc &A, bool msk, V8 mv, bool add, int64_t *IF_R
   }
 }
 
+// The HOG sums of a block of several cells, 4, 8 or 16 lanes (columns) a cell. A quarter block
+// holds two cells, one, or half of one; the lanes of a cell add in 32 bits first (a HOG lane
+// is below 2^28 at KROWS = 128, so four of them fit), as 128-bit vectors of four lanes, and
+// four cells' vectors reduce together through two interleave levels into one vector of their
+// sums (see fold_cell), widened to int64 and stored to the four consecutive cells. Only where
+// a vector is eight int32 lanes; other widths take the generic fold.
+constexpr bool FOLDH = HWY_MAX_BYTES >= 32 && !HWY_HAVE_SCALABLE && HWY_MAX_LANES_D(D32) == 8;
+#if HWY_MAX_BYTES >= 32 && !HWY_HAVE_SCALABLE
+using D32x4 = hn::FixedTag<int32_t, 4>;
+using V32x4 = hn::VFromD<D32x4>;
+template <bool SIGNED = true> // the sums widen by sign or (unsigned kinds, up to 2^32) by zero
+HWY_INLINE hn::VFromD<D64x4> sum4x4(V32x4 a, V32x4 b, V32x4 c, V32x4 e)
+{
+  const D32x4 d4;
+  const hn::Repartition<int64_t, D32x4> d2;
+  const auto ab = hn::Add(hn::InterleaveLower(d4, a, b), hn::InterleaveUpper(d4, a, b));
+  const auto ce = hn::Add(hn::InterleaveLower(d4, c, e), hn::InterleaveUpper(d4, c, e));
+  const auto lo = hn::InterleaveLower(d2, hn::BitCast(d2, ab), hn::BitCast(d2, ce)),
+             hi = hn::InterleaveUpper(d2, hn::BitCast(d2, ab), hn::BitCast(d2, ce));
+  const auto sum = hn::Add(hn::BitCast(d4, lo), hn::BitCast(d4, hi));
+  if constexpr (SIGNED)
+    return hn::PromoteTo(D64x4(), sum);
+  else
+    return hn::BitCast(D64x4(), hn::PromoteTo(hn::RebindToUnsigned<D64x4>(),
+                                              hn::BitCast(hn::RebindToUnsigned<D32x4>(), sum)));
+}
+// ... and the pair sums (one int32 lane per two columns, a half block each): 2, 4 or 8 lanes
+// a cell. Any two lanes sum within 32 bits; the unsigned kinds' four reach 2^32 - 2^25, which
+// unsigned 32-bit arithmetic holds exactly.
+template <bool SIGNED>
+HWY_INLINE void fold_pair_multi(V32 v0, V32 v1, size_t g, const bool *IF_RESTRICT adds,
+                                const size_t *IF_RESTRICT at, int64_t *IF_RESTRICT dst, size_t cst)
+{
+  const D64x4 dw;
+  const D32x4 d4;
+  const hn::Half<D64x4> dw2;
+  auto store = [&](auto v, auto d, bool add, int64_t *IF_RESTRICT p)
+  { hn::StoreU(add ? hn::Add(v, hn::LoadU(d, p)) : v, d, p); };
+  auto halves = [&](V32 v) { return hn::Add(hn::LowerHalf(d4, v), hn::UpperHalf(d4, v)); };
+  if (g == 4) // a cell a lane pair: four cells a half, the pairs added through a shuffle each,
+  {           // then only widened
+    const V32 v[2] = {v0, v1};
+    for (int h = 0; h < 2; ++h)
+    {
+      const auto lo = hn::LowerHalf(d4, v[h]), hi = hn::UpperHalf(d4, v[h]);
+      const auto p = hn::Add(hn::ConcatEven(d4, hi, lo), hn::ConcatOdd(d4, hi, lo));
+      hn::VFromD<D64x4> w;
+      if constexpr (SIGNED)
+        w = hn::PromoteTo(dw, p);
+      else
+        w = hn::BitCast(dw, hn::PromoteTo(hn::RebindToUnsigned<D64x4>(),
+                                          hn::BitCast(hn::RebindToUnsigned<D32x4>(), p)));
+      store(w, dw, adds[2 * h], dst + at[2 * h] * cst);
+    }
+  }
+  else if (g == 8) // a cell per 128-bit half: four cells
+    store(sum4x4<SIGNED>(hn::LowerHalf(d4, v0), hn::UpperHalf(d4, v0), hn::LowerHalf(d4, v1),
+                         hn::UpperHalf(d4, v1)),
+          dw, adds[0], dst + at[0] * cst);
+  else // g == 16: a cell a half: two cells
+    store(hn::LowerHalf(dw2, sum4x4<SIGNED>(halves(v0), halves(v1), hn::Zero(d4), hn::Zero(d4))),
+          dw2, adds[0], dst + at[0] * cst);
+}
+HWY_INLINE void fold_hog_multi(const Acc &A, size_t g, const bool *IF_RESTRICT adds,
+                               const size_t *IF_RESTRICT at, int64_t *IF_RESTRICT cb, size_t kst,
+                               size_t cst)
+{
+  const D64x4 dw;
+  const D32x4 d4;
+  const hn::Half<D64x4> dw2;
+  auto store = [&](auto v, auto d, bool add, int64_t *IF_RESTRICT dst)
+  { hn::StoreU(add ? hn::Add(v, hn::LoadU(d, dst)) : v, d, dst); };
+  auto halves = [&](V32 v) { return hn::Add(hn::LowerHalf(d4, v), hn::UpperHalf(d4, v)); };
+  for (int j = 0; j < HB - 1; ++j)
+  {
+    int64_t *IF_RESTRICT dst = cb + (K_HOG + j) * kst + at[0] * cst; // cells cst == 1 apart
+    if (g == 8)                                                      // a cell a quarter
+      store(sum4x4(halves(A.hog[0][j]), halves(A.hog[1][j]), halves(A.hog[2][j]),
+                   halves(A.hog[3][j])),
+            dw, adds[0], dst);
+    else if (g == 4) // two cells a quarter: the lower and upper four lanes
+    {
+      store(sum4x4(hn::LowerHalf(d4, A.hog[0][j]), hn::UpperHalf(d4, A.hog[0][j]),
+                   hn::LowerHalf(d4, A.hog[1][j]), hn::UpperHalf(d4, A.hog[1][j])),
+            dw, adds[0], dst);
+      store(sum4x4(hn::LowerHalf(d4, A.hog[2][j]), hn::UpperHalf(d4, A.hog[2][j]),
+                   hn::LowerHalf(d4, A.hog[3][j]), hn::UpperHalf(d4, A.hog[3][j])),
+            dw, adds[2], cb + (K_HOG + j) * kst + at[2] * cst);
+    }
+    else // g == 16: a cell two quarters, which add first
+    {
+      const auto c0 = halves(hn::Add(A.hog[0][j], A.hog[1][j])),
+                 c1 = halves(hn::Add(A.hog[2][j], A.hog[3][j]));
+      store(hn::LowerHalf(dw2, sum4x4(c0, c1, hn::Zero(d4), hn::Zero(d4))), dw2, adds[0], dst);
+    }
+  }
+}
+#endif
+
 // derive, for LD cell-channels in lockstep: four a vector where vectors hold four doubles.
 #if HWY_MAX_BYTES >= 32 && !HWY_HAVE_SCALABLE
 constexpr int LD = 4;
@@ -1895,7 +1994,16 @@ void accumulate_hash_row(const uint8_t *IF_RESTRICT row, size_t pstride, int C, 
     {
       const uint8_t *IF_RESTRICT v = row + (size_t)k * pstride;
       int64_t s = 0;
-      for (int c = b; c < e; c += step) s += v[c];
+      int c = b;
+      if (step == 1) // whole vectors of the run sum through psadbw; the compiler's own
+      {              // vectorization widened every byte to int64
+        const size_t N = hn::Lanes(d8);
+        V64 acc = hn::Zero(d64);
+        for (; c + (int)N <= e; c += (int)N)
+          acc = hn::Add(acc, hn::BitCast(d64, hn::SumsOf8(hn::LoadU(d8, v + c))));
+        s = hn::ReduceSum(d64, acc);
+      }
+      for (; c < e; c += step) s += v[c];
       cell[k] += s;
     }
   }
@@ -2458,23 +2566,40 @@ class FeatureComputer
                 fold32<false>(hn::BitCast(d32, hn::PromoteUpperTo(du32, sums)), g / 2, adds[2],
                               cb + t * kst + at[2] * cst);
               }
+#if HWY_MAX_BYTES >= 32 && !HWY_HAVE_SCALABLE
+              if (FOLDH)
+              {
+                for (int t = 0; t < K_NUNSIGNED; ++t)
+                  fold_pair_multi<false>(A.pair[0][t], A.pair[1][t], g, adds, at, cb + t * kst,
+                                         cst);
+                for (int t = K_NUNSIGNED; t < K_NPAIR; ++t)
+                  fold_pair_multi<true>(A.pair[0][t], A.pair[1][t], g, adds, at, cb + t * kst, cst);
+              }
+#endif
               for (size_t h = 0; h < 2; ++h)
               {
                 const bool ad = adds[2 * h];
                 int64_t *IF_RESTRICT ch = cb + at[2 * h] * cst;
-                for (int t = 0; t < K_NUNSIGNED; ++t)
-                  fold32<false>(A.pair[h][t], g / 2, ad, ch + t * kst);
-                for (int t = K_NUNSIGNED; t < K_NPAIR; ++t)
-                  fold32<true>(A.pair[h][t], g / 2, ad, ch + t * kst);
+                if (!FOLDH)
+                {
+                  for (int t = 0; t < K_NUNSIGNED; ++t)
+                    fold32<false>(A.pair[h][t], g / 2, ad, ch + t * kst);
+                  for (int t = K_NUNSIGNED; t < K_NPAIR; ++t)
+                    fold32<true>(A.pair[h][t], g / 2, ad, ch + t * kst);
+                }
                 fold(d64, A.t4[h], g / 4, ad, ch + K_T4 * kst);
               }
               for (int q = 0; q < 4; ++q)
               {
                 int64_t *IF_RESTRICT cq = cb + at[q] * cst;
                 fold(d64, A.sg4[q], gq / 2, adds[q], cq + K_SG4 * kst);
+                if (FOLDH) continue; // the HOG sums of all four quarters fold together below
                 for (int j = 0; j < HB - 1; ++j) // signed: energy past minus energy short
                   fold32<true>(A.hog[q][j], gq, adds[q], cq + (K_HOG + j) * kst);
               }
+#if HWY_MAX_BYTES >= 32 && !HWY_HAVE_SCALABLE
+              if (FOLDH) fold_hog_multi(A, g, adds, at, cb, kst, cst);
+#endif
             }
             if (local)
             {
