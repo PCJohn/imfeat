@@ -65,10 +65,11 @@ namespace nb = nanobind;
 // the tensor eigen-features are nonlinear, so they are derived at the end.
 //
 // One traversal, COLUMNS as the SIMD lane. Every image row is de-interleaved once into a
-// rolling window of planar rows; kernel() then reads a block of columns from rows r-1, r,
-// r+1 and computes every per-pixel quantity in-register (Sobel, tensor products, HOG ray
-// tests, extrema, LBP, moments). Its accumulators are carried in registers down the rows of
-// a cell row and folded to cells once per block, so memory is touched once per cell row.
+// rolling window of planar rows; block() then takes a block of columns down all the sampled
+// rows of a cell row, in phases that each carry a few accumulators in registers (bytes:
+// extrema, LBP, the bar detector; 16-bit: the 1-D row responses once per image row, then the
+// Laws energies and the tensor, the Laplacian and the moments, and the HOG ray tests), and the
+// accumulators are folded to cells once per block, so memory is touched once per cell row.
 
 namespace
 {
@@ -125,7 +126,7 @@ enum
 constexpr int NSUM = LAWS0 + NLAWS;    // 44 int64 sums per cell per channel
 constexpr int BARD_NF = 4 + BARD_NL;   // cover, spec*NL, peak, peaked, bal
 constexpr int BARD_NMAP = 3 + BARD_NL; // dense maps: cover, resp*NL, dark, light
-// The rolling window of planar rows kernel() reads. Every row of the cell row in flight plus
+// The rolling window of planar rows block() reads. Every row of the cell row in flight plus
 // a MAXLAG halo each side stays resident (slots_ rows, set at configure time; image row y
 // lives in slot y % slots). Each phase plane carries slack at both ends for the taps that
 // reach past the row and for the last block's overrun into the next plane, whose lanes are
@@ -147,7 +148,7 @@ constexpr int BARDF0 = NF_S + HB + 2 + LBPB + NDER; // 34: start of the bard blo
 constexpr int TEXF0 = BARDF0 + BARD_NF; // 41
 constexpr int NTEX = 2 + NLAWS + 1;
 constexpr int NF = TEXF0 + NTEX; // 50 derived float32 per cell per channel
-// Channels kernel() carries through a block together, so that a block's cells are complete
+// Channels block() carries through a block together, so that a block's cells are complete
 // for every channel at once and can be derived on the spot (cell_row). More channels than
 // this (hyperspectral) go one at a time, so the accumulators stay in L1 however many there are.
 constexpr int GMAX = 8;
@@ -183,6 +184,7 @@ using DU16 = hn::Repartition<uint16_t, D8>;
 using D32 = hn::Repartition<int32_t, D8>; // a quarter block, or half a block of column pairs
 using DU32 = hn::Repartition<uint32_t, D8>;
 using D64 = hn::Repartition<int64_t, D8>;
+using DU64 = hn::Repartition<uint64_t, D8>;
 using V8 = hn::VFromD<D8>;
 using V16 = hn::VFromD<D16>;
 using V32 = hn::VFromD<D32>;
@@ -194,17 +196,20 @@ constexpr DU16 du16;
 constexpr D32 d32;
 constexpr DU32 du32;
 constexpr D64 d64;
+constexpr DU64 du64;
 
-// The sums kernel() produces per cell, in fold order. To add one: add an entry next to the
-// sums of the same lane geometry, accumulate it in kernel(), and map it to its output slot in
+// The sums block() produces per cell, in fold order. To add one: add an entry next to the
+// sums of the same lane geometry, accumulate it in block(), and map it to its output slot in
 // cell_row()'s flush -- the folds in between walk the enum.
 //   PAIR: pmaddwd outputs, one int32 lane per two columns, per half block. The moments are
 //         those of w = v - KBIAS (w^2 <= 2^14 keeps every product inside pmaddwd's int16
 //         inputs); the flush shifts them back to raw power sums, exactly.
 //   T4:   sum w^4, one int64 lane per four columns, per half block.
 //   SG4:  sum |grad|^4, one int64 lane per two columns, per quarter block.
-//   HOG:  CUMULATIVE gradient energy past each bin-boundary ray, one int32 lane per column,
-//         per quarter block. The ray tests are nested, so bin b = cum[b-1] - cum[b].
+//   HOG:  per bin-boundary ray, the gradient energy of the pixels past it MINUS that of the
+//         pixels short of it (one sign flip per test, see block()), one int32 lane per column,
+//         per quarter block. With the total energy T, the cumulative energy past ray j is
+//         (P_j + T) / 2, and the ray tests are nested, so bin b = cum[b-1] - cum[b].
 //   U8:   counts, one uint8 lane per column over the whole block.
 //   BARD: the bar detector's gated maps, one uint16 lane per two columns over the whole block.
 // clang-format off
@@ -222,9 +227,9 @@ enum
 // A pair of uint8 map values is up to 510 a row, which caps a block at 128 sampled rows
 // between folds; every other sum has headroom beyond that (a pair of |grad|^2 is 2^22 a row).
 constexpr int KROWS = 128;
-// kernel() lane bases per sampled row per channel: the 3x3 neighbourhood, then four taps a lag.
-constexpr int KPTR = 9 + 4 * BARD_NL;
-constexpr int KBIAS = 128; // kernel() takes moments of v - KBIAS
+// block()'s column taps: the 3x3 neighbourhood's left, mid, right, then each lag's left, right.
+constexpr int KTAP = 3 + 2 * BARD_NL;
+constexpr int KBIAS = 128; // block() takes moments of v - KBIAS
 
 struct Acc // one block of one channel
 {
@@ -245,38 +250,44 @@ struct Acc // one block of one channel
 // light base to 255 there zeroes that axis alone -- SatSub(0, c) == SatSub(c, 255) == 0. `hok`
 // drops a lag on BOTH axes when its span exceeds the smaller image side. A pixel counts only
 // if its best response over all lags reaches BARD_TAU; peak == max(dmax, lmax), so that gate
-// is one compare. `mesh` is the sampling mesh, all-ones when every lane is sampled.
-// acc += v -- or acc = v on a block's first row (ROW0), so that no accumulator is ever zeroed.
-template <bool ROW0, class V>
-HWY_INLINE void add(V &acc, V v)
-{
-  acc = ROW0 ? v : hn::Add(acc, v);
-}
+// is one compare. `mesh` is the sampling mesh, all-ones when every lane is sampled. Returned:
+// the gate as 0 / 1 bytes and the maps (cover is the gate itself), for the caller to pair up
+// and add. `rb` is the centre row at the block's first lane, `tap` the column taps (KTAP), `ud`
+// the row's up/down offsets from it per lag. VALID and ALL (every lag's rows and columns are
+// in the image: the usual row) are known per block and per run of rows, so the branches below
+// are resolved outside the row loop.
+using VU16 = hn::VFromD<DU16>;
 
-template <bool ROW0>
-HWY_INLINE void bard(const uint8_t *const *t, size_t x, V8 c, const V8 *IF_RESTRICT near, V8 mesh,
-                     const uint8_t *IF_RESTRICT valid, size_t vstride, int hok, int vok, Acc &A)
+struct BardRow
 {
-  static_assert(BARD_LAGS[0] == 1, "lag 1's taps are the 3x3 neighbours kernel() already holds");
+  V8 keep, map[BARD_NMAP - 1];
+};
+
+template <bool VALID, bool ALL>
+HWY_INLINE BardRow bard(const uint8_t *IF_RESTRICT rb, const int64_t *IF_RESTRICT tap,
+                        const int64_t *IF_RESTRICT ud, V8 c, V8 mesh,
+                        const uint8_t *IF_RESTRICT valid, size_t vstride, int hok, int vok)
+{
+  static_assert(BARD_LAGS[0] == 1, "lag 1's column taps are the 3x3 neighbours'");
   V8 dmax = hn::Zero(d8), lmax = hn::Zero(d8), resp[BARD_NL];
   for (size_t j = 0; j < BARD_NL; ++j)
   {
     V8 dk = hn::Zero(d8), lt = hn::Zero(d8);
-    if ((hok >> j) & 1)
+    if (ALL || ((hok >> j) & 1))
     {
-      const V8 l = j ? hn::LoadU(d8, t[4 * j] + x) : near[0],
-               r = j ? hn::LoadU(d8, t[4 * j + 1] + x) : near[1];
+      const V8 l = hn::LoadU(d8, rb + tap[j ? 3 + 2 * j : 0]),
+               r = hn::LoadU(d8, rb + tap[j ? 4 + 2 * j : 2]);
       V8 lo = hn::Min(l, r), hi = hn::Max(l, r);
-      if (valid)
+      if (VALID)
       {
-        const V8 vm = hn::LoadU(d8, valid + j * vstride + x);
+        const V8 vm = hn::LoadU(d8, valid + j * vstride);
         lo = hn::And(lo, vm);
         hi = hn::Or(hi, hn::Not(vm));
       }
-      if ((vok >> j) & 1)
+      if (ALL || ((vok >> j) & 1))
       {
-        const V8 u = j ? hn::LoadU(d8, t[4 * j + 2] + x) : near[2],
-                 v = j ? hn::LoadU(d8, t[4 * j + 3] + x) : near[3];
+        const V8 u = hn::LoadU(d8, rb + ud[2 * j] + tap[1]),
+                 v = hn::LoadU(d8, rb + ud[2 * j + 1] + tap[1]);
         lo = hn::Max(lo, hn::Min(u, v));
         hi = hn::Min(hi, hn::Max(u, v));
       }
@@ -288,122 +299,321 @@ HWY_INLINE void bard(const uint8_t *const *t, size_t x, V8 c, const V8 *IF_RESTR
     lmax = hn::Max(lmax, lt);
   }
   const V8 peak = hn::Max(dmax, lmax);
-  const V8 keep = hn::And(
-      mesh, hn::VecFromMask(d8, hn::Eq(hn::Max(peak, hn::Set(d8, (uint8_t)BARD_TAU)), peak)));
-  auto gated = [&](int m, V8 v) { add<ROW0>(A.bard[m], hn::SumsOf2(hn::And(keep, v))); };
-  gated(0, hn::Set(d8, 1));
-  for (int j = 0; j < BARD_NL; ++j) gated(1 + j, resp[j]);
-  gated(1 + BARD_NL, dmax);
-  gated(2 + BARD_NL, lmax);
+  BardRow o;
+  o.keep =
+      hn::And(hn::And(mesh, hn::Set(d8, 1)),
+              hn::VecFromMask(d8, hn::Eq(hn::Max(peak, hn::Set(d8, (uint8_t)BARD_TAU)), peak)));
+  for (int j = 0; j < BARD_NL; ++j) o.map[j] = resp[j];
+  o.map[BARD_NL] = dmax;
+  o.map[BARD_NL + 1] = lmax;
+  return o;
 }
 
-// One block of columns of one sampled row. `p` holds KPTR lane bases: the 3x3 neighbourhood,
-// rows above/centre/below by columns left/mid/right, then bard()'s taps. Replicate padding is
-// already in the planes, so there is no border logic here. MASKED zeroes the off-mesh lanes
+// A chunk of a cell row's sampled rows, as block() walks it: what is constant over the chunk
+// (set up once per chunk by cell_row()) and what is per channel and block (set per call).
+// Each row's three 1-D responses D = r - l (mask E), S = l + r - 2m (mask S, negated) and
+// L = l + 2m + r = S + 4m, plus its centre m, are made once per distinct image row of a
+// sub-chunk and kept in `resp`: at stride 1 every image row serves three sampled rows (above,
+// centre, below), so the promotions and the 1-D work are done once instead of three times.
+// `rsub` says which slot each sampled row's three rows have; `rdist` their plane offsets.
+constexpr int NRESP = 4; // D, S, L, M
+
+struct Chunk
+{
+  size_t nr = 0;                    // sampled rows in the chunk
+  const int64_t *r3 = nullptr;      // [q * 3 + role]: plane offsets of row q's above, centre
+                                    // and below rows (replicated at the image edge)
+  const int64_t *ud = nullptr;      // [(q * BARD_NL + lag) * 2 + {up, down}]: offsets from
+                                    // the centre row of the bar detector's row taps
+  const int *vok = nullptr;         // [q]: bard lags whose rows are inside the image
+  bool allok = false;               // every lag fits the image (hok is all ones)
+  const int *rsub = nullptr;        // [q * 3 + role]: offset in `resp` of that row's responses
+  const int64_t *rdist = nullptr;   // [sub * rdstride + slot]: a distinct row's plane offset
+  const int *rdn = nullptr;         // [sub]: distinct rows of the sub-chunk
+  size_t rdstride = 0, subrows = 0; // ... and the sampled rows a sub-chunk holds
+  const int64_t *tapcol = nullptr;  // the column taps (KTAP)
+  const uint8_t *base = nullptr;    // this channel's planes, at the block's first lane
+  int16_t *resp = nullptr;          // [slot][NRESP][half][Lanes(d16)]
+  int32_t *hbuf = nullptr;          // [q - qs][half][z0 z1][Lanes(d32)]
+};
+constexpr int RESP_STRIDE = NRESP * 2; // a slot's responses, in vectors of Lanes(d16)
+
+// The first 64-byte-aligned element of a vector (sized with 64 bytes of slack): the vector
+// loads of the 16-bit phases then never straddle a cache line.
+template <class T>
+T *aligned64(std::vector<T> &v)
+{
+  auto p = reinterpret_cast<uintptr_t>(v.data());
+  return v.data() + ((64 - p % 64) % 64) / sizeof(T);
+}
+
+// One block of columns of one channel, down all the sampled rows of a chunk. Replicate padding
+// is already in the planes, so there is no border logic here. MASKED zeroes the off-mesh lanes
 // (mask: 255 on the sampling mesh) before anything pairs up columns; the uint8 counts are per
 // column, so they are masked once, at the fold.
-template <bool MASKED, bool ROW0>
-HWY_INLINE void kernel(const uint8_t *const *p, size_t x, const uint8_t *IF_RESTRICT mask,
-                       const uint8_t *IF_RESTRICT valid, size_t vstride, int hok, int vok,
-                       const V16 *IF_RESTRICT rays, Acc &A)
+//
+// The work goes in phases, each a loop down the rows with its own few accumulators, so that
+// they stay in registers for the whole chunk instead of going through memory on every row
+// (the whole set is about 76 vectors, far more than any register file): bytes first (extrema
+// and LBP, then the bar detector), then, a sub-chunk of rows at a time, the row responses into
+// `resp`, the Laws energies and the tensor (which also write the HOG inputs to `hbuf`), the
+// Laplacian and the moments, and the HOG ray tests a quarter block at a time. Every sum is an
+// integer, so the order of the additions changes nothing.
+template <bool MASKED>
+HWY_INLINE void block(const Chunk &C, const uint8_t *IF_RESTRICT mask,
+                      const uint8_t *IF_RESTRICT valid, size_t vstride, int hok,
+                      const V16 *IF_RESTRICT rays, Acc &A)
 {
-  const V8 aL = hn::LoadU(d8, p[0] + x), aM = hn::LoadU(d8, p[1] + x), aR = hn::LoadU(d8, p[2] + x);
-  const V8 bL = hn::LoadU(d8, p[3] + x), c = hn::LoadU(d8, p[4] + x), bR = hn::LoadU(d8, p[5] + x);
-  const V8 eL = hn::LoadU(d8, p[6] + x), eM = hn::LoadU(d8, p[7] + x), eR = hn::LoadU(d8, p[8] + x);
-  // strict 8-neighbour extrema: c > max  <=>  SatSub(c, max) != 0
-  const V8 one = hn::Set(d8, 1);
-  const V8 mx =
-      hn::Max(hn::Max(hn::Max(aL, aM), hn::Max(aR, bL)), hn::Max(hn::Max(bR, eL), hn::Max(eM, eR)));
-  const V8 mn =
-      hn::Min(hn::Min(hn::Min(aL, aM), hn::Min(aR, bL)), hn::Min(hn::Min(bR, eL), hn::Min(eM, eR)));
-  add<ROW0>(A.u8[K_MAX - K_U8], hn::Min(hn::SaturatedSub(c, mx), one));
-  add<ROW0>(A.u8[K_MIN - K_U8], hn::Min(hn::SaturatedSub(mn, c), one));
-  // LBP^riu2: sign tests (0 / -1) in circular order NW N NE E SE S SW W, so their sum is
-  // -popcount and the sum of neighbouring XORs is -transitions. Uniform (<= 2 transitions)
-  // votes bin popcount; the rest vote nothing and are recovered at flush as count - sum.
-  auto ge = [&](V8 q) { return hn::VecFromMask(d8, hn::Eq(hn::Max(q, c), q)); };
-  const V8 s0 = ge(aL), s1 = ge(aM), s2 = ge(aR), s3 = ge(bR), s4 = ge(eR), s5 = ge(eM),
-           s6 = ge(eL), s7 = ge(bL);
-  const V8 npc =
-      hn::Add(hn::Add(hn::Add(s0, s1), hn::Add(s2, s3)), hn::Add(hn::Add(s4, s5), hn::Add(s6, s7)));
-  const V8 ntr = hn::Add(
-      hn::Add(hn::Add(hn::Xor(s0, s1), hn::Xor(s1, s2)), hn::Add(hn::Xor(s2, s3), hn::Xor(s3, s4))),
-      hn::Add(hn::Add(hn::Xor(s4, s5), hn::Xor(s5, s6)),
-              hn::Add(hn::Xor(s6, s7), hn::Xor(s7, s0))));
-  const auto uniform = hn::Gt(hn::BitCast(di8, ntr), hn::Set(di8, -3));
-  const V8 code = hn::BitCast(d8, hn::IfThenElse(uniform, hn::BitCast(di8, npc), hn::Set(di8, 1)));
-  for (int j = 0; j < LBPB - 1; ++j)
-    A.u8[K_LBP - K_U8 + j] = hn::Sub(ROW0 ? hn::Zero(d8) : A.u8[K_LBP - K_U8 + j],
-                                     hn::VecFromMask(d8, hn::Eq(code, hn::Set(d8, (uint8_t)-j))));
-
-  const V8 m8 = MASKED ? hn::LoadU(d8, mask) : hn::Set(d8, 255);
-  // left, right, up, down: where lag 1's rows are in the image; the 3x3 rows are not replicas
-  const V8 near[4] = {bL, bR, aM, eM};
-  bard<ROW0>(p + 9, x, c, near, m8, valid, vstride, hok, vok, A);
-  for (int h = 0; h < 2; ++h) // the int16 half blocks
+  const size_t L16 = hn::Lanes(d16), L32 = hn::Lanes(d32);
+  const V8 one = hn::Set(d8, 1), m8 = MASKED ? hn::LoadU(d8, mask) : hn::Set(d8, 255);
+  const int64_t tl = C.tapcol[0], tm = C.tapcol[1], tr = C.tapcol[2];
+  // the 3x3 neighbourhood of row q: its rows at the block's first lane
+  auto rows3 = [&](size_t q, const uint8_t *&ra, const uint8_t *&rb, const uint8_t *&re)
+  { ra = C.base + C.r3[q * 3], rb = C.base + C.r3[q * 3 + 1], re = C.base + C.r3[q * 3 + 2]; };
   {
-    auto wide = [&](V8 v)
-    { return hn::BitCast(d16, h ? hn::PromoteUpperTo(du16, v) : hn::PromoteLowerTo(du16, v)); };
-    const V16 al = wide(aL), am = wide(aM), ar = wide(aR), bl = wide(bL), br = wide(bR),
-              el = wide(eL), em = wide(eM), er = wide(eR), cc = wide(c), c2 = hn::Add(cc, cc);
-    // Each row's three 1-D responses: D = r - l (mask E), S = l + r - 2m (mask S, negated)
-    // and L = l + 2m + r = S + 4m. A 3x3 Laws response is then one 1-D mask down a column of
-    // them -- Sobel included (gx = L.D, gy = E.L) -- up to a sign that the squares drop.
-    const V16 Da = hn::Sub(ar, al), Db = hn::Sub(br, bl), De = hn::Sub(er, el);
-    const V16 Sa = hn::Sub(hn::Add(al, ar), hn::Add(am, am)), Sb = hn::Sub(hn::Add(bl, br), c2),
-              Se = hn::Sub(hn::Add(el, er), hn::Add(em, em));
-    const V16 La = hn::Add(Sa, hn::ShiftLeft<2>(am)), Lb = hn::Add(Sb, hn::ShiftLeft<1>(c2)),
-              Le = hn::Add(Se, hn::ShiftLeft<2>(em));
-    V32 *IF_RESTRICT P = A.pair[h];
-    const V16 m = !MASKED ? hn::Zero(d16)
-                  : h     ? hn::PromoteUpperTo(d16, hn::BitCast(di8, m8))
-                          : hn::PromoteLowerTo(d16, hn::BitCast(di8, m8));
-    auto on_mesh = [&](V16 v) { return MASKED ? hn::And(v, m) : v; };
-    // a response is squared into its sum as soon as it exists, which keeps few of them alive
-    auto energy = [&](int k, V16 v)
+    // strict 8-neighbour extrema: c > max  <=>  SatSub(c, max) != 0
+    V8 umax = hn::Zero(d8), umin = hn::Zero(d8);
+    for (size_t q = 0; q < C.nr; ++q)
     {
-      v = on_mesh(v);
-      add<ROW0>(P[k], hn::WidenMulPairwiseAdd(d32, v, v));
-    };
-    const V16 ones = hn::Set(d16, 1), gx0 = hn::Add(hn::Add(Da, De), hn::Add(Db, Db));
-    const V16 ls = hn::Add(hn::Add(Sa, Se), hn::Add(Sb, Sb));
-    energy(K_LAWS + LAWS_EE, hn::Sub(De, Da));
-    energy(K_LAWS + LAWS_SE, hn::Sub(gx0, hn::ShiftLeft<2>(Db)));
-    energy(K_LAWS + LAWS_ES, hn::Sub(Se, Sa));
-    energy(K_LAWS + LAWS_LS, ls);
-    energy(K_LAWS + LAWS_SS, hn::Sub(ls, hn::ShiftLeft<2>(Sb)));
-    energy(K_LAWS + LAWS_SL, hn::Sub(hn::Add(La, Le), hn::Add(Lb, Lb)));
-    const V16 lap = on_mesh(hn::Sub(hn::Add(Sb, hn::Add(am, em)), c2)); // up+down+left+right-4c
-    add<ROW0>(P[K_LAP1], hn::WidenMulPairwiseAdd(d32, lap, ones));
-    add<ROW0>(P[K_LAP2], hn::WidenMulPairwiseAdd(d32, lap, lap));
-    const V16 gx = on_mesh(gx0), gy = on_mesh(hn::Sub(Le, La)),
-              wc = on_mesh(hn::Sub(cc, hn::Set(d16, KBIAS)));
-    const V16 w2 = hn::Mul(wc, wc);
-    add<ROW0>(P[K_SXX], hn::WidenMulPairwiseAdd(d32, gx, gx));
-    add<ROW0>(P[K_SYY], hn::WidenMulPairwiseAdd(d32, gy, gy));
-    add<ROW0>(P[K_SXY], hn::WidenMulPairwiseAdd(d32, gx, gy));
-    add<ROW0>(P[K_T1], hn::WidenMulPairwiseAdd(d32, wc, ones));
-    add<ROW0>(P[K_T2], hn::WidenMulPairwiseAdd(d32, wc, wc));
-    add<ROW0>(P[K_T3], hn::WidenMulPairwiseAdd(d32, w2, wc));
-    add<ROW0>(A.t4[h], hn::SumsOf2(hn::WidenMulPairwiseAdd(d32, w2, w2))); // 2^29 a pair: widen now
-    // HOG: fold the gradient to the upper half-plane, interleave (qy, qx) so that one pmaddwd
-    // against (cx, -cy) is a whole ray test, and add |grad|^2 past every ray it clears.
-    const V16 zero = hn::Zero(d16);
-    const V16 neg =
-        hn::VecFromMask(d16, hn::Or(hn::Lt(gy, zero), hn::And(hn::Eq(gy, zero), hn::Lt(gx, zero))));
-    const V16 qx = hn::Sub(hn::Xor(gx, neg), neg), qy = hn::Abs(gy);
-    for (int q = 0; q < 2; ++q) // the int32 quarter blocks
+      const uint8_t *ra, *rb, *re;
+      rows3(q, ra, rb, re);
+      const V8 aL = hn::LoadU(d8, ra + tl), aM = hn::LoadU(d8, ra + tm),
+               aR = hn::LoadU(d8, ra + tr), bL = hn::LoadU(d8, rb + tl), c = hn::LoadU(d8, rb + tm),
+               bR = hn::LoadU(d8, rb + tr), eL = hn::LoadU(d8, re + tl),
+               eM = hn::LoadU(d8, re + tm), eR = hn::LoadU(d8, re + tr);
+      const V8 mx = hn::Max(hn::Max(hn::Max(aL, aM), hn::Max(aR, bL)),
+                            hn::Max(hn::Max(bR, eL), hn::Max(eM, eR)));
+      const V8 mn = hn::Min(hn::Min(hn::Min(aL, aM), hn::Min(aR, bL)),
+                            hn::Min(hn::Min(bR, eL), hn::Min(eM, eR)));
+      umax = hn::Add(umax, hn::Min(hn::SaturatedSub(c, mx), one));
+      umin = hn::Add(umin, hn::Min(hn::SaturatedSub(mn, c), one));
+    }
+    A.u8[K_MAX - K_U8] = umax;
+    A.u8[K_MIN - K_U8] = umin;
+  }
+  {
+    // LBP^riu2: sign tests (0 / -1) in circular order NW N NE E SE S SW W, so their sum is
+    // -popcount and the sum of neighbouring XORs is -transitions. Uniform (<= 2 transitions)
+    // votes bin popcount; the rest vote nothing and are recovered at flush as count - sum.
+    V8 lbp[LBPB - 1];
+    for (int j = 0; j < LBPB - 1; ++j) lbp[j] = hn::Zero(d8);
+    for (size_t q = 0; q < C.nr; ++q)
     {
-      const V16 z =
-          q ? hn::InterleaveWholeUpper(d16, qy, qx) : hn::InterleaveWholeLower(d16, qy, qx);
-      const V32 g2 = hn::WidenMulPairwiseAdd(d32, z, z);
-      const int k = 2 * h + q;
-      add<ROW0>(A.sg4[k], hn::BitCast(d64, hn::Add(hn::MulEven(g2, g2), hn::MulOdd(g2, g2))));
-      for (int j = 0; j < HB - 1; ++j)
+      const uint8_t *ra, *rb, *re;
+      rows3(q, ra, rb, re);
+      const V8 c = hn::LoadU(d8, rb + tm);
+      auto ge = [&](const uint8_t *p)
       {
-        const V32 t = hn::WidenMulPairwiseAdd(d32, z, rays[j]);
-        add<ROW0>(A.hog[k][j], hn::And(g2, hn::VecFromMask(d32, hn::Gt(t, hn::Set(d32, -1)))));
+        const V8 nb = hn::LoadU(d8, p);
+        return hn::VecFromMask(d8, hn::Eq(hn::Max(nb, c), nb));
+      };
+      const V8 s0 = ge(ra + tl);
+      V8 prev = s0, npc = s0, ntr = hn::Zero(d8);
+      auto next = [&](const uint8_t *p) // the ring, a neighbour at a time: few tests stay alive
+      {
+        const V8 si = ge(p);
+        npc = hn::Add(npc, si);
+        ntr = hn::Add(ntr, hn::Xor(prev, si));
+        prev = si;
+      };
+      next(ra + tm), next(ra + tr), next(rb + tr), next(re + tr), next(re + tm), next(re + tl),
+          next(rb + tl);
+      ntr = hn::Add(ntr, hn::Xor(prev, s0));
+      const auto uniform = hn::Gt(hn::BitCast(di8, ntr), hn::Set(di8, -3));
+      const V8 code =
+          hn::BitCast(d8, hn::IfThenElse(uniform, hn::BitCast(di8, npc), hn::Set(di8, 1)));
+      for (int j = 0; j < LBPB - 1; ++j)
+        lbp[j] = hn::Sub(lbp[j], hn::VecFromMask(d8, hn::Eq(code, hn::Set(d8, (uint8_t)-j))));
+    }
+    for (int j = 0; j < LBPB - 1; ++j) A.u8[K_LBP - K_U8 + j] = lbp[j];
+  }
+  {
+    // The bar detector. Its gated maps pair up through one multiply-add by the 0 / 1 gate. The
+    // rows whose lags all fit the image are one run (vok is monotone in from each image edge),
+    // walked without a test per lag; the rest, at the image's top and bottom, with the tests.
+    V16 b0 = hn::Zero(d16), b1 = b0, b2 = b0, b3 = b0, b4 = b0, b5 = b0; // (sums below 2^15)
+    static_assert(BARD_NMAP == 6, "the bar detector's accumulators are named");
+    const auto ones8 = hn::Set(di8, 1);
+    auto gate = [&](const BardRow &r)
+    {
+      const auto k = hn::BitCast(di8, r.keep);
+      b0 = hn::Add(b0, hn::SatWidenMulPairwiseAdd(d16, r.keep, ones8)); // cover: the gate
+      b1 = hn::Add(b1, hn::SatWidenMulPairwiseAdd(d16, r.map[0], k));
+      b2 = hn::Add(b2, hn::SatWidenMulPairwiseAdd(d16, r.map[1], k));
+      b3 = hn::Add(b3, hn::SatWidenMulPairwiseAdd(d16, r.map[2], k));
+      b4 = hn::Add(b4, hn::SatWidenMulPairwiseAdd(d16, r.map[3], k));
+      b5 = hn::Add(b5, hn::SatWidenMulPairwiseAdd(d16, r.map[4], k));
+    };
+    auto run = [&](auto kValid, auto kAll, size_t q0, size_t q1)
+    {
+      for (size_t q = q0; q < q1; ++q)
+      {
+        const uint8_t *IF_RESTRICT rb = C.base + C.r3[q * 3 + 1];
+        gate(bard<decltype(kValid)::value, decltype(kAll)::value>(
+            rb, C.tapcol, C.ud + q * BARD_NL * 2, hn::LoadU(d8, rb + tm), m8, valid, vstride, hok,
+            C.vok[q]));
       }
+    };
+    size_t q0 = 0, q1 = C.nr;
+    if (C.allok)
+    {
+      while (q0 < q1 && C.vok[q0] != hok) ++q0;
+      while (q1 > q0 && C.vok[q1 - 1] != hok) --q1;
+    }
+    else
+      q1 = q0; // no run without a test
+    if (valid)
+    {
+      run(std::true_type(), std::false_type(), 0, q0);
+      run(std::true_type(), std::true_type(), q0, q1);
+      run(std::true_type(), std::false_type(), q1, C.nr);
+    }
+    else
+    {
+      run(std::false_type(), std::false_type(), 0, q0);
+      run(std::false_type(), std::true_type(), q0, q1);
+      run(std::false_type(), std::false_type(), q1, C.nr);
+    }
+    A.bard[0] = hn::BitCast(du16, b0), A.bard[1] = hn::BitCast(du16, b1);
+    A.bard[2] = hn::BitCast(du16, b2), A.bard[3] = hn::BitCast(du16, b3);
+    A.bard[4] = hn::BitCast(du16, b4), A.bard[5] = hn::BitCast(du16, b5);
+  }
+  const V16 ones = hn::Set(d16, 1), zero = hn::Zero(d16);
+  const V16 m16[2] = {MASKED ? hn::PromoteLowerTo(d16, hn::BitCast(di8, m8)) : zero,
+                      MASKED ? hn::PromoteUpperTo(d16, hn::BitCast(di8, m8)) : zero};
+  auto resp = [&](int off, int t, int h) // off: a row's offset in C.resp (Chunk::rsub)
+  { return hn::LoadU(d16, C.resp + off + (t * 2 + h) * L16); };
+  auto hin = [&](size_t q, int h, int i) { return C.hbuf + (((q * 2) + h) * 2 + i) * L32; };
+  for (size_t sub = 0, qs = 0; qs < C.nr; ++sub, qs += C.subrows)
+  {
+    const size_t qe = std::min(C.nr, qs + C.subrows);
+    // a sub-chunk's accumulators start from zero and continue from what the chunk has so far
+    auto init = [&](auto &acc, const auto &sofar)
+    { acc = sub ? sofar : hn::Zero(hn::DFromV<std::remove_reference_t<decltype(acc)>>()); };
+    const int64_t *IF_RESTRICT dist = C.rdist + sub * C.rdstride;
+    for (int j = 0; j < C.rdn[sub]; ++j) // the distinct rows' responses, both halves
+    {
+      const uint8_t *IF_RESTRICT row = C.base + dist[j];
+      const V8 l = hn::LoadU(d8, row + C.tapcol[0]), m = hn::LoadU(d8, row + C.tapcol[1]),
+               r = hn::LoadU(d8, row + C.tapcol[2]);
+      for (int h = 0; h < 2; ++h)
+      {
+        auto wide = [&](V8 v)
+        { return hn::BitCast(d16, h ? hn::PromoteUpperTo(du16, v) : hn::PromoteLowerTo(du16, v)); };
+        const V16 wl = wide(l), wm = wide(m), wr = wide(r), lr = hn::Add(wl, wr),
+                  m2 = hn::Add(wm, wm);
+        int16_t *IF_RESTRICT o = C.resp + ((size_t)j * RESP_STRIDE + h) * L16;
+        hn::StoreU(hn::Sub(wr, wl), d16, o);
+        hn::StoreU(hn::Sub(lr, m2), d16, o + 2 * L16);
+        hn::StoreU(hn::Add(lr, m2), d16, o + 4 * L16);
+        hn::StoreU(wm, d16, o + 6 * L16);
+      }
+    }
+    for (int h = 0; h < 2; ++h) // the int16 half blocks: Laws energies, the tensor, HOG inputs
+    {
+      V32 *IF_RESTRICT P = A.pair[h];
+      auto on_mesh = [&](V16 v) { return MASKED ? hn::And(v, m16[h]) : v; };
+      V32 ee, se, es, ls2, ss, sl, sxx, syy, sxy;
+      init(ee, P[K_LAWS + LAWS_EE]), init(se, P[K_LAWS + LAWS_SE]), init(es, P[K_LAWS + LAWS_ES]);
+      init(ls2, P[K_LAWS + LAWS_LS]), init(ss, P[K_LAWS + LAWS_SS]), init(sl, P[K_LAWS + LAWS_SL]);
+      init(sxx, P[K_SXX]), init(syy, P[K_SYY]), init(sxy, P[K_SXY]);
+      // a response is squared into its sum as soon as it exists, which keeps few of them alive
+      auto energy = [&](V32 &acc, V16 v)
+      {
+        v = on_mesh(v);
+        acc = hn::Add(acc, hn::WidenMulPairwiseAdd(d32, v, v));
+      };
+      for (size_t q = qs; q < qe; ++q)
+      {
+        const int *IF_RESTRICT sl3 = C.rsub + q * 3;
+        // A 3x3 Laws response is one 1-D mask down a column of the row responses -- Sobel
+        // included (gx = L.D, gy = E.L) -- up to a sign that the squares drop.
+        const V16 Da = resp(sl3[0], 0, h), Db = resp(sl3[1], 0, h), De = resp(sl3[2], 0, h);
+        const V16 gx0 = hn::Add(hn::Add(Da, De), hn::Add(Db, Db));
+        energy(ee, hn::Sub(De, Da));
+        energy(se, hn::Sub(gx0, hn::ShiftLeft<2>(Db)));
+        const V16 Sa = resp(sl3[0], 1, h), Sb = resp(sl3[1], 1, h), Se = resp(sl3[2], 1, h);
+        const V16 ls = hn::Add(hn::Add(Sa, Se), hn::Add(Sb, Sb));
+        energy(es, hn::Sub(Se, Sa));
+        energy(ls2, ls);
+        energy(ss, hn::Sub(ls, hn::ShiftLeft<2>(Sb)));
+        const V16 La = resp(sl3[0], 2, h), Lb = resp(sl3[1], 2, h), Le = resp(sl3[2], 2, h);
+        energy(sl, hn::Sub(hn::Add(La, Le), hn::Add(Lb, Lb)));
+        const V16 gx = on_mesh(gx0), gy = on_mesh(hn::Sub(Le, La));
+        sxx = hn::Add(sxx, hn::WidenMulPairwiseAdd(d32, gx, gx));
+        syy = hn::Add(syy, hn::WidenMulPairwiseAdd(d32, gy, gy));
+        sxy = hn::Add(sxy, hn::WidenMulPairwiseAdd(d32, gx, gy));
+        // HOG inputs: the gradient folded to the upper half-plane and interleaved as (qy, qx),
+        // so that one pmaddwd against (cx, -cy) is a whole ray test, and |grad|^2
+        const V16 neg =
+            hn::BroadcastSignBit(hn::Or(gy, hn::And(hn::VecFromMask(d16, hn::Eq(gy, zero)), gx)));
+        const V16 qx = hn::Sub(hn::Xor(gx, neg), neg), qy = hn::Abs(gy);
+        const V16 z0 = hn::InterleaveWholeLower(d16, qy, qx),
+                  z1 = hn::InterleaveWholeUpper(d16, qy, qx);
+        hn::StoreU(hn::BitCast(d32, z0), d32, hin(q - qs, h, 0));
+        hn::StoreU(hn::BitCast(d32, z1), d32, hin(q - qs, h, 1));
+      }
+      P[K_LAWS + LAWS_EE] = ee, P[K_LAWS + LAWS_SE] = se, P[K_LAWS + LAWS_ES] = es;
+      P[K_LAWS + LAWS_LS] = ls2, P[K_LAWS + LAWS_SS] = ss, P[K_LAWS + LAWS_SL] = sl;
+      P[K_SXX] = sxx, P[K_SYY] = syy, P[K_SXY] = sxy;
+    }
+    for (int h = 0; h < 2; ++h) // the Laplacian and the moments of w = v - KBIAS
+    {
+      V32 *IF_RESTRICT P = A.pair[h];
+      auto on_mesh = [&](V16 v) { return MASKED ? hn::And(v, m16[h]) : v; };
+      V32 lap1, lap2, t1, t2, t3;
+      V64 t4;
+      init(lap1, P[K_LAP1]), init(lap2, P[K_LAP2]), init(t1, P[K_T1]), init(t2, P[K_T2]);
+      // The two linear sums ride in 16-bit lanes for the sub-chunk (|lap| <= 1020 and |w| <= 128
+      // over at most 32 rows stay within int16) and pair up into the int32 sums once
+      V16 lap16 = zero, w16 = zero;
+      static_assert(1020 * 32 <= 32767, "a sub-chunk's Laplacian sum fits int16");
+      init(t3, P[K_T3]), init(t4, A.t4[h]);
+      for (size_t q = qs; q < qe; ++q)
+      {
+        const int *IF_RESTRICT sl3 = C.rsub + q * 3;
+        const V16 Sb = resp(sl3[1], 1, h), Ma = resp(sl3[0], 3, h), Mb = resp(sl3[1], 3, h),
+                  Me = resp(sl3[2], 3, h);
+        const V16 lap = on_mesh(
+            hn::Sub(hn::Add(Sb, hn::Add(Ma, Me)), hn::Add(Mb, Mb))); // up+down+left+right-4c
+        lap16 = hn::Add(lap16, lap);
+        lap2 = hn::Add(lap2, hn::WidenMulPairwiseAdd(d32, lap, lap));
+        const V16 wc = on_mesh(hn::Sub(Mb, hn::Set(d16, KBIAS))), w2 = hn::Mul(wc, wc);
+        w16 = hn::Add(w16, wc);
+        t2 = hn::Add(t2, hn::WidenMulPairwiseAdd(d32, wc, wc));
+        t3 = hn::Add(t3, hn::WidenMulPairwiseAdd(d32, w2, wc));
+        // 2^29 a pair: widen now. The pair sum of squares cannot be negative, so it zero-extends
+        t4 = hn::Add(
+            t4,
+            hn::BitCast(d64, hn::SumsOf2(hn::BitCast(du32, hn::WidenMulPairwiseAdd(d32, w2, w2)))));
+      }
+      lap1 = hn::Add(lap1, hn::WidenMulPairwiseAdd(d32, lap16, ones));
+      t1 = hn::Add(t1, hn::WidenMulPairwiseAdd(d32, w16, ones));
+      P[K_LAP1] = lap1, P[K_LAP2] = lap2, P[K_T1] = t1, P[K_T2] = t2, P[K_T3] = t3;
+      A.t4[h] = t4;
+    }
+    for (int k = 0; k < 4; ++k) // the int32 quarter blocks: |grad|^4 and the HOG ray tests
+    {
+      V32 hog[HB - 1];
+      V64 sg4;
+      for (int j = 0; j < HB - 1; ++j) init(hog[j], A.hog[k][j]);
+      init(sg4, A.sg4[k]);
+      for (size_t q = qs; q < qe; ++q)
+      {
+        const V16 z = hn::BitCast(d16, hn::LoadU(d32, hin(q - qs, k >> 1, k & 1)));
+        const V32 g2 = hn::WidenMulPairwiseAdd(d32, z, z); // |grad|^2: cheaper than a store + load
+        sg4 = hn::Add(sg4, hn::BitCast(d64, hn::Add(hn::MulEven(g2, g2), hn::MulOdd(g2, g2))));
+        for (int j = 0; j < HB - 1; ++j)
+        {
+          // + |grad|^2 past the ray (t > 0), - |grad|^2 short of it (t < 0): one sign flip. The
+          // rays are such that t == 0 only for a zero gradient (set_config checks), where
+          // |grad|^2 is 0 whatever the flip makes of it.
+          const V32 t = hn::WidenMulPairwiseAdd(d32, z, rays[j]);
+          hog[j] = hn::Add(hog[j], hn::IfNegativeThenNegOrUndefIfZero(t, g2));
+        }
+      }
+      for (int j = 0; j < HB - 1; ++j) A.hog[k][j] = hog[j];
+      A.sg4[k] = sg4;
     }
   }
 }
@@ -415,6 +625,13 @@ template <class D>
 HWY_INLINE void fold(D d, hn::VFromD<D> v, size_t g, bool add, int64_t *IF_RESTRICT dst)
 {
   if constexpr (HWY_MAX_LANES_D(D) > 1)
+  {
+    if (g >= hn::Lanes(d)) // one cell: a horizontal sum, not a level per halving
+    {
+      const int64_t total = (int64_t)hn::ReduceSum(d, v);
+      dst[0] = add ? dst[0] + total : total;
+      return;
+    }
     if (g > 1)
     {
       const hn::Half<D> dh;
@@ -422,6 +639,7 @@ HWY_INLINE void fold(D d, hn::VFromD<D> v, size_t g, bool add, int64_t *IF_RESTR
                  odd = hn::LowerHalf(dh, hn::ConcatOdd(d, v, v));
       return fold(dh, hn::Add(even, odd), g / 2, add, dst);
     }
+  }
   hn::StoreU(add ? hn::Add(hn::LoadU(d, dst), v) : v, d, dst);
 }
 // ... of int32 lanes. Sums that cannot go negative widen by zero-extension, which is a mask
@@ -1476,7 +1694,7 @@ void interleave_row(const uint8_t *IF_RESTRICT src, size_t sstride, int planes, 
 // With P > 1 each row is then split by column phase: phase p holds columns p, p+P, ...
 // so the sampled columns are exactly phase 0 and a tap d columns away is still a contiguous
 // load, from phase (d % P). The columns just outside the image replicate the border, so
-// kernel()'s 3x3 taps need no border logic: column -1 is lane -1 of the last phase, and
+// block()'s 3x3 taps need no border logic: column -1 is lane -1 of the last phase, and
 // column w (reachable only when P == 1) is lane w.
 void deinterleave_row(const uint8_t *IF_RESTRICT img, int64_t rs, int64_t cs,
                       const int64_t *IF_RESTRICT coff, const int *IF_RESTRICT chan, int conv, int c,
@@ -1626,14 +1844,16 @@ class FeatureComputer
   int bard_lagmask_ = 0; // bit j set iff bard lag j fits the image (see bard())
   int group_ = 1;        // channels a block carries together: c_ up to GMAX, else 1
 
-  // How kernel() blocks map to cells, in LANES of phase 0 (a cell is cw_ of them, every
+  // How block()'s blocks map to cells, in LANES of phase 0 (a cell is cw_ of them, every
   // step_-th one sampled). A block either spans whole cells (multi_: cw_ divides it) or starts
   // at a cell edge with the lanes past the cell masked off; kmask_ is that cell-relative mesh.
   int cw_ = 1, cw_log2_ = 0, step_ = 1, ncols_ = 1;
   // Nothing per row, per block or per cell divides: what would is worked out once per
   // configuration, or carried along as a running count.
-  int64_t tapcol_[KPTR] = {}; // each kernel() tap's column, as an offset into a row of planes
+  int64_t tapcol_[KTAP] = {}; // each block() column tap, as an offset into a row of planes
   int symod_ = 0;             // sy_ % slots_: how far the window slot moves per sampled row
+  size_t sub_rows_ = 1;       // sampled rows per block() sub-chunk: their distinct rows' responses
+  size_t rd_stride_ = 3;      // stay in L1; and the most distinct rows a sub-chunk can have
   size_t block_cells_ = 1;    // cells a block spans (multi_)
   size_t lanes_ = 0;          // lanes in a row of one phase plane: w_ / phases_
   int up_shift_ = 0;          // log2 of level 1's fy: parents are whole powers of two of cells
@@ -1643,14 +1863,21 @@ class FeatureComputer
   // Per-band state: the plane window and everything a cell row in flight touches.
   struct Scratch
   {
-    std::vector<Acc> acc;              // [channel] block accumulators
-    std::vector<const uint8_t *> rows; // [sampled row][channel][KPTR] kernel() lane bases
-    std::vector<int> rslot;         // the window slot of each sampled row of the cell row in hand
-    int fslot = 0;                  // ... of the next row to fill
-    std::vector<int> vok;           // [sampled row] bard lags whose rows are inside the image
-    std::vector<int> rws;           // the cell row's sampled rows
-    std::vector<int64_t> cells;     // [channel][K_N][cell]: the cell row's sums
-    std::vector<int64_t> hsum;      // private hash partial; bands >0 only
+    Acc acc;                    // the block accumulators (one block of one channel at a time)
+    std::vector<int64_t> ud;    // [sampled row][BARD_NL][2]: bard's up/down row offsets
+    std::vector<int> rslot;     // the window slot of each sampled row of the cell row in hand
+    int fslot = 0;              // ... of the next row to fill
+    std::vector<int> vok;       // [sampled row] bard lags whose rows are inside the image
+    std::vector<int> rws;       // the cell row's sampled rows
+    std::vector<int64_t> r3;    // [sampled row][3] window offsets of its above/centre/below rows
+    std::vector<int> rsub, rdn; // block()'s row tables (Chunk::rsub, rdn)
+    std::vector<int> r3slot;    // [sampled row][3] window slots of its rows, and the lookup
+    std::vector<int> seen;      // from a window slot to its slot in rdist (-1: none yet)
+    std::vector<int64_t> rdist; // ... and the distinct rows of each sub-chunk (Chunk::rdist)
+    std::vector<int16_t> resp;  // the sub-chunk's row responses (Chunk::resp)
+    std::vector<int32_t> hbuf;  // ... and HOG inputs (Chunk::hbuf)
+    std::vector<int64_t> cells; // [channel][K_N][cell]: the cell row's sums
+    std::vector<int64_t> hsum;  // private hash partial; bands >0 only
     std::vector<int64_t> row, graw; // features(): the cell row in flight, and the band's share
                                     // of the global sums
     std::vector<int64_t>
@@ -1772,10 +1999,11 @@ class FeatureComputer
         hn::VFromD<decltype(df)> out[NMAP];
         S[SXX] = sum(K_SXX), S[SYY] = sum(K_SYY), S[SXY] = sum_signed(K_SXY);
         S[CNT] = hn::Set(dd, (double)n);
-        V past = hn::Add(S[SXX], S[SYY]), rest = S[CNT]; // as the flush derives these slots
+        const V tot = hn::Add(S[SXX], S[SYY]);
+        V past = tot, rest = S[CNT]; // as the flush derives these slots
         for (int j = 0; j < HB - 1; ++j)
-        {
-          const V cum = sum(K_HOG + j);
+        { // (P + tot) / 2: an even integer halved, exact
+          const V cum = hn::Mul(hn::Add(sum_signed(K_HOG + j), tot), hn::Set(dd, 0.5));
           S[HOG0 + j] = hn::Sub(past, cum);
           past = cum;
         }
@@ -1955,6 +2183,11 @@ class FeatureComputer
     // every channel in one pass of the blocks, and blocks of enough cells to fill derive's vectors
     const bool derives = stream_ && local && group_ == c_ && block_cells_ >= (size_t)LD;
     const size_t nxs = local ? block_cells_ | 1 : cells_stride(); // never above cells_stride()
+    // A block's sums are contiguous per kind across its cells (what derive_block and the roll-up
+    // read) when it holds several; a block of one cell writes its kinds contiguously instead, so
+    // that the fold touches five cache lines per block and not one per kind (which, over a cell
+    // row, evicted block()'s row buffers from L1).
+    const size_t kst = multi_ ? nxs : 1, cst = multi_ ? 1 : (size_t)K_N;
     const size_t pstride = (size_t)slots_ * (size_t)s.row_stride, lanes = lanes_;
     V16 rays[HB - 1];
     for (int j = 0; j < HB - 1; ++j)
@@ -1969,36 +2202,61 @@ class FeatureComputer
         // r+1, replicated at the image edge, and r -/+ each bard lag: all within r's halo, so
         // their slots are r's moved by as much, wrapped.
         const int r = rws[q0 + q], sr = s.rslot[q0 + q];
-        auto row = [&](int y)
+        auto slot = [&](int y)
         {
           int v = sr + (y - r);
           v += v < 0 ? slots_ : 0;
           v -= v >= slots_ ? slots_ : 0;
-          return (size_t)v * s.row_stride + PAD_L;
+          return v;
         };
+        auto row = [&](int y) { return (size_t)slot(y) * s.row_stride + PAD_L; };
         s.vok[q] = 0;
         for (int j = 0; j < BARD_NL; ++j)
           if (r >= BARD_LAGS[j] && r < h_ - BARD_LAGS[j]) s.vok[q] |= bard_lagmask_ & (1 << j);
-        size_t rows3[3], up[BARD_NL], down[BARD_NL];
-        for (int i = 0; i < 3; ++i) rows3[i] = row(clampi(r - 1 + i, h_ - 1));
-        for (int j = 0; j < BARD_NL; ++j)
+        for (int i = 0; i < 3; ++i)
+        {
+          s.r3slot[q * 3 + i] = slot(clampi(r - 1 + i, h_ - 1));
+          s.r3[q * 3 + i] = (int64_t)s.r3slot[q * 3 + i] * s.row_stride + PAD_L;
+        }
+        for (int j = 0; j < BARD_NL; ++j) // (read only where the lag's rows are in the image)
         {
           const int d = (s.vok[q] >> j) & 1 ? BARD_LAGS[j] : 0;
-          up[j] = row(r - d), down[j] = row(r + d);
+          s.ud[(q * BARD_NL + j) * 2] = (int64_t)row(r - d) - s.r3[q * 3 + 1];
+          s.ud[(q * BARD_NL + j) * 2 + 1] = (int64_t)row(r + d) - s.r3[q * 3 + 1];
         }
-        for (int k = 0; k < c_; ++k)
-        {
-          const uint8_t *IF_RESTRICT base = s.planes.data() + (size_t)k * pstride;
-          const uint8_t **p = &s.rows[(q * c_ + k) * KPTR];
-          for (int i = 0; i < 9; ++i) p[i] = base + rows3[i / 3] + tapcol_[i];
-          for (int j = 0; j < BARD_NL; ++j)
+      }
+      // block()'s row tables: per sub-chunk, the distinct rows its sampled rows read, in order
+      // of first use, and each sampled row's three slots among them
+      Chunk C;
+      C.nr = nr;
+      C.r3 = s.r3.data();
+      C.ud = s.ud.data();
+      C.vok = s.vok.data();
+      C.allok = bard_lagmask_ == (1 << BARD_NL) - 1;
+      C.rsub = s.rsub.data();
+      C.rdist = s.rdist.data();
+      C.rdn = s.rdn.data();
+      C.rdstride = rd_stride_;
+      C.subrows = sub_rows_;
+      C.tapcol = tapcol_;
+      C.resp = aligned64(s.resp);
+      C.hbuf = aligned64(s.hbuf);
+      for (size_t sub = 0, qs = 0; qs < nr; ++sub, qs += sub_rows_)
+      {
+        int64_t *IF_RESTRICT dist = &s.rdist[sub * rd_stride_];
+        int *IF_RESTRICT seen = s.seen.data(); // [window slot] -> its slot in `dist`, or -1
+        const size_t qe = std::min(nr, qs + sub_rows_);
+        int nd = 0;
+        for (size_t q = qs; q < qe; ++q)
+          for (int i = 0; i < 3; ++i)
           {
-            p[9 + 4 * j] = base + rows3[1] + tapcol_[9 + 4 * j];
-            p[10 + 4 * j] = base + rows3[1] + tapcol_[10 + 4 * j];
-            p[11 + 4 * j] = base + up[j];
-            p[12 + 4 * j] = base + down[j];
+            const int v = s.r3slot[q * 3 + i];
+            if (seen[v] < 0) dist[seen[v] = nd++] = s.r3[q * 3 + i];
+            s.rsub[q * 3 + i] = seen[v] * RESP_STRIDE * (int)hn::Lanes(d16);
           }
-        }
+        s.rdn[sub] = nd;
+        for (size_t q = qs; q < qe; ++q) // (nd entries at most: cheaper than a fill of slots_)
+          for (int i = 0; i < 3; ++i) seen[s.r3slot[q * 3 + i]] = -1;
       }
       for (int k0 = 0; k0 < c_; k0 += G)
         for (size_t x0 = 0, cell = 0; x0 < lanes;
@@ -2013,22 +2271,6 @@ class FeatureComputer
             const bool edge =
                 x * phases_ < (size_t)BARD_MAXLAG || (x + N) * phases_ + BARD_MAXLAG > (size_t)w_;
             const uint8_t *IF_RESTRICT valid = edge ? bvalid_.data() : nullptr;
-            for (size_t q = 0; q < nr; ++q) // row 0 of a block assigns its accumulators
-              for (int k = 0; k < G; ++k)
-              {
-                const uint8_t *const *rp = &s.rows[(q * c_ + k0 + k) * KPTR];
-                auto run = [&](auto m, auto first)
-                {
-                  kernel<decltype(m)::value, decltype(first)::value>(
-                      rp, x, mask, valid, bvalid_stride_, bard_lagmask_, s.vok[q], rays, s.acc[k]);
-                };
-                if (msk)
-                  q ? run(std::true_type(), std::false_type())
-                    : run(std::true_type(), std::true_type());
-                else
-                  q ? run(std::false_type(), std::false_type())
-                    : run(std::false_type(), std::true_type());
-              }
             // Lanes -> cells, a quarter block (or a half: quarters 0 and 2) at a time. The block
             // holds g lanes per cell, so the part starting at lane l belongs to cell e0 + l / g; a
             // block no wider than a cell (g == N) is all e0. A part adds to its cell unless it is
@@ -2042,42 +2284,64 @@ class FeatureComputer
               adds[q] = q0 > 0 || (g < N ? l & (g - 1) : xv + l) > 0;
             }
             const V8 mv = hn::LoadU(d8, mask);
-            for (int k = 0; k < G; ++k)
-            {
-              const Acc &A = s.acc[k];
+            for (int k = 0; k < G; ++k) // every row of the chunk, channel by channel: block()
+            {                           // then its fold, one set of accumulators serving all
+              Acc &A = s.acc;
+              C.base = s.planes.data() + (size_t)(k0 + k) * pstride + x;
+              const uint8_t *IF_RESTRICT vx = valid ? valid + x : nullptr;
+              if (msk)
+                block<true>(C, mask, vx, bvalid_stride_, bard_lagmask_, rays, A);
+              else
+                block<false>(C, mask, vx, bvalid_stride_, bard_lagmask_, rays, A);
               int64_t *IF_RESTRICT cb = s.cells.data() + (size_t)(k0 + k) * K_N * nxs;
-              for (int t = K_U8; t < K_N; ++t) // both kinds fold as uint16 lanes of column pairs
+              for (int t = K_U8; t < K_N; ++t)
               {
-                const auto sums =
-                    t < K_BARD ? hn::SumsOf2(msk ? hn::And(A.u8[t - K_U8], mv) : A.u8[t - K_U8])
-                               : A.bard[t - K_BARD];
+                const V8 u8 = t < K_BARD ? (msk ? hn::And(A.u8[t - K_U8], mv) : A.u8[t - K_U8])
+                                         : hn::Zero(d8);
+                if (g >= 8) // cells of whole octets: both kinds sum to uint64 lanes of 8 columns
+                {           // in one step (psadbw for the bytes), and the cells all add alike
+                  const V64 w = hn::BitCast(d64, t < K_BARD ? hn::SumsOf8(u8)
+                                                            : hn::SumsOf4(A.bard[t - K_BARD]));
+                  fold(d64, w, g / 8, adds[0], cb + t * kst + at[0] * cst);
+                  continue;
+                }
+                if (g == 4) // cells of quads: uint32 lanes of 4 columns, one a cell
+                {
+                  const auto w = t < K_BARD ? hn::SumsOf4(u8) : hn::SumsOf2(A.bard[t - K_BARD]);
+                  fold(d64, hn::BitCast(d64, hn::PromoteLowerTo(du64, w)), 1, adds[0],
+                       cb + t * kst + at[0] * cst);
+                  fold(d64, hn::BitCast(d64, hn::PromoteUpperTo(du64, w)), 1, adds[2],
+                       cb + t * kst + at[2] * cst);
+                  continue;
+                }
+                const auto sums = t < K_BARD ? hn::SumsOf2(u8) : A.bard[t - K_BARD];
                 fold32<false>(hn::BitCast(d32, hn::PromoteLowerTo(du32, sums)), g / 2, adds[0],
-                              cb + t * nxs + at[0]);
+                              cb + t * kst + at[0] * cst);
                 fold32<false>(hn::BitCast(d32, hn::PromoteUpperTo(du32, sums)), g / 2, adds[2],
-                              cb + t * nxs + at[2]);
+                              cb + t * kst + at[2] * cst);
               }
               for (size_t h = 0; h < 2; ++h)
               {
                 const bool ad = adds[2 * h];
-                int64_t *IF_RESTRICT ch = cb + at[2 * h];
+                int64_t *IF_RESTRICT ch = cb + at[2 * h] * cst;
                 for (int t = 0; t < K_NUNSIGNED; ++t)
-                  fold32<false>(A.pair[h][t], g / 2, ad, ch + t * nxs);
+                  fold32<false>(A.pair[h][t], g / 2, ad, ch + t * kst);
                 for (int t = K_NUNSIGNED; t < K_NPAIR; ++t)
-                  fold32<true>(A.pair[h][t], g / 2, ad, ch + t * nxs);
-                fold(d64, A.t4[h], g / 4, ad, ch + K_T4 * nxs);
+                  fold32<true>(A.pair[h][t], g / 2, ad, ch + t * kst);
+                fold(d64, A.t4[h], g / 4, ad, ch + K_T4 * kst);
               }
               for (int q = 0; q < 4; ++q)
               {
-                int64_t *IF_RESTRICT cq = cb + at[q];
-                fold(d64, A.sg4[q], gq / 2, adds[q], cq + K_SG4 * nxs);
-                for (int j = 0; j < HB - 1; ++j)
-                  fold32<false>(A.hog[q][j], gq, adds[q], cq + (K_HOG + j) * nxs);
+                int64_t *IF_RESTRICT cq = cb + at[q] * cst;
+                fold(d64, A.sg4[q], gq / 2, adds[q], cq + K_SG4 * kst);
+                for (int j = 0; j < HB - 1; ++j) // signed: energy past minus energy short
+                  fold32<true>(A.hog[q][j], gq, adds[q], cq + (K_HOG + j) * kst);
               }
             }
             if (local)
             {
               const size_t e = cell, cells = std::min(block_cells_, nfx - e);
-              if (!(derives && rolls)) flush(s.cells.data(), nxs, e, cells, k0, G, n, dst);
+              if (!(derives && rolls)) flush(s.cells.data(), nxs, nxs, 1, e, cells, k0, G, n, dst);
               if (derives)
               {
                 derive_block(s.cells.data(), nxs, cy * nfx + e, cells, n);
@@ -2087,7 +2351,7 @@ class FeatureComputer
             }
           }
     }
-    if (!local) flush(s.cells.data(), nxs, 0, nfx, 0, c_, n, dst);
+    if (!local) flush(s.cells.data(), nxs, kst, cst, 0, nfx, 0, c_, n, dst);
     if (derives && rolls) s.up_n += n * levels_[1].fx;
     return derives;
   }
@@ -2170,15 +2434,16 @@ class FeatureComputer
   void flush_up(Scratch &s, size_t cy)
   {
     Level &lv = levels_[1];
-    flush(s.up.data(), (size_t)lv.nx + hn::Lanes(d64), 0, (size_t)lv.nx, 0, c_, s.up_n,
-          lv.buf.data() + (cy >> up_shift_) * lv.nx * c_ * NSUM);
+    flush(s.up.data(), (size_t)lv.nx + hn::Lanes(d64), (size_t)lv.nx + hn::Lanes(d64), 1, 0,
+          (size_t)lv.nx, 0, c_, s.up_n, lv.buf.data() + (cy >> up_shift_) * lv.nx * c_ * NSUM);
     s.up_n = 0;
   }
 
   // Cell sums -> accumulator slots, for the `cells` cells from cell0 on that the sums hold (a
-  // block's, or the whole row's), `nxs` apart, and for channels [k0, k0 + G).
-  void flush(const int64_t *IF_RESTRICT sums, size_t nxs, size_t cell0, size_t cells, int k0, int G,
-             int64_t n, int64_t *IF_RESTRICT dst) const
+  // block's, or the whole row's), kinds `kst` apart and cells `cst` apart (one of them 1), a
+  // channel's K_N * nxs long, and for channels [k0, k0 + G).
+  void flush(const int64_t *IF_RESTRICT sums, size_t nxs, size_t kst, size_t cst, size_t cell0,
+             size_t cells, int k0, int G, int64_t n, int64_t *IF_RESTRICT dst) const
   {
     const int64_t B = KBIAS;
     for (size_t i = 0; i < cells; ++i)
@@ -2187,17 +2452,19 @@ class FeatureComputer
       for (int k = k0; k < k0 + G; ++k)
       {
         int64_t *IF_RESTRICT a = dst + (e * c_ + k) * NSUM;
-        const int64_t *IF_RESTRICT cb = sums + (size_t)k * K_N * nxs + src;
-        auto sum = [&](int t) { return cb[(size_t)t * nxs]; };
+        const int64_t *IF_RESTRICT cb = sums + (size_t)k * K_N * nxs + src * cst;
+        auto sum = [&](int t) { return cb[(size_t)t * kst]; };
         a[SXX] = sum(K_SXX);
         a[SYY] = sum(K_SYY);
         a[SXY] = sum(K_SXY);
         a[CNT] = n;
-        int64_t past = a[SXX] + a[SYY]; // every pixel is past "ray -1": the total |grad|^2
+        const int64_t tot = a[SXX] + a[SYY]; // every pixel is past "ray -1": the total |grad|^2
+        int64_t past = tot;
         for (int j = 0; j < HB - 1; ++j)
         {
-          a[HOG0 + j] = past - sum(K_HOG + j);
-          past = sum(K_HOG + j);
+          const int64_t cum = (sum(K_HOG + j) + tot) >> 1; // (past - short + past + short) / 2
+          a[HOG0 + j] = past - cum;
+          past = cum;
         }
         a[HOG0 + HB - 1] = past;
         a[NMAX] = sum(K_MAX);
@@ -2890,6 +3157,21 @@ public:
       const double a = PI * k / HB;
       ray_[k - 1][0] = (int16_t)std::llround(RAYSCALE * std::cos(a));
       ray_[k - 1][1] = (int16_t)-std::llround(RAYSCALE * std::sin(a));
+      // block() sums the energy past a ray minus the energy short of it, with the pixels ON the
+      // ray (t == 0) going either way: that is exact only if no nonzero gradient lies on a ray,
+      // i.e. the ray's reduced direction is out of the gradient's range (|gx|, |gy| <= 4 * 255).
+      // True of these rays (the smallest component after the gcd is 467 and the largest 16135);
+      // a retuned HB or RAYSCALE would be checked here.
+      const int64_t cx = std::abs((int64_t)ray_[k - 1][0]), cy = std::abs((int64_t)ray_[k - 1][1]);
+      int64_t g = cx, h = cy;
+      while (h)
+      {
+        const int64_t t = g % h;
+        g = h, h = t;
+      }
+      if (std::max(cx, cy) / g <= 4 * 255)
+        throw std::logic_error(
+            "HOG ray on a reachable gradient: the signed ray sums are not exact");
     }
     // A bin is "cardinal" if its centre orientation lies within 3/4 of a bin width of a
     // horizontal or vertical edge (gradient at 0, pi/2, or pi). Text, tables, UI and the
@@ -2933,14 +3215,14 @@ public:
     }
 
     // Split the planes by column phase while the stride and the cell stay even, so the sampled
-    // columns end up adjacent in phase 0 and kernel() wastes no lanes on the rest -- but only
+    // columns end up adjacent in phase 0 and block() wastes no lanes on the rest -- but only
     // down to cells of whole lane quads, the coarsest geometry an accumulator folds from.
     {
       const int cwf = w_ / levels_[0].nx, N = (int)hn::Lanes(d8);
       for (phases_ = 1;
            phases_ < PHASES_MAX && sx_ % (2 * phases_) == 0 && cwf % (8 * phases_) == 0;)
         phases_ *= 2;
-      // kernel() geometry, in lanes of phase 0. Blocks span whole cells when a cell divides
+      // block() geometry, in lanes of phase 0. Blocks span whole cells when a cell divides
       // half a block and holds whole lane quads; otherwise each cell is walked alone, its
       // last block masked past the cell edge.
       cw_ = cwf / phases_;
@@ -2962,11 +3244,11 @@ public:
         const int f = ((d % phases_) + phases_) % phases_;
         return f * phase_stride + (d - f) / phases_;
       };
-      for (int i = 0; i < 9; ++i) tapcol_[i] = col(i % 3 - 1);
+      for (int i = 0; i < 3; ++i) tapcol_[i] = col(i - 1);
       for (int j = 0; j < BARD_NL; ++j)
       {
-        tapcol_[9 + 4 * j] = col(-BARD_LAGS[j]);
-        tapcol_[10 + 4 * j] = col(BARD_LAGS[j]);
+        tapcol_[3 + 2 * j] = col(-BARD_LAGS[j]);
+        tapcol_[4 + 2 * j] = col(BARD_LAGS[j]);
       }
       // when cell_row() derives by the block, and there is a level for the sums to go up to
       rolls_ = multi_ && N / cw_ >= LD && group_ == c_ && levels_.size() > 1 &&
@@ -2992,6 +3274,10 @@ public:
     // amortizes over more rows. The window has to span the cell row plus a halo.
     slots_ = std::max(2 * BARD_MAXLAG + 1, h_ / levels_[0].ny + 2 * BARD_MAXLAG + 1);
     symod_ = sy_ % slots_;
+    // A sub-chunk's sampled rows read at most about 34 distinct image rows (adjacent rows at
+    // stride 1, every other one at stride 2, three apiece beyond), whose responses then fit L1.
+    sub_rows_ = sy_ == 1 ? 32 : sy_ == 2 ? 16 : 11;
+    rd_stride_ = 3 * sub_rows_;
     for (up_shift_ = 0; levels_.size() > 1 && (1 << up_shift_) < levels_[1].fy;) ++up_shift_;
     coff_.assign((size_t)std::max(c_, conv_ != CONV_NONE ? 3 : 0), 0);
 
@@ -3075,9 +3361,16 @@ public:
     for (size_t b = 0; b < scr_.size(); ++b)
     {
       Scratch &s = scr_[b];
-      s.acc.resize((size_t)group_);
-      s.rows.assign(nrows * c_ * KPTR, nullptr);
+      s.ud.assign(nrows * BARD_NL * 2, 0);
       s.vok.assign(nrows, 0);
+      s.r3.assign(nrows * 3, 0);
+      s.rsub.assign(nrows * 3, 0);
+      s.r3slot.assign(nrows * 3, 0);
+      s.seen.assign((size_t)slots_, -1);
+      s.rdn.assign((nrows + sub_rows_ - 1) / sub_rows_, 0);
+      s.rdist.assign(s.rdn.size() * rd_stride_, 0);
+      s.resp.assign(rd_stride_ * NRESP * 2 * hn::Lanes(d16) + 32, 0); // (+ alignment slack)
+      s.hbuf.assign(sub_rows_ * 2 * 2 * hn::Lanes(d32) + 16, 0);
       s.cells.assign((size_t)c_ * K_N * cells_stride() + N, 0);
       s.phase_stride = (int64_t)(w_ / phases_) + PAD_L + PAD_R;
       s.row_stride = s.phase_stride * phases_;
