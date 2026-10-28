@@ -1961,6 +1961,57 @@ void deinterleave_row(const uint8_t *IF_RESTRICT img, int64_t rs, int64_t cs,
   uint8_t *IF_RESTRICT d0 = dst + (size_t)slot * (size_t)prs + PAD_L;
   const size_t pstride = (size_t)slots * (size_t)prs;
   uint8_t *IF_RESTRICT scratch = tmp + (size_t)c * (size_t)w;
+  // Two phases of a raw row split as they are gathered: planar input straight from the
+  // image, packed 2-4 channel input from the de-interleaved vectors, with no trip through
+  // tmp. (More phases, or a colour conversion, gather first and split below.)
+  if (P == 2 && conv == CONV_NONE && (cs == 1 || (packed && c >= 2 && c <= 4)))
+  {
+    const size_t N = hn::Lanes(d8);
+    size_t x = 0;
+    if (cs == 1)
+      for (int k = 0; k < c; ++k)
+        split_phases(src + coff[k], (size_t)w, 2, (size_t)phs, scratch, d0 + (size_t)k * pstride);
+    else
+    {
+      auto put = [&](int k, V8 lo, V8 hi)
+      {
+        uint8_t *IF_RESTRICT b = d0 + (size_t)k * pstride + x / 2;
+        hn::StoreU(hn::ConcatEven(d8, hi, lo), d8, b);
+        hn::StoreU(hn::ConcatOdd(d8, hi, lo), d8, b + phs);
+      };
+      for (; x + 2 * N <= (size_t)w; x += 2 * N)
+      {
+        V8 a0, a1, b0, b1, e0, e1, g0, g1;
+        if (c == 2)
+        {
+          hn::LoadInterleaved2(d8, src + x * 2, a0, b0);
+          hn::LoadInterleaved2(d8, src + (x + N) * 2, a1, b1);
+        }
+        else if (c == 3)
+        {
+          hn::LoadInterleaved3(d8, src + x * 3, a0, b0, e0);
+          hn::LoadInterleaved3(d8, src + (x + N) * 3, a1, b1, e1);
+          put(2, e0, e1);
+        }
+        else
+        {
+          hn::LoadInterleaved4(d8, src + x * 4, a0, b0, e0, g0);
+          hn::LoadInterleaved4(d8, src + (x + N) * 4, a1, b1, e1, g1);
+          put(2, e0, e1), put(3, g0, g1);
+        }
+        put(0, a0, a1), put(1, b0, b1);
+      }
+      for (; x < (size_t)w; ++x)    // the tail, a pixel at a time: column x is lane x / 2 of
+        for (int k = 0; k < c; ++k) // phase x % 2
+          d0[(size_t)k * pstride + (x & 1) * (size_t)phs + x / 2] = src[(int64_t)x * cs + coff[k]];
+    }
+    for (int k = 0; k < c; ++k)
+    {
+      uint8_t *IF_RESTRICT b = d0 + (size_t)k * pstride;
+      b[(int64_t)(P - 1) * phs - 1] = b[0];
+    }
+    return;
+  }
   // straight into the window, or into tmp's first c planes for the split below
   uint8_t *IF_RESTRICT row = P == 1 ? d0 : tmp;
   const size_t rstride = P == 1 ? pstride : (size_t)w;
