@@ -728,6 +728,88 @@ HWY_INLINE void fold32(V32 v, size_t g, bool add, int64_t *IF_RESTRICT dst)
     fold(d64, hn::BitCast(d64, hn::SumsOf2(hn::BitCast(du32, v))), g / 2, add, dst);
 }
 
+// The sums of a one-cell block (every lane of every accumulator is the cell's), into its
+// kind-contiguous K_N slots. The halves and quarters of a kind add in registers first (any two
+// lanes of an accumulator sum within 32 bits at KROWS = 128, and the four quarters of a HOG sum
+// within 2^30), widen once, and then four kinds reduce together: two interleave levels pair the
+// lanes of four vectors into one vector of their four sums, a quarter of the shuffles of four
+// horizontal sums, and store four consecutive slots at once. Lane widths other than four int64
+// lanes (eight reduce to four first) take the generic fold.
+constexpr bool FOLD4 = HWY_MAX_BYTES >= 32 && !HWY_HAVE_SCALABLE && HWY_MAX_LANES_D(D64) % 4 == 0;
+#if HWY_MAX_BYTES >= 32 && !HWY_HAVE_SCALABLE
+using D64x4 = hn::FixedTag<int64_t, 4>;
+template <class V> // (a template, so that only the branch for this width is instantiated)
+HWY_INLINE hn::VFromD<D64x4> to4(V v)
+{
+  if constexpr (HWY_MAX_LANES_D(D64) == 4)
+    return v;
+  else
+  {
+    const D64x4 d4;
+    return hn::Add(hn::LowerHalf(d4, v), hn::UpperHalf(d4, v));
+  }
+}
+#endif
+HWY_INLINE void fold_cell(const Acc &A, bool msk, V8 mv, bool add, int64_t *IF_RESTRICT cb)
+{
+  auto wide = [&](int t) -> V64 // kind t's lanes as int64 (not yet reduced)
+  {
+    if (t < K_NUNSIGNED)
+    {
+      const auto v = hn::Add(hn::BitCast(du32, A.pair[0][t]), hn::BitCast(du32, A.pair[1][t]));
+      return hn::BitCast(d64, hn::SumsOf2(v));
+    }
+    if (t < K_NPAIR)
+    {
+      const V32 v = hn::Add(A.pair[0][t], A.pair[1][t]);
+      return hn::Add(hn::PromoteLowerTo(d64, v), hn::PromoteUpperTo(d64, v));
+    }
+    if (t == K_T4) return hn::Add(A.t4[0], A.t4[1]);
+    if (t == K_SG4) return hn::Add(hn::Add(A.sg4[0], A.sg4[1]), hn::Add(A.sg4[2], A.sg4[3]));
+    if (t < K_U8)
+    {
+      const int j = t - K_HOG;
+      const V32 v = hn::Add(hn::Add(A.hog[0][j], A.hog[1][j]), hn::Add(A.hog[2][j], A.hog[3][j]));
+      return hn::Add(hn::PromoteLowerTo(d64, v), hn::PromoteUpperTo(d64, v));
+    }
+    if (t < K_BARD)
+      return hn::BitCast(d64, hn::SumsOf8(msk ? hn::And(A.u8[t - K_U8], mv) : A.u8[t - K_U8]));
+    if (t < K_N) return hn::BitCast(d64, hn::SumsOf4(A.bard[t - K_BARD]));
+    return hn::Zero(d64);
+  };
+#if HWY_MAX_BYTES >= 32 && !HWY_HAVE_SCALABLE
+  if constexpr (FOLD4)
+  {
+    const D64x4 d4;
+    for (int t = 0; t < K_N; t += 4)
+    {
+      const auto a = to4(wide(t)), b = to4(wide(t + 1)), c = to4(wide(t + 2)), e = to4(wide(t + 3));
+      const auto ab = hn::Add(hn::InterleaveLower(d4, a, b), hn::InterleaveUpper(d4, a, b));
+      const auto ce = hn::Add(hn::InterleaveLower(d4, c, e), hn::InterleaveUpper(d4, c, e));
+      auto r = hn::Add(hn::ConcatLowerLower(d4, ce, ab), hn::ConcatUpperUpper(d4, ce, ab));
+      int64_t *IF_RESTRICT dst = cb + t;
+      if (t + 4 <= K_N)
+      {
+        if (add) r = hn::Add(r, hn::LoadU(d4, dst));
+        hn::StoreU(r, d4, dst);
+      }
+      else // the last kinds: only theirs are stored
+      {
+        const auto m = hn::FirstN(d4, (size_t)(K_N - t));
+        if (add) r = hn::Add(r, hn::MaskedLoad(m, d4, dst));
+        hn::BlendedStore(r, m, d4, dst);
+      }
+    }
+    return;
+  }
+#endif
+  for (int t = 0; t < K_N; ++t)
+  {
+    const int64_t total = hn::ReduceSum(d64, wide(t));
+    cb[t] = add ? cb[t] + total : total;
+  }
+}
+
 // derive, for LD cell-channels in lockstep: four a vector where vectors hold four doubles.
 #if HWY_MAX_BYTES >= 32 && !HWY_HAVE_SCALABLE
 constexpr int LD = 4;
@@ -2345,6 +2427,11 @@ class FeatureComputer
                     ? block<false, true>(C, mask, vx, bvalid_stride_, bard_lagmask_, rays, A)
                     : block<false, false>(C, mask, vx, bvalid_stride_, bard_lagmask_, rays, A);
               int64_t *IF_RESTRICT cb = s.cells.data() + (size_t)(k0 + k) * K_N * nxs;
+              if (!multi_) // one cell: its kinds are contiguous (kst == 1), at[] all the cell
+              {
+                fold_cell(A, msk, mv, adds[0], cb + at[0] * cst); // (the first part's flag)
+                continue;
+              }
               for (int t = K_U8; t < K_N; ++t)
               {
                 const V8 u8 = t < K_BARD ? (msk ? hn::And(A.u8[t - K_U8], mv) : A.u8[t - K_U8])
