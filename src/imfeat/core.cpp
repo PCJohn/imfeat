@@ -281,6 +281,10 @@ struct BardRow
 {
   V8 keep, map[BARD_NMAP - 1];
 };
+struct BardSums // the gated maps' sums over a block's rows (below 2^16, as uint16)
+{
+  V16 b[BARD_NMAP];
+};
 
 template <bool VALID, bool ALL, bool UNIT>
 HWY_INLINE BardRow bard(const uint8_t *IF_RESTRICT rb, const int64_t *IF_RESTRICT tap, int64_t rs,
@@ -366,6 +370,14 @@ struct Chunk
                                     // pixels in interleave order (see block())
 };
 constexpr int RESP_STRIDE = NRESP * 2; // a slot's responses, in vectors of Lanes(d16)
+
+// The bar detector phase of a block: its gated maps paired up through one multiply-add by
+// the 0 / 1 gate (`mesh1` is the mesh as 0 / 1) into `out`. A function of its own, not
+// inlined: in block() its row loop had to share the registers with the phases around it and
+// spilled a quarter of its instructions.
+template <bool UNIT>
+HWY_NOINLINE void bard_phase(const Chunk &C, int64_t tm, V8 mesh1, const uint8_t *IF_RESTRICT valid,
+                             size_t vstride, int hok, VU16 *IF_RESTRICT out);
 
 // The first 64-byte-aligned element of a vector (sized with 64 bytes of slack): the vector
 // loads of the 16-bit phases then never straddle a cache line.
@@ -463,55 +475,7 @@ HWY_INLINE void block(const Chunk &C, const uint8_t *IF_RESTRICT mask,
     A.u8[K_MAX - K_U8] = lbp[0];
     A.u8[K_MIN - K_U8] = umin;
   }
-  {
-    // The bar detector. Its gated maps pair up through one multiply-add by the 0 / 1 gate. The
-    // rows whose lags all fit the image are one run (vok is monotone in from each image edge),
-    // walked without a test per lag; the rest, at the image's top and bottom, with the tests.
-    // The sums (below 2^15) go through the runs by value: by reference they would have a
-    // home in memory that the byte loads may alias, and GCC then stored them every row.
-    struct Sums
-    {
-      V16 b[BARD_NMAP];
-    };
-    const V8 mesh1 = hn::And(m8, one); // the mesh as 0 / 1: the gate is then the 0 / 1 multiplier
-    auto run = [&](auto kValid, auto kAll, size_t q0, size_t q1, Sums acc) IF_LAMBDA_INLINE
-    {
-      const uint8_t *IF_RESTRICT rb = C.base + C.row0 + (int64_t)q0 * C.rowstep;
-      for (size_t q = q0; q < q1; ++q, rb += C.rowstep)
-      {
-        const BardRow r = bard<decltype(kValid)::value, decltype(kAll)::value, UNIT>(
-            rb, C.tapcol, rs, hn::LoadU(d8, rb + tm), mesh1, valid, vstride, hok, C.vok[q]);
-        const auto k = hn::BitCast(di8, r.keep);
-        acc.b[0] = hn::Add(acc.b[0], hn::SatWidenMulPairwiseAdd(d16, r.keep, k)); // cover: 1 * 1
-        for (int j = 1; j < BARD_NMAP; ++j)
-          acc.b[j] = hn::Add(acc.b[j], hn::SatWidenMulPairwiseAdd(d16, r.map[j - 1], k));
-      }
-      return acc;
-    };
-    Sums acc;
-    for (int j = 0; j < BARD_NMAP; ++j) acc.b[j] = hn::Zero(d16);
-    size_t q0 = 0, q1 = C.nr;
-    if (C.allok)
-    {
-      while (q0 < q1 && C.vok[q0] != hok) ++q0;
-      while (q1 > q0 && C.vok[q1 - 1] != hok) --q1;
-    }
-    else
-      q1 = q0; // no run without a test
-    if (valid)
-    {
-      acc = run(std::true_type(), std::false_type(), 0, q0, acc);
-      acc = run(std::true_type(), std::true_type(), q0, q1, acc);
-      acc = run(std::true_type(), std::false_type(), q1, C.nr, acc);
-    }
-    else
-    {
-      acc = run(std::false_type(), std::false_type(), 0, q0, acc);
-      acc = run(std::false_type(), std::true_type(), q0, q1, acc);
-      acc = run(std::false_type(), std::false_type(), q1, C.nr, acc);
-    }
-    for (int j = 0; j < BARD_NMAP; ++j) A.bard[j] = hn::BitCast(du16, acc.b[j]);
-  }
+  bard_phase<UNIT>(C, tm, hn::And(m8, one), valid, vstride, hok, A.bard);
   const V16 ones = hn::Set(d16, 1), zero = hn::Zero(d16);
   // Bytes widen to the 16-bit halves by promotion (the first 16 pixels, then the rest) or,
   // where the block is one cell and the lanes' order is nobody's business, by interleaving
@@ -697,6 +661,53 @@ HWY_INLINE void block(const Chunk &C, const uint8_t *IF_RESTRICT mask,
       A.sg4[k] = sg4;
     }
   }
+}
+
+template <bool UNIT>
+HWY_NOINLINE void bard_phase(const Chunk &C, int64_t tm, V8 mesh1, const uint8_t *IF_RESTRICT valid,
+                             size_t vstride, int hok, VU16 *IF_RESTRICT out)
+{
+  // The sums (below 2^16) go through the runs by value: by reference they would have a home
+  // in memory that the byte loads may alias, and GCC then stored them every row
+  auto run = [&](auto kValid, auto kAll, size_t q0, size_t q1, BardSums acc) IF_LAMBDA_INLINE
+  {
+    const uint8_t *IF_RESTRICT rb = C.base + C.row0 + (int64_t)q0 * C.rowstep;
+    for (size_t q = q0; q < q1; ++q, rb += C.rowstep)
+    {
+      const BardRow r = bard<decltype(kValid)::value, decltype(kAll)::value, UNIT>(
+          rb, C.tapcol, C.rs, hn::LoadU(d8, rb + tm), mesh1, valid, vstride, hok, C.vok[q]);
+      const auto k = hn::BitCast(di8, r.keep);
+      acc.b[0] = hn::Add(acc.b[0], hn::SatWidenMulPairwiseAdd(d16, r.keep, k)); // cover: 1 * 1
+      for (int j = 1; j < BARD_NMAP; ++j)
+        acc.b[j] = hn::Add(acc.b[j], hn::SatWidenMulPairwiseAdd(d16, r.map[j - 1], k));
+    }
+    return acc;
+  };
+  BardSums acc;
+  for (int j = 0; j < BARD_NMAP; ++j) acc.b[j] = hn::Zero(d16);
+  // The rows whose lags all fit the image are one run (vok is monotone in from each image
+  // edge), walked without a test per lag; the rest, at the image's top and bottom, with the tests
+  size_t q0 = 0, q1 = C.nr;
+  if (C.allok)
+  {
+    while (q0 < q1 && C.vok[q0] != hok) ++q0;
+    while (q1 > q0 && C.vok[q1 - 1] != hok) --q1;
+  }
+  else
+    q1 = q0; // no run without a test
+  if (valid)
+  {
+    acc = run(std::true_type(), std::false_type(), 0, q0, acc);
+    acc = run(std::true_type(), std::true_type(), q0, q1, acc);
+    acc = run(std::true_type(), std::false_type(), q1, C.nr, acc);
+  }
+  else
+  {
+    acc = run(std::false_type(), std::false_type(), 0, q0, acc);
+    acc = run(std::false_type(), std::true_type(), q0, q1, acc);
+    acc = run(std::false_type(), std::false_type(), q1, C.nr, acc);
+  }
+  for (int j = 0; j < BARD_NMAP; ++j) out[j] = hn::BitCast(du16, acc.b[j]);
 }
 
 // Four times the |grad|^2 past each bin-boundary ray of a cell, in ray order, from its ray
