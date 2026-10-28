@@ -750,7 +750,8 @@ HWY_INLINE hn::VFromD<D64x4> to4(V v)
   }
 }
 #endif
-HWY_INLINE void fold_cell(const Acc &A, bool msk, V8 mv, bool add, int64_t *IF_RESTRICT cb)
+HWY_INLINE void fold_cell(const Acc &A, bool msk, V8 mv, bool add, int64_t *IF_RESTRICT cb,
+                          size_t kst) // the slots kst apart: one vector store where contiguous
 {
   auto wide = [&](int t) -> V64 // kind t's lanes as int64 (not yet reduced)
   {
@@ -788,7 +789,17 @@ HWY_INLINE void fold_cell(const Acc &A, bool msk, V8 mv, bool add, int64_t *IF_R
       const auto ce = hn::Add(hn::InterleaveLower(d4, c, e), hn::InterleaveUpper(d4, c, e));
       auto r = hn::Add(hn::ConcatLowerLower(d4, ce, ab), hn::ConcatUpperUpper(d4, ce, ab));
       int64_t *IF_RESTRICT dst = cb + t;
-      if (t + 4 <= K_N)
+      if (kst != 1) // kinds apart (a group of several blocks' cells): a lane at a time
+      {
+        int64_t lane[4];
+        hn::StoreU(r, d4, lane);
+        for (int j = 0; j < 4 && t + j < K_N; ++j)
+        {
+          int64_t *IF_RESTRICT p = cb + (size_t)(t + j) * kst;
+          *p = add ? *p + lane[j] : lane[j];
+        }
+      }
+      else if (t + 4 <= K_N)
       {
         if (add) r = hn::Add(r, hn::LoadU(d4, dst));
         hn::StoreU(r, d4, dst);
@@ -806,7 +817,7 @@ HWY_INLINE void fold_cell(const Acc &A, bool msk, V8 mv, bool add, int64_t *IF_R
   for (int t = 0; t < K_N; ++t)
   {
     const int64_t total = hn::ReduceSum(d64, wide(t));
-    cb[t] = add ? cb[t] + total : total;
+    cb[t * kst] = add ? cb[t * kst] + total : total;
   }
 }
 
@@ -2490,16 +2501,22 @@ class FeatureComputer
     // When a block holds whole cells and the cell row is one chunk of rows, a block finishes
     // its cells: they are flushed at once from a block's worth of sums that never leaves L1.
     // Otherwise the sums are kept for the whole cell row and flushed at its end.
-    const bool local = multi_ && rws.size() <= (size_t)KROWS;
+    const bool local = rws.size() <= (size_t)KROWS;
     const int64_t n = (int64_t)rws.size() * ncols_; // samples per cell, the same for the whole row
-    // every channel in one pass of the blocks, and blocks of enough cells to fill derive's vectors
-    const bool derives = stream_ && local && group_ == c_ && block_cells_ >= (size_t)LD;
-    const size_t nxs = local ? block_cells_ | 1 : cells_stride(); // never above cells_stride()
-    // A block's sums are contiguous per kind across its cells (what derive_block and the roll-up
-    // read) when it holds several; a block of one cell writes its kinds contiguously instead, so
-    // that the fold touches five cache lines per block and not one per kind (which, over a cell
-    // row, evicted block()'s row buffers from L1).
-    const size_t kst = multi_ ? nxs : 1, cst = multi_ ? 1 : (size_t)K_N;
+    // every channel in one pass of the blocks: a block's cells then derive as they are folded
+    // (a block of one or two cells fills a quarter or half of derive's vectors, which still
+    // costs a fraction of flushing them to slots and gathering those back)
+    const bool derives = stream_ && local && group_ == c_;
+    // The cells folded, derived and rolled up together: a block's, or as many blocks' as fill
+    // derive's vectors, so that a block of one or two cells is not derived at a quarter or half
+    // of a vector and rolls up through the vector pair path. Their sums are contiguous per kind
+    // (what derive_block and the roll-up read); a row of cells kept to the end (local == false,
+    // cells taller than a chunk) keeps the whole-row layout, a block of one cell's kinds
+    // contiguous there, so that its fold touches five cache lines per block and not one per
+    // kind (which, over a cell row, evicted block()'s row buffers from L1).
+    const size_t group = local ? std::max(block_cells_, (size_t)LD) : 1;
+    const size_t nxs = local ? group | 1 : cells_stride(); // never above cells_stride()
+    const size_t kst = multi_ || local ? nxs : 1, cst = multi_ || local ? 1 : (size_t)K_N;
     const size_t pstride = (size_t)wrows_ * (size_t)s.row_stride, lanes = lanes_;
     V16 rays[HB - 1];
     for (int j = 0; j < HB - 1; ++j)
@@ -2551,7 +2568,7 @@ class FeatureComputer
              x0 += multi_ ? N : (size_t)cw_, cell += block_cells_)
           for (size_t xv = 0; xv < (multi_ ? N : (size_t)cw_); xv += N)
           {
-            const size_t x = x0 + xv, e0 = local ? 0 : cell; // cell == x0 / cw_
+            const size_t x = x0 + xv, e0 = local ? cell % group : cell; // cell == x0 / cw_
             // Blocks that span cells can overrun the row: the surplus lanes are masked off too.
             const bool tail = multi_ && x + N > lanes, msk = masked_ || tail;
             const uint8_t *IF_RESTRICT mask = tail ? ktail_.data() : kmask_.data() + xv;
@@ -2586,9 +2603,9 @@ class FeatureComputer
                     ? block<false, true>(C, mask, vx, bvalid_stride_, bard_lagmask_, rays, A)
                     : block<false, false>(C, mask, vx, bvalid_stride_, bard_lagmask_, rays, A);
               int64_t *IF_RESTRICT cb = s.cells.data() + (size_t)(k0 + k) * K_N * nxs;
-              if (!multi_) // one cell: its kinds are contiguous (kst == 1), at[] all the cell
+              if (!multi_) // one cell (at[] all the same): its kinds kst apart
               {
-                fold_cell(A, msk, mv, adds[0], cb + at[0] * cst); // (the first part's flag)
+                fold_cell(A, msk, mv, adds[0], cb + at[0] * cst, kst); // (the first part's flag)
                 continue;
               }
               for (int t = K_U8; t < K_N; ++t)
@@ -2652,9 +2669,10 @@ class FeatureComputer
               if (FOLDH) fold_hog_multi(A, g, adds, at, cb, kst, cst);
 #endif
             }
-            if (local)
+            if (local && xv + N >= (multi_ ? N : (size_t)cw_) && // the group's last block
+                (e0 + block_cells_ >= group || cell + block_cells_ >= nfx))
             {
-              const size_t e = cell, cells = std::min(block_cells_, nfx - e);
+              const size_t e = cell - e0, cells = std::min(group, nfx - e);
               if (!(derives && rolls)) flush(s.cells.data(), nxs, nxs, 1, e, cells, k0, G, n, dst);
               if (derives)
               {
@@ -3674,8 +3692,7 @@ public:
         tapcol_[4 + 2 * j] = col(BARD_LAGS[j]);
       }
       // when cell_row() derives by the block, and there is a level for the sums to go up to
-      rolls_ = multi_ && N / cw_ >= LD && group_ == c_ && levels_.size() > 1 &&
-               (h_ / levels_[0].ny + sy_ - 1) / sy_ <= KROWS;
+      rolls_ = group_ == c_ && levels_.size() > 1 && (h_ / levels_[0].ny + sy_ - 1) / sy_ <= KROWS;
       for (int i = 0; i < (w_ / phases_) % N; ++i) ktail_[i] = kmask_[i];
     }
     // A lag contributes on the horizontal axis only where BOTH its taps are inside the
@@ -3791,7 +3808,10 @@ public:
       s.rdist.assign(s.rdn.size() * rd_stride_, 0);
       s.resp.assign(rd_stride_ * NRESP * 2 * hn::Lanes(d16) + 32, 0); // (+ alignment slack)
       s.hbuf.assign(sub_rows_ * 2 * 2 * hn::Lanes(d32) + 16, 0);
-      s.cells.assign((size_t)c_ * K_N * cells_stride() + N, 0);
+      // the cell row's sums, or a group of cells' (cell_row(): the wider of the two strides)
+      s.cells.assign(
+          (size_t)c_ * K_N * std::max(cells_stride(), std::max(block_cells_, (size_t)LD) | 1) + N,
+          0);
       s.phase_stride = pstride_;
       s.row_stride = s.phase_stride * phases_;
       // a slack row and block so the final vector's overrun stays inside the allocation
