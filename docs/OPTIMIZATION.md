@@ -634,6 +634,17 @@ of per-cell work had measured as the step-13 numbers; which of the two a deploym
 depends on what shares its cores, and the instruction count is the one number that does not
 depend on that.
 
+Tried after step 14 and reverted, by instruction count on the symbol build: for one-cell
+blocks, the two halves of the energy and Laplacian phases and the four quarters of the HOG
+sharing one set of accumulators in one loop each (every lane is the cell's; any two lanes
+sum within 32 bits, four HOG quarters within 2³⁰), to save five loop exits per sub-chunk and
+the accumulators' round trips through `Acc`. Bit-exact, but GCC interleaves the unrolled
+parts and spills: the HOG loop went from 4 × 34 instructions a row to 174 with 43 spill
+moves, the Laplacian from 92 per two rows to 101 with 22, the energies from 110 to 114; a
+rolled inner loop over the quarters (`_Pragma("GCC unroll 1")`) has no spills but 42
+instructions a quarter row for its addressing. The separate loops stay. Also measured and
+not taken: clang 14 on the same source (equal at 32 px cells, +15% at 8 px cells, stride 2).
+
 ## What did not work
 
 * **Transposing cell sums into slots with SIMD** — slower, twice. The eventual answer was not
