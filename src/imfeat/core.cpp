@@ -1823,7 +1823,7 @@ IF_STRICT_FN HWY_NOINLINE void area_round(const float *IF_RESTRICT sum, int n,
   for (; i + hn::Lanes(df) <= (size_t)n; i += hn::Lanes(df))
   {
     const auto r = hn::NearestInt(hn::LoadU(df, sum + i));
-    hn::StoreU(hn::DemoteTo(du, hn::Min(hn::Max(r, hn::Zero(di)), hn::Set(di, 255))), du, out + i);
+    hn::StoreU(hn::DemoteTo(du, r), du, out + i); // (the pack saturates: that is the clamp)
   }
   for (; i < (size_t)n; ++i)
   {
@@ -1853,7 +1853,7 @@ IF_STRICT_FN HWY_NOINLINE void area_finish(const float *const *IF_RESTRICT rows,
     if (ntaps > 1) sum = hn::Add(sum, hn::Mul(b1, hn::LoadU(df, rows[1] + i)));
     if (ntaps > 2) sum = hn::Add(sum, hn::Mul(b2, hn::LoadU(df, rows[2] + i)));
     const auto r = hn::ConvertInRangeTo(di, hn::Round(sum)); // in [0, 256): no overflow fix-up
-    hn::StoreU(hn::DemoteTo(du, hn::Min(hn::Max(r, hn::Zero(di)), hn::Set(di, 255))), du, out + i);
+    hn::StoreU(hn::DemoteTo(du, r), du, out + i); // (the pack saturates: that is the clamp)
   }
   for (; i < (size_t)n; ++i)
   {
@@ -1884,7 +1884,7 @@ IF_STRICT_FN HWY_NOINLINE void area_int_round(const int32_t *IF_RESTRICT sum, in
     const auto v = hn::LoadU(di, sum + i);
     const auto r = half_up_2x2 ? hn::ShiftRight<2>(hn::Add(v, hn::Set(di, 2)))
                                : hn::NearestInt(hn::Mul(hn::ConvertTo(df, v), s));
-    hn::StoreU(hn::DemoteTo(du, hn::Min(hn::Max(r, hn::Zero(di)), hn::Set(di, 255))), du, out + i);
+    hn::StoreU(hn::DemoteTo(du, r), du, out + i); // (the pack saturates: that is the clamp)
   }
   for (; i < (size_t)n; ++i)
   {

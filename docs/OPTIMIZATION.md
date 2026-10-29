@@ -117,6 +117,7 @@ Chronologically. Times are single-thread `features()`; instruction counts are pe
 | 22 | Three items from a cycle profile per loop set against the instruction profile (where cycles outrun instructions, something stalls): the three-channel gather, where the frame is first read and its loads waited, asks for the lines 768 bytes on; the resize's finish converts without Highway's overflow fix-up (the sum is a weighted mean of bytes, so in range); a multi-cell block's byte and bar-map kinds decide the block width once outside the kinds loop instead of per kind | Alone, pinned A/B/B/A on the gate's 1080p frame: the prefetch −1.1%, −0.9%, −0.9%; the finish −0.5%, −0.4%; the kinds loop −0.6%, −1.2% (headline −0.7%). Together: the gate −0.0% and −0.4% (medians −0.2%, −1.0%), two threads −0.5%, the headline −0.7%; the module's instructions per two gate frames 142.7 M → 139.5 M (−2.2%). Bit-identical on the three builds |
 | 23 | The finest level's records prefetched two groups ahead of the derive's stores, and the resize's horizontal pass testing its store bound once per group instead of once per plane store (details below) | Judged by cycles per loop, not the frame: the scatter loop 506 → 282 samples of 23,171 (−1.0% of the module), the prefetches free in the derive loop; the bound test within run noise, −1.5% of the module's instructions per two gate frames with it (139.9 M → 137.8 M). Wall clock, pinned A/B/B/A: the gate −2.4%, the headline −1.1%. Bit-identical on the three builds |
 | 24 | Cells derived and rolled up in groups of two vectors (eight) instead of one, with the group's kind stride a whole cache line: the roll-up writes a whole vector of parents per kind and touches each kind's line of the level-1 row (larger than L1 at the gate's sizes) half as often (details below) | By loop cycles: the roll-up loops 553 → 370 samples of 22,472 (−0.8% of the module), the folds unchanged once the stride was even (at the odd stride of 9 they had gained 100); the module's instructions per two gate frames 137.8 M → 136.6 M (−0.9%). Wall clock, pinned A/B/B/A: the gate −1.7%, 16 px cells −1.7%, the headline −0.6%. Bit-identical on the three builds |
+| 25 | The resize's rounding functions store through the saturating pack alone: the explicit clamp to [0, 255] before `DemoteTo` was the pack's own saturation done twice | By loop cycles, two runs each: the finish loop 1605 → 1351 and 1562 → 1353 samples (−0.65% of the module), the module's instructions per two gate frames 136.6 M → 135.7 M (−0.65%); the gate −1.7% pinned A/B/B/A. Byte-identical to cv2 on the three builds |
 | 19 | The level-1 roll-up two kinds per even/odd lane add (a group's one vector of children, both kinds' parents in one vector), and the finest level's summary folded once per cell row instead of once per group of four cells, the same cells in the same order (details below) | The gate's pass (1024×576, six levels from 16×9 px cells), pinned A/B/B/A, 16 rounds: 4.09 → 3.87 ms (−5.4%); 16 px cells at 1024², −3.2%; the headline, −0.2% (its roll-up and summary are under 2% of it). Instructions per two gate frames 124.0 M → 117.6 M; the roll-up loops 6.2 M → 2.7 M, the summary's 6.3 M → 4.3 M. Bit-identical on the three builds |
 | 18 | The resize's finish in one pass: with three resampled rows cached, a destination row's (up to three) tap rows are summed in tap order, rounded and stored as bytes in one sweep instead of a scaled copy, a read-modify-write pass per tap row and a rounding pass (details below, after step 17's) | 1080p → 1024×576, the resize 1.98 → 1.66 ms (−16.5%); 720p → 512×320, −4.6%; the gate's 1080p frame 6.59 → 6.16 ms (−6.6%). Bit-identical on the three builds |
 | 17 | The fused INTER_AREA resize's horizontal pass over all of a row's planes at once: a group's tap patterns and weights loaded once and the loop's bookkeeping shared across the (up to four) planes, each plane's products and sums the same in the same order (details below, after step 16) | The gate's 1080p → 1024×576 HSV frame, pinned A/B/B/A, one thread: 7.18 → 6.84 ms (−4.7%); the resize alone 2.21 → 1.90 ms (−13.7%) at that size and 0.96 → 0.74 (−22.7%) at 720p → 512×320. Bit-identical on the three builds; the resize tests against cv2 pass |
@@ -1117,6 +1118,22 @@ recompiled the multi-cell fold loops around it larger (one +40%, a new 434-instr
 loop), since `cell_row` holds every phase inlined and a pointer kept live across its block
 loop changes the allocation of all of them. Reverted. A change inside `cell_row` has to be
 judged on every configuration's loops, not only the one it targets.
+
+**Step 25, the clamp the pack already does (October 2026).** The resize's finish rounds a
+weighted mean of bytes to int32 and stores it as bytes; it clamped to [0, 255] first with a
+`Min` and a `Max`, then narrowed with `DemoteTo`, whose contract (and whose x86 form, a
+signed pack to 16 bits then an unsigned pack to 8) saturates to exactly that range. The
+clamp goes, in the finish and in the two other rounding functions written the same way
+(the generic multi-tap finish and the whole-number-ratio one): two instructions of seventeen
+per eight outputs. By loop cycles, two runs each: the finish loop 1605 → 1351 and 1562 →
+1353 samples (−0.65% of the module), the instructions per two gate frames 136.6 M → 135.7 M;
+the gate 5.30 → 5.21 ms (−1.7%) pinned A/B/B/A. Every resize byte identical to cv2 on the
+three builds. Tried beside it and left: the gather's prefetch distance doubled to 1536
+bytes, +227 and +88 samples on its loop in two runs, so 768 stays. And a calibration of the
+judge itself: two builds of the same source, profiled in one session under this host's load,
+differed by up to 3.6% on single large loops and 0.8% on the module, so an item under 1% of
+the module needs the two runs each that the finish got, and the instruction count beside
+them.
 
 Where the single thread stands after step 15: 1.75× the original at the headline
 configuration (7.51 → 4.28 ms pinned on a quiet core), 1.88× at 128 px cells, 1.72× with one

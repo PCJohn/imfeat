@@ -397,7 +397,8 @@ bar-detector corner cases that were bugs. The short version, with the full log i
   loop −44%) and the resize's store bound tested once per group, −1.5% of the instructions
   more. Step 24 derives and rolls up cells eight at a time with the group's kind stride a
   whole cache line, so the roll-up touches each kind's line of the level-1 row half as often:
-  the gate −1.7%. The log says what each stage costs now, why
+  the gate −1.7%. Step 25 drops the resize's explicit clamp before the saturating pack,
+  another −1.7% on the gate. The log says what each stage costs now, why
   the kernel is at the practical floor of this core, and how to measure on a machine that is
   not quiet.
 
