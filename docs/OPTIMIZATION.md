@@ -1204,8 +1204,14 @@ two threads −10.2% (2.98 → 2.67), four threads −11.8% (1.62 → 1.42); the
 Against the original: 8.43 / 4.46 / 2.76 → 4.82 / 2.53 / 1.45 ms, 1.75× / 1.76× / 1.91×, so
 no thread count crosses 2×, and the single thread pays. The module's instruction count rose
 only 0.2%, so the single-thread cost is the per-row accumulators (about 125 rows × 4 KB at
-the gate against six sets before) and placement, not work. Reverted the same hour; the
-patch is in the session scratchpad as `summary_rows.patch`. The bit-exact contract stands.
+the gate against six sets before) and placement, not work. On 1,914 real photographs (the
+gate configuration under the `"pow2-fit"` thumbnail) the float32 feature summaries did not
+change in any of their 1.72 M lanes, the float32 rounding absorbing the float64 sums' last
+bits; only the float64 moment summaries moved, the means by at most 9e-13 relative and the
+standard deviations by at most 1.5e-8 (three lanes above 1e-9). Reverted the same hour; the
+patch is in the session scratchpad as `summary_rows.patch`. The decision: a change to the
+outputs would have to pay across the board, the single thread included, and this one costs
+the single thread; the bit-exact contract stands.
 
 Where the single thread stands after step 15: 1.75× the original at the headline
 configuration (7.51 → 4.28 ms pinned on a quiet core), 1.88× at 128 px cells, 1.72× with one
@@ -1423,8 +1429,9 @@ float64 moments move by at most one unit in the last place when the code around 
 * **A summary independent of the band split** (sum per cell row, then the rows in order), so
   that threads can share it. Built and measured after step 27 (see there): −10% at two
   threads, −12% at four, +2% at one, 1.91× the original at four threads, and the summary
-  means and standard deviations move (the stds by up to 4e-9 relative). Reverted: it does
-  not reach 2× and it breaks the bit-exact contract.
+  means and standard deviations move (on real photographs only the float64 moment rows, the
+  stds by up to 1.5e-8 relative). Reverted: it does not reach 2×, it costs the single
+  thread, and it breaks the bit-exact contract.
 * **int32 cell sums where a level's sample count bounds them** (all but `Σw⁴` and `Σg⁴` at
   typical finest levels): halves the per-cell data volume; an estimated −8% at small cells.
 * **A batched fold.** Done in step 13, with portable ops after all (`fold_cell`,
