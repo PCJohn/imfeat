@@ -372,9 +372,12 @@ bar-detector corner cases that were bugs. The short version, with the full log i
   detector's accumulators out of memory, then rewrites the stride-1 energy phase as three
   chunk-wide product sums per response column: 1.75× over the starting point on a quiet core
   (7.51 → 4.28 ms pinned; 1.88× at 128 px cells, 1.72× with one channel), bit-identical, and
-  the same ratio at 2 and 4 threads (3.74 → 2.14 and 1.97 → 1.15 ms). The log says what each
-  stage costs now, why the kernel is at the practical floor of this core, and how to measure
-  on a machine that is not quiet.
+  the same ratio at 2 and 4 threads (3.74 → 2.14 and 1.97 → 1.15 ms). Step 16 takes the
+  fused HSV conversion's table step down to one rounding (a short proof that the float guess
+  always rounds to OpenCV's table value): HSV frames another −5% at 1024², the conversion
+  itself −30%, exact on every one of the 2²⁴ colours. The log says what each stage costs now,
+  why the kernel is at the practical floor of this core, and how to measure on a machine
+  that is not quiet.
 
 ---
 

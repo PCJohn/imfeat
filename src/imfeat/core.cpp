@@ -1341,29 +1341,20 @@ HWY_INLINE VF hsv_recip(VF p)
   return hn::Div(hn::Set(df, 1.0f), p);
 }
 
-// (NUM / x) rounded, for x in [1, 255], from a float guess g of the quotient within 1/2 of it
-// (hsv_lanes' guesses are within 1/8): floor(g) is the answer or one less, and the remainder
-// NUM - floor(g) * x says which (it is above x/2 exactly when one less). The remainder needs
-// an exact NUM - q * x: an fma where there is one (the product has up to 28 bits, the
-// difference at most 9), 32-bit integers otherwise. The rounded value returns as a float,
-// which the fixed-point product wants.
+// (NUM / x) rounded half up, for x in [1, 255], from a float guess g of the quotient within
+// 2^-23 of it (relative): the nearest integer to g. The quotient is never a half-integer
+// (2 NUM / x odd would need x >= 8192) and is at least 1 / (2x) from the nearest one (2 (NUM
+// mod x) - x is a nonzero integer), while g is at most NUM 2^-23 / x from it; the ratio of
+// the two, 2 NUM 2^-23, is 0.25 for the saturation table and 0.03 for the hue table, so
+// rounding g lands on the table value with a margin, on any IEEE target. The exhaustive
+// colour test holds every target to it. The value returns as a float, which the
+// fixed-point product wants.
 template <int32_t NUM>
-HWY_INLINE VF hsv_table(VF g, VF x, V32 xi)
+HWY_INLINE VF hsv_table(VF g)
 {
   IF_STRICT_BODY
-  const DF df;
-  const VF q = hn::Floor(g);
-#if HWY_NATIVE_FMA
-  (void)xi;
-  const VF rem = hn::NegMulAdd(q, x, hn::Set(df, (float)NUM));
-  return hn::Add(q, hn::IfThenElseZero(hn::Gt(hn::Add(rem, rem), x), hn::Set(df, 1.0f)));
-#else
-  (void)x;
-  V32 qi = hn::ConvertInRangeTo(d32, q);
-  const V32 rem = hn::Sub(hn::Set(d32, NUM), hn::Mul(qi, xi));
-  qi = hn::Sub(qi, hn::VecFromMask(d32, hn::Gt(hn::Add(rem, rem), xi))); // - (-1) where true
-  return hn::ConvertTo(df, qi);
-#endif
+  static_assert(2.0 * NUM * (1.0 / 8388608.0) < 0.5, "the guess rounds to the table value");
+  return hn::Round(g);
 }
 
 // Eight (or more) pixels' s and h -- OpenCV's integers, in float arithmetic that is exact at
@@ -1372,8 +1363,8 @@ HWY_INLINE VF hsv_table(VF g, VF x, V32 xi)
 // exact; and the final >> 12 is the integer shift, which floors like OpenCV's. Both table
 // values share one reciprocal, 1 / (v * diff): sdiv = SNUM * diff * r, hdiv = HNUM * v * r,
 // where SNUM * diff and HNUM * v are exact (they are 2^12 * 255 * diff and 2^13 * 15 * v), so
-// each guess carries the reciprocal's rounding and one of its own: within 2^-23 relative, or
-// 1/8 of a unit at the largest table value. When diff is 0 (v too, or a grey)
+// each guess carries the reciprocal's rounding and one of its own: within 2^-23 relative,
+// which is what hsv_table needs. When diff is 0 (v too, or a grey)
 // the products that use the tables are 0, so the tables may be anything finite: the
 // reciprocal is taken of max(v * diff, 1).
 template <bool kH, bool kS>
@@ -1386,14 +1377,12 @@ HWY_INLINE void hsv_lanes(V32 v, V32 diff, V32 h6, V32 &s, V32 &h)
   const VF r = hsv_recip(hn::Max(hn::Mul(vf, dfv), hn::Set(df, 1.0f)));
   if (kS)
   {
-    const VF guess = hn::Mul(hn::Mul(hn::Set(df, (float)HSV_SNUM), dfv), r);
-    const VF sdiv = hsv_table<HSV_SNUM>(guess, vf, v);
+    const VF sdiv = hsv_table<HSV_SNUM>(hn::Mul(hn::Mul(hn::Set(df, (float)HSV_SNUM), dfv), r));
     s = hn::ShiftRight<HSV_SHIFT>(hn::ConvertInRangeTo(d32, hn::MulAdd(dfv, sdiv, half_)));
   }
   if (kH)
   {
-    const VF guess = hn::Mul(hn::Mul(hn::Set(df, (float)HSV_HNUM), vf), r);
-    const VF hdiv = hsv_table<HSV_HNUM>(guess, dfv, diff);
+    const VF hdiv = hsv_table<HSV_HNUM>(hn::Mul(hn::Mul(hn::Set(df, (float)HSV_HNUM), vf), r));
     const VF t = hn::MulAdd(hn::ConvertTo(df, h6), hdiv, half_);
     h = hn::ShiftRight<HSV_SHIFT>(hn::ConvertInRangeTo(d32, t));
   }
