@@ -1191,6 +1191,22 @@ saturating): 60 → 66 instructions, +13%. So the operation that moves to anothe
 not cost an instruction; where it does, the count wins. The HOG loop's 34 instructions and
 the bar detector's 60 are at their counts, and the LBP's one swap was the one with no cost.
 
+Tried after step 27 and reverted, the only lever above 1% left: the summary folded
+band-independently (a set of accumulators per cell row of every level, seeded at the row's
+first cell, every band folding its own rows as it derives them while they are still in its
+cache, the rows then added in order after the join; the lane-split summary job of step 21
+gone). Identical across 1–6 threads, every map, moment, hash and raw array bit-identical,
+the 740 tests passing; only the summary means and standard deviations moved, as expected:
+the means by up to 2e-14 relative (one float32 unit or less for the float32 features), the
+standard deviations by up to 4e-9 relative where the variance cancels against the mean
+squared. Pinned, A/B/B/A against step 27 on the gate: one thread +2.1% (4.77 → 4.87 ms),
+two threads −10.2% (2.98 → 2.67), four threads −11.8% (1.62 → 1.42); the headline +2.1%.
+Against the original: 8.43 / 4.46 / 2.76 → 4.82 / 2.53 / 1.45 ms, 1.75× / 1.76× / 1.91×, so
+no thread count crosses 2×, and the single thread pays. The module's instruction count rose
+only 0.2%, so the single-thread cost is the per-row accumulators (about 125 rows × 4 KB at
+the gate against six sets before) and placement, not work. Reverted the same hour; the
+patch is in the session scratchpad as `summary_rows.patch`. The bit-exact contract stands.
+
 Where the single thread stands after step 15: 1.75× the original at the headline
 configuration (7.51 → 4.28 ms pinned on a quiet core), 1.88× at 128 px cells, 1.72× with one
 channel; the per-cell-bound configurations (8 px cells at stride 2) 1.04×. The six kernel
@@ -1405,9 +1421,10 @@ float64 moments move by at most one unit in the last place when the code around 
 ## Open ideas
 
 * **A summary independent of the band split** (sum per cell row, then the rows in order), so
-  that threads can share it. Nothing at one thread; an estimated 5–15% at 2–4 threads on
-  small-cell grids; it would move `summary` means and standard deviations by one unit in the
-  last place, once. Not done.
+  that threads can share it. Built and measured after step 27 (see there): −10% at two
+  threads, −12% at four, +2% at one, 1.91× the original at four threads, and the summary
+  means and standard deviations move (the stds by up to 4e-9 relative). Reverted: it does
+  not reach 2× and it breaks the bit-exact contract.
 * **int32 cell sums where a level's sample count bounds them** (all but `Σw⁴` and `Σg⁴` at
   typical finest levels): halves the per-cell data volume; an estimated −8% at small cells.
 * **A batched fold.** Done in step 13, with portable ops after all (`fold_cell`,
