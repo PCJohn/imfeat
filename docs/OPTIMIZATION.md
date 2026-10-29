@@ -826,8 +826,12 @@ instructions a gate frame (84.7 M → 79.5 M in all, −6.1%); 1080p → 1024×5
 0.96 → 0.74 (−22.7%). The vertical accumulation (`area_vmuladd`, 4.6% of the frame) and the rounding
 (2.7%) are at their floors; what remains in the resize is the deinterleave of the source
 rows (4%) and the resampled row's store and reload between the two passes, which fusing the
-vertical accumulation into the horizontal pass would remove (two destination rows in flight;
-not done).
+vertical accumulation into the horizontal pass would remove. Tried: the resampled values
+scaled and accumulated into one or two destination rows straight from the registers (the
+row the source row ends and the one it starts, as OpenCV's mul and muladd, element by element
+the same), bit-exact and the tests passing, and slower: the resize +5% at 1080p → 1024×576
+and +10% at 720p → 512×320, the gate frame +0.6%. The read-modify-write stores inside the
+group loop cost more than the streaming pass they replaced. Reverted.
 
 Where the single thread stands after step 15: 1.75× the original at the headline
 configuration (7.51 → 4.28 ms pinned on a quiet core), 1.88× at 128 px cells, 1.72× with one
