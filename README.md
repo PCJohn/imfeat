@@ -375,9 +375,12 @@ bar-detector corner cases that were bugs. The short version, with the full log i
   the same ratio at 2 and 4 threads (3.74 → 2.14 and 1.97 → 1.15 ms). Step 16 takes the
   fused HSV conversion's table step down to one rounding (a short proof that the float guess
   always rounds to OpenCV's table value): HSV frames another −5% at 1024², the conversion
-  itself −30%, exact on every one of the 2²⁴ colours. The log says what each stage costs now,
-  why the kernel is at the practical floor of this core, and how to measure on a machine
-  that is not quiet.
+  itself −30%, exact on every one of the 2²⁴ colours. Step 17 runs the fused INTER_AREA
+  resize's horizontal pass over all of a row's planes at once (the tap patterns and weights
+  loaded once, every float the same): the resize −14% at 1080p → 1024×576 and −23% at
+  720p → 512×320, the gate's whole 1080p frame −4.7%. The log says what each stage costs
+  now, why the kernel is at the practical floor of this core, and how to measure on a
+  machine that is not quiet.
 
 ---
 

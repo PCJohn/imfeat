@@ -1693,9 +1693,12 @@ void area_hplan(const std::vector<std::vector<AreaTap>> &t, AreaHPlan &p)
 #pragma fp_contract(off)
 #endif
 // One row of one plane through the horizontal plan: dsize float32 sums of the taps, in tap order.
-template <int G>
+// P planes at once (plane q at src + q * sstride, its row at dst + q * dstride): a group's
+// patterns and weights are loaded once for all of them, and the loop's bookkeeping is shared;
+// each plane's products and sums are the same, in the same order.
+template <int G, int P>
 IF_STRICT_FN HWY_NOINLINE void area_hpass(const AreaHPlan &p, const uint8_t *IF_RESTRICT src,
-                                          float *IF_RESTRICT dst)
+                                          size_t sstride, float *IF_RESTRICT dst, size_t dstride)
 {
   IF_STRICT_BODY
   const hn::FixedTag<uint8_t, 16> dwin;
@@ -1704,21 +1707,31 @@ IF_STRICT_FN HWY_NOINLINE void area_hpass(const AreaHPlan &p, const uint8_t *IF_
   const hn::Rebind<float, decltype(dg)> df;
   for (size_t g = 0; g < (size_t)p.groups; ++g)
   {
-    const auto win = hn::LoadU(dwin, src + p.w0[g]);
+    hn::VFromD<decltype(dwin)> win[P];
+    for (int q = 0; q < P; ++q) win[q] = hn::LoadU(dwin, src + q * sstride + p.w0[g]);
     const uint8_t *IF_RESTRICT pat = p.pattern.data() + g * p.slots * 16;
     const float *IF_RESTRICT wgt = p.weight.data() + g * p.slots * G;
-    auto tap = [&](size_t k)
+    hn::VFromD<decltype(df)> acc[P];
+    for (size_t k = 0; k < (size_t)p.slots; ++k)
     {
-      const auto sel = hn::TableLookupBytesOr0(win, hn::LoadU(dwin, pat + k * 16));
-      const auto v = hn::ConvertTo(df, hn::PromoteTo(di, hn::ResizeBitCast(dg, sel)));
-      return hn::Mul(v, hn::LoadU(df, wgt + k * G)); // rounded, like OpenCV's S * alpha
-    };
-    auto acc = tap(0); // 0 + the first product is the product
-    for (size_t k = 1; k < (size_t)p.slots; ++k) acc = hn::Add(acc, tap(k));
-    if (g * G + G <= (size_t)p.dsize)
-      hn::StoreU(acc, df, dst + g * G);
-    else
-      hn::StoreN(acc, df, dst + g * G, (size_t)p.dsize - g * G);
+      const auto pk = hn::LoadU(dwin, pat + k * 16);
+      const auto wk = hn::LoadU(df, wgt + k * G);
+      for (int q = 0; q < P; ++q)
+      {
+        const auto sel = hn::TableLookupBytesOr0(win[q], pk);
+        const auto v = hn::ConvertTo(df, hn::PromoteTo(di, hn::ResizeBitCast(dg, sel)));
+        const auto prod = hn::Mul(v, wk);               // rounded, like OpenCV's S * alpha
+        acc[q] = k == 0 ? prod : hn::Add(acc[q], prod); // 0 + the first product is the product
+      }
+    }
+    for (int q = 0; q < P; ++q)
+    {
+      float *IF_RESTRICT o = dst + q * dstride + g * G;
+      if (g * G + G <= (size_t)p.dsize)
+        hn::StoreU(acc[q], df, o);
+      else
+        hn::StoreN(acc[q], df, o, (size_t)p.dsize - g * G);
+    }
   }
 }
 
@@ -1815,12 +1828,18 @@ IF_STRICT_FN HWY_NOINLINE void area_int_round(const int32_t *IF_RESTRICT sum, in
     out[i] = (uint8_t)std::min(std::max(v, 0), 255);
   }
 }
-template void area_hpass<1>(const AreaHPlan &, const uint8_t *, float *);
-template void area_hpass<2>(const AreaHPlan &, const uint8_t *, float *);
-template void area_hpass<4>(const AreaHPlan &, const uint8_t *, float *);
+#define IMFEAT_HPASS(G)                                                                            \
+  template void area_hpass<G, 1>(const AreaHPlan &, const uint8_t *, size_t, float *, size_t);     \
+  template void area_hpass<G, 2>(const AreaHPlan &, const uint8_t *, size_t, float *, size_t);     \
+  template void area_hpass<G, 3>(const AreaHPlan &, const uint8_t *, size_t, float *, size_t);     \
+  template void area_hpass<G, 4>(const AreaHPlan &, const uint8_t *, size_t, float *, size_t);
+IMFEAT_HPASS(1)
+IMFEAT_HPASS(2)
+IMFEAT_HPASS(4)
 #if HWY_MAX_BYTES >= 32
-template void area_hpass<8>(const AreaHPlan &, const uint8_t *, float *);
+IMFEAT_HPASS(8)
 #endif
+#undef IMFEAT_HPASS
 #if defined(_MSC_VER) && !defined(__clang__)
 #pragma float_control(pop)
 #pragma fp_contract(on)
@@ -1967,20 +1986,31 @@ const float *area_resampled(const AreaResizer &r, AreaScratch &s, int sy)
     if (s.hsy[c] == sy) return s.hrow[c].data();
   const int slot = s.hsy[0] < s.hsy[1] ? 0 : 1; // the older one goes
   float *out = s.hrow[slot].data();
-  for (int p = 0; p < s.planes; ++p)
+  const uint8_t *IF_RESTRICT src = s.src.data();
+  const size_t ss = (size_t)s.plane_stride, ds = (size_t)s.dw;
+  auto planes = [&](auto kG) // the planes together (up to four: the channels a thumbnail has)
   {
-    const uint8_t *IF_RESTRICT src = s.src.data() + (size_t)p * s.plane_stride;
-    float *IF_RESTRICT dst = out + (size_t)p * s.dw;
-    switch (r.hp.G)
+    constexpr int G = decltype(kG)::value;
+    switch (s.planes)
     {
-#if HWY_MAX_BYTES >= 32
-    case 8: area_hpass<8>(r.hp, src, dst); break;
-#endif
-    case 4: area_hpass<4>(r.hp, src, dst); break;
-    case 2: area_hpass<2>(r.hp, src, dst); break;
-    case 1: area_hpass<1>(r.hp, src, dst); break;
-    default: area_hpass_scalar(r.hp, src, dst); break;
+    case 1: area_hpass<G, 1>(r.hp, src, ss, out, ds); break;
+    case 2: area_hpass<G, 2>(r.hp, src, ss, out, ds); break;
+    case 3: area_hpass<G, 3>(r.hp, src, ss, out, ds); break;
+    default: area_hpass<G, 4>(r.hp, src, ss, out, ds); break;
     }
+  };
+  switch (r.hp.G)
+  {
+#if HWY_MAX_BYTES >= 32
+  case 8: planes(std::integral_constant<int, 8>()); break;
+#endif
+  case 4: planes(std::integral_constant<int, 4>()); break;
+  case 2: planes(std::integral_constant<int, 2>()); break;
+  case 1: planes(std::integral_constant<int, 1>()); break;
+  default:
+    for (int p = 0; p < s.planes; ++p)
+      area_hpass_scalar(r.hp, src + (size_t)p * ss, out + (size_t)p * ds);
+    break;
   }
   s.hsy[slot] = sy;
   return out;
