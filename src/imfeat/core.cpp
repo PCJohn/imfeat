@@ -1720,11 +1720,11 @@ IF_STRICT_FN HWY_NOINLINE void area_hpass(const AreaHPlan &p, const uint8_t *IF_
     Tab win[P];
     for (int q = 0; q < P; ++q)
     {
-      const auto w16 = hn::LoadU(dwin, src + q * sstride + p.w0[g]);
+      const uint8_t *IF_RESTRICT w = src + q * sstride + p.w0[g];
       if constexpr (kWide)
-        win[q] = hn::Combine(dpat, w16, w16);
+        win[q] = hn::LoadDup128(dpat, w); // the window in every block: one load, no shuffle
       else
-        win[q] = w16;
+        win[q] = hn::LoadU(dwin, w);
     }
     const uint8_t *IF_RESTRICT pat = p.pattern.data() + g * p.slots * 4 * G;
     const float *IF_RESTRICT wgt = p.weight.data() + g * p.slots * G;

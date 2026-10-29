@@ -862,6 +862,20 @@ against cv2 pass. Where the fused accumulation above lost by putting read-modify
 stores inside the horizontal pass, this wins by removing passes: what counts is the number
 of times a row crosses the cache, not where the arithmetic sits.
 
+Small and certain after it: the 256-bit horizontal pass loaded each plane's 16-byte window
+and duplicated it into both halves of the shuffle table with a shuffle; a broadcast-128 load
+(`LoadDup128`) does both in the load unit, one ALU operation fewer per plane and group.
+1080p → 1024×576, the resize −3% in three runs; 720p → 512×320, ±0.2%; the gate frame
+−0.3 to −0.7%. Nothing it could cost on any target (the 128-bit ones do not take the path).
+
+A note on the test suite on this host: `tests/test_resize.py` fails one of its large-image
+cases (3840×2160, 4096×3072, 3000×1050) in about one run in three, a different case each
+time, on this branch, on the build before step 18 and on the original build alike, while
+forty focused repeats of a failing size, single- and three-threaded, agree with cv2 to the
+byte and every thread of the resize has its own scratch and line buffer. It is the same
+transient memory corruption as above, on the largest arrays the tests allocate, not a race
+or a change on the branch.
+
 Where the single thread stands after step 15: 1.75× the original at the headline
 configuration (7.51 → 4.28 ms pinned on a quiet core), 1.88× at 128 px cells, 1.72× with one
 channel; the per-cell-bound configurations (8 px cells at stride 2) 1.04×. The six kernel
