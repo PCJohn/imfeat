@@ -751,6 +751,16 @@ Harvested after that and reverted, each timed pinned A/B/B/A against the build b
   other cell row: the `memmove` is 0.6% of the frame's cycles, the change ±0.1%. Reverted.
 * **`-O2` instead of `-O3`, and `-falign-loops=32`**: +0.4% and +0.9% at the headline, within
   noise at 8 px cells stride 2. The flags stay.
+* **The memory side, counted** (`perf stat`, native events, per headline frame): 20.7 M
+  data-cache accesses, 426 K fills from L2 (46 a block and chunk: the plane rows' first touch,
+  half a line a block over 40 rows), 13 K lines from beyond L2, 11 K DTLB misses, 16 K branch
+  misses (about 1% of the time). Nothing to fix there; the generic `L1-dcache-load-misses`
+  event on this CPU lands evenly on compute instructions and does not mean what its name says.
+* **`|grad|⁴` through FMA in doubles** (two promotes and two FMAs a quarter row, exact below
+  2⁵³, converted back once a chunk) instead of `pmuldq` pairs on the multiply pipe: the same
+  instruction count, bit-exact, +0.3% at the headline, +2.3% at 16 px cells, +2.7% at 8 px
+  cells stride 2 (two more live registers, two conversions a chunk). Reverted. The multiply
+  pipe is not what the HOG loop waits for.
 
 Where the single thread stands after step 15: 1.75× the original at the headline
 configuration (7.51 → 4.28 ms pinned on a quiet core), 1.88× at 128 px cells, 1.72× with one
