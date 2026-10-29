@@ -13,6 +13,7 @@
 #include <limits>
 #include <mutex>
 #include <new>
+#include <numeric>
 #include <optional>
 #include <stdexcept>
 #include <thread>
@@ -2463,11 +2464,18 @@ class FeatureComputer
     JOB_DERIVE,
     JOB_SUMMARY
   };
-  size_t sum0_cells_ = 0; // level-0 cells band 0 folded into the summary during its pass
-  // The summary split over the threads (summary_job) pays from three bands: band 0's in-band
-  // fold is a third or less of level 0's, and the tail after the join spreads over two or
-  // more threads. With two it measured even: band 0 longer by its fold, the tail no shorter.
-  bool parallel_summary() const { return bands_.size() >= 3; }
+  // The summary after the join, split over the threads by lane (summary_job): a run is one
+  // level's cells, one channel, a range of its features (or its moments), folded on thread t
+  // in cell order, so every lane's sums round as a lone thread's do. Runs are cut at
+  // multiples of 8 features -- whole vectors at any width the fold uses -- and dealt out by
+  // cumulative cells x lanes, so the threads finish together.
+  struct SumRun
+  {
+    int t, lvl, k, j0, n;
+    bool mom;
+  };
+  std::vector<SumRun> sruns_;
+  bool parallel_summary() const { return bands_.size() >= 2; }
   Job job_ = JOB_ACC;
   bool stream_ = false; // features(): the finest level is derived row by row and never stored
   bool rolls_ = false;  // ... block by block, its sums going straight up to level 1 (roll_block)
@@ -3168,10 +3176,8 @@ class FeatureComputer
     const size_t nfx = (size_t)fine.nx;
     Scratch &s = scr_[bi];
     int64_t *IF_RESTRICT hs = bi ? s.hsum.data() : hsum_.data();
-    // the summary of the cells derived here: a lone band's, or band 0's own where the summary
-    // job (summary_job) continues level 0 from band 0's last cell, folded in cell order as
-    // they come
-    const bool fold0 = bands_.size() == 1 || (parallel_summary() && bi == 0);
+    // the summary of the cells derived here: a lone band's (several fold after the join)
+    const bool fold0 = bands_.size() == 1;
     if (resize_)
     {
       // The band's rows of the thumbnail, its halo included, made up front from the frame's
@@ -3277,9 +3283,6 @@ class FeatureComputer
         stream_row(s, cy, owner, derived, fold0, hs);
     }
     if (stream_ && bands_.size() == 1) summary_write(fine);
-    // (band 0 folded every cell of its rows in order; the summary job continues from there)
-    if (stream_ && bi == 0 && parallel_summary())
-      sum0_cells_ = (size_t)(bands_[0].cy1 - bands_[0].cy0) * nfx;
   }
 
   // features(): everything the finest cell row cy is needed for, while it is still in cache.
@@ -3458,8 +3461,7 @@ class FeatureComputer
     task_rs_ = rs;
     task_cs_ = cs;
     std::fill(up_done_.begin(), up_done_.end(), (uint8_t)0);
-    summary_reset(); // every level's accumulators: band 0 starts folding level 0 as it goes
-    sum0_cells_ = 0;
+    summary_reset(); // every level's accumulators: a lone band folds level 0 as it goes
     run_job(JOB_ACC);
 
     if (hashing) // fold the bands' private hash partials; int64 sums, so still exact
@@ -3698,9 +3700,9 @@ class FeatureComputer
 
   // Per-cell derivation. Every cell writes only its own feat/mom slice, so this
   // splits over bands. The cross-cell summary fold is deliberately NOT here: its sum
-  // and sum-of-squares are float64 reductions over cells, and splitting them would
-  // reassociate the additions and make the output depend on the thread count. It stays
-  // serial in derive(), below.
+  // and sum-of-squares are float64 reductions over cells, and splitting them over cells
+  // would reassociate the additions and make the output depend on the thread count. It
+  // runs after the join, split over lanes instead (summary_job, below).
   // The cross-cell summary of a level: reset, fold a run of cells, write.
   void summary_reset()
   {
@@ -3750,26 +3752,29 @@ class FeatureComputer
                     &smsq_[bm + k * NMOM], L.sum + (NF * (size_t)c_ + k) * NST, stride);
     }
   }
-  // The summary after the join, with more than one band: level 0's cells past band 0's (band 0
-  // folded its own as it went, in order, so these continue the same sequence) on the first
-  // thread, the coarser levels whole on the others. Every level folds in cell order on one
-  // thread, as it always has; only which thread differs.
+  // The summary after the join, with more than one band: thread bi folds its runs (sruns_),
+  // each a level's cells in order over a range of lanes, as a lone thread folds them all.
   void summary_job(int bi)
   {
-    const int nb = (int)bands_.size();
-    if (bi == 0)
+    for (const SumRun &u : sruns_)
     {
-      const Level &L = levels_[0];
+      if (u.t != bi) continue;
+      const Level &L = levels_[u.lvl];
       const size_t nc = (size_t)L.ny * L.nx;
-      for (size_t cell = sum0_cells_; cell < nc; cell += SB)
-        summary_fold(L, cell, std::min(SB, nc - cell));
-      return;
-    }
-    for (size_t lvl = (size_t)bi; lvl < levels_.size(); lvl += (size_t)(nb - 1))
-    {
-      const Level &L = levels_[lvl];
-      const size_t nc = (size_t)L.ny * L.nx;
-      for (size_t cell = 0; cell < nc; cell += SB) summary_fold(L, cell, std::min(SB, nc - cell));
+      if (u.mom)
+      {
+        const size_t b = sbase(L, NMOM) + (size_t)u.k * NMOM;
+        for (size_t cell = 0; cell < nc; cell += SB)
+          fold_summary(L.mom + (cell * c_ + u.k) * NMOM, (size_t)c_ * NMOM, std::min(SB, nc - cell),
+                       NMOM, &smmn_[b], &smmx_[b], &smsm_[b], &smsq_[b]);
+      }
+      else
+      {
+        const size_t b = sbase(L, NF) + (size_t)u.k * NF + u.j0;
+        for (size_t cell = 0; cell < nc; cell += SB)
+          fold_summary(L.feat + (cell * c_ + u.k) * NMAP + u.j0, (size_t)c_ * NMAP,
+                       std::min(SB, nc - cell), u.n, &sfmn_[b], &sfmx_[b], &sfsm_[b], &sfsq_[b]);
+      }
     }
   }
 
@@ -3836,8 +3841,8 @@ class FeatureComputer
       run_job(JOB_SUMMARY);
       for (const Level &L : levels_) summary_write(L);
     }
-    else if (bands_.size() > 1)      // two bands: band 0's in-band fold would only lengthen band 0,
-      for (const Level &L : levels_) // and the serial tail is level 0's whole fold anyway
+    else if (bands_.size() > 1) // the serial fold after the join
+      for (const Level &L : levels_)
       {
         const size_t nc = (size_t)L.ny * L.nx;
         for (size_t cell = 0; cell < nc; cell += SB) summary_fold(L, cell, std::min(SB, nc - cell));
@@ -4142,6 +4147,41 @@ public:
       if (levels_.size() > 1) s.up.assign((size_t)c_ * K_N * ((size_t)levels_[1].nx + N), 0);
       if (levels_.size() > 1) up_done_.assign((size_t)levels_[1].ny, 0);
       s.graw.assign((size_t)c_ * NSUM, 0);
+    }
+    // The summary runs (summary_job): every level's lanes, finest level first, each channel's
+    // features in 8s and its moments whole, each run to the thread its midpoint falls in by
+    // cumulative size; a thread's adjacent feature runs of one channel merge into one.
+    sruns_.clear();
+    {
+      std::vector<SumRun> units;
+      std::vector<size_t> wt;
+      for (size_t lvl = 0; lvl < levels_.size(); ++lvl)
+        for (int k = 0; k < c_; ++k)
+        {
+          const size_t nc = (size_t)levels_[lvl].ny * levels_[lvl].nx;
+          for (int j = 0; j < NF; j += 8)
+          {
+            units.push_back({0, (int)lvl, k, j, std::min(8, NF - j), false});
+            wt.push_back(nc * (size_t)units.back().n);
+          }
+          units.push_back({0, (int)lvl, k, 0, NMOM, true});
+          wt.push_back(nc * 8);
+        }
+      const size_t total = std::accumulate(wt.begin(), wt.end(), (size_t)0);
+      size_t acc = 0;
+      const size_t nbnd = bands_.size();
+      for (size_t i = 0; i < units.size(); ++i)
+      {
+        SumRun u = units[i];
+        u.t = total ? (int)std::min(nbnd - 1, (acc + wt[i] / 2) * nbnd / total) : 0;
+        acc += wt[i];
+        if (!sruns_.empty() && !u.mom && !sruns_.back().mom && sruns_.back().t == u.t &&
+            sruns_.back().lvl == u.lvl && sruns_.back().k == u.k &&
+            sruns_.back().j0 + sruns_.back().n == u.j0)
+          sruns_.back().n += u.n;
+        else
+          sruns_.push_back(u);
+      }
     }
     for (size_t b = 1; b < bands_.size(); ++b) workers_.emplace_back([this, b] { worker((int)b); });
     if (blocks_) blocks_->retire(); // arrays of the old configuration keep their blocks

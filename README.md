@@ -385,8 +385,11 @@ bar-detector corner cases that were bugs. The short version, with the full log i
   the summary once per cell row: the gate's pass −5.4%, 16 px cells −3.2%. Step 20 spreads a
   multi-band frame's summary over the threads without changing any fold's order (from three
   bands): the gate's frame −7.4% at three threads and −7.5% at four, outputs identical at
-  any thread count. The log says what each stage costs now, why the kernel is at the
-  practical floor of this core, and how to measure on a machine that is not quiet.
+  any thread count. Step 21 cuts that summary by lane instead of by level, every lane's
+  additions still in cell order on one thread: −2% more at two threads, where the whole fold
+  had been serial, flat at three and four. The log says what each stage costs now, why the
+  kernel is at the practical floor of this core, and how to measure on a machine that is not
+  quiet.
 
 ---
 
