@@ -116,6 +116,7 @@ Chronologically. Times are single-thread `features()`; instruction counts are pe
 | 21 | The summary after the join split over the threads by lane instead of by level: a run is one level's cells, one channel, a range of eight-feature groups (or its moments), folded on one thread in cell order, the runs dealt out by cumulative size; band 0's in-band share and the two-band serial fold go, so every multi-band frame takes the one path (details below) | The gate's 1080p HSV frame, pinned to as many idle cores as threads, A/B/B/A: 2 threads 2.83 → 2.77 and 2.78 → 2.71 ms (−2.1%, −2.4%); 3 and 4 threads within ±0.5% in two sessions each; 1 thread the same code. Every output identical across 1 to 6 threads on the three builds |
 | 22 | Three items from a cycle profile per loop set against the instruction profile (where cycles outrun instructions, something stalls): the three-channel gather, where the frame is first read and its loads waited, asks for the lines 768 bytes on; the resize's finish converts without Highway's overflow fix-up (the sum is a weighted mean of bytes, so in range); a multi-cell block's byte and bar-map kinds decide the block width once outside the kinds loop instead of per kind | Alone, pinned A/B/B/A on the gate's 1080p frame: the prefetch −1.1%, −0.9%, −0.9%; the finish −0.5%, −0.4%; the kinds loop −0.6%, −1.2% (headline −0.7%). Together: the gate −0.0% and −0.4% (medians −0.2%, −1.0%), two threads −0.5%, the headline −0.7%; the module's instructions per two gate frames 142.7 M → 139.5 M (−2.2%). Bit-identical on the three builds |
 | 23 | The finest level's records prefetched two groups ahead of the derive's stores, and the resize's horizontal pass testing its store bound once per group instead of once per plane store (details below) | Judged by cycles per loop, not the frame: the scatter loop 506 → 282 samples of 23,171 (−1.0% of the module), the prefetches free in the derive loop; the bound test within run noise, −1.5% of the module's instructions per two gate frames with it (139.9 M → 137.8 M). Wall clock, pinned A/B/B/A: the gate −2.4%, the headline −1.1%. Bit-identical on the three builds |
+| 24 | Cells derived and rolled up in groups of two vectors (eight) instead of one, with the group's kind stride a whole cache line: the roll-up writes a whole vector of parents per kind and touches each kind's line of the level-1 row (larger than L1 at the gate's sizes) half as often (details below) | By loop cycles: the roll-up loops 553 → 370 samples of 22,472 (−0.8% of the module), the folds unchanged once the stride was even (at the odd stride of 9 they had gained 100); the module's instructions per two gate frames 137.8 M → 136.6 M (−0.9%). Wall clock, pinned A/B/B/A: the gate −1.7%, 16 px cells −1.7%, the headline −0.6%. Bit-identical on the three builds |
 | 19 | The level-1 roll-up two kinds per even/odd lane add (a group's one vector of children, both kinds' parents in one vector), and the finest level's summary folded once per cell row instead of once per group of four cells, the same cells in the same order (details below) | The gate's pass (1024×576, six levels from 16×9 px cells), pinned A/B/B/A, 16 rounds: 4.09 → 3.87 ms (−5.4%); 16 px cells at 1024², −3.2%; the headline, −0.2% (its roll-up and summary are under 2% of it). Instructions per two gate frames 124.0 M → 117.6 M; the roll-up loops 6.2 M → 2.7 M, the summary's 6.3 M → 4.3 M. Bit-identical on the three builds |
 | 18 | The resize's finish in one pass: with three resampled rows cached, a destination row's (up to three) tap rows are summed in tap order, rounded and stored as bytes in one sweep instead of a scaled copy, a read-modify-write pass per tap row and a rounding pass (details below, after step 17's) | 1080p → 1024×576, the resize 1.98 → 1.66 ms (−16.5%); 720p → 512×320, −4.6%; the gate's 1080p frame 6.59 → 6.16 ms (−6.6%). Bit-identical on the three builds |
 | 17 | The fused INTER_AREA resize's horizontal pass over all of a row's planes at once: a group's tap patterns and weights loaded once and the loop's bookkeeping shared across the (up to four) planes, each plane's products and sums the same in the same order (details below, after step 16) | The gate's 1080p → 1024×576 HSV frame, pinned A/B/B/A, one thread: 7.18 → 6.84 ms (−4.7%); the resize alone 2.21 → 1.90 ms (−13.7%) at that size and 0.96 → 0.74 (−22.7%) at 720p → 512×320. Bit-identical on the three builds; the resize tests against cv2 pass |
@@ -1085,6 +1086,24 @@ cycles, and the module's instructions per two gate frames 139.9 M → 137.8 M (�
 two together. Wall clock, for the record: the gate 5.36 → 5.23 ms (−2.4%), the headline
 4.37 → 4.32 (−1.1%). The compiler had also already peeled the slot loop's first iteration,
 which is why step 22's peel by hand had nothing to gain.
+
+**Step 24, groups of eight (October 2026).** The per-loop table at HEAD put the level-1
+roll-up (`pair_up`, `roll_block`) at 3.5% of the gate's cycles for 2.5% of its instructions,
+stalling on its read-modify-writes: at 16 px cells the level-1 row is 132 kinds × 36 parents
+of int64, 38 KB, more than L1, and every group of four finest cells touched each kind's
+line once for two parents. The group is now two derive vectors, eight cells (`GROUP`), so
+a kind's line is touched once per eight cells for a whole vector of parents, through the
+path that two-cell blocks of four-pixel cells already took; the derive walks a group one
+vector at a time as before, and the fold's cell offsets are the same arithmetic. The first
+build kept the group's odd kind stride (`group | 1` = 9, 72 bytes): the roll-up loops went
+553 → 453 samples but a fold loop went 392 → 496, its stores straddling two lines where the
+40-byte stride of a group of four had fitted one. With the stride a whole line for this group
+size (8, 64 bytes; smaller groups keep the odd stride) the roll-up loops are 370 and the
+folds are back where they were: −0.8% of the module's cycles, and −0.9% of its instructions
+per two gate frames (137.8 M → 136.6 M). Wall clock, pinned A/B/B/A: the gate 5.26 → 5.17 ms
+(−1.7%), 16 px cells at 1024² −1.7%, the headline (32 px cells, a level-1 row that fits L1)
+−0.6%. Bit-identical on the three builds and across 1–6 threads: every cell's sums are the
+same integers whichever group they are derived in.
 
 Where the single thread stands after step 15: 1.75× the original at the headline
 configuration (7.51 → 4.28 ms pinned on a quiet core), 1.88× at 128 px cells, 1.72× with one

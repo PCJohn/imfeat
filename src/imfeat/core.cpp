@@ -1070,6 +1070,10 @@ constexpr int LD = 2;
 constexpr int LD = 1;
 #endif
 using DDV = hn::FixedTag<double, LD>;
+// Cells derived and rolled up together in a cell row: two vectors of them, so that the roll-up
+// writes a whole vector of parents per kind and touches each kind's line of the level-1 row
+// half as often (that row is larger than L1 at the gate's sizes)
+constexpr size_t GROUP = 2 * LD;
 
 // Every float feature of LD cell-channels, a lane each, from their sums S (the NSUM slots, as
 // doubles), their moments M and 1/n. The scalar guards of the definitions become lane masks: a
@@ -2767,8 +2771,10 @@ class FeatureComputer
     // cells taller than a chunk) keeps the whole-row layout, a block of one cell's kinds
     // contiguous there, so that its fold touches five cache lines per block and not one per
     // kind (which, over a cell row, evicted block()'s row buffers from L1).
-    const size_t group = local ? std::max(block_cells_, (size_t)LD) : 1;
-    const size_t nxs = local ? group | 1 : cells_stride(); // never above cells_stride()
+    const size_t group = local ? std::max(block_cells_, GROUP) : 1;
+    // (a group of GROUP keeps the even stride: every kind's cells one whole line, where the odd
+    // stride of a smaller group straddled two in the folds)
+    const size_t nxs = local ? (group == GROUP ? GROUP : group | 1) : cells_stride();
     const size_t kst = multi_ || local ? nxs : 1, cst = multi_ || local ? 1 : (size_t)K_N;
     const size_t pstride = (size_t)wrows_ * (size_t)s.row_stride, lanes = lanes_;
     V16 rays[HRAYS]; // the low rays as (-cy, cx), against block()'s (|gx|, |gy|) lanes
@@ -4143,8 +4149,7 @@ public:
       s.hbuf.assign(sub_rows_ * 2 * 2 * hn::Lanes(d32) + 16, 0);
       // the cell row's sums, or a group of cells' (cell_row(): the wider of the two strides)
       s.cells.assign(
-          (size_t)c_ * K_N * std::max(cells_stride(), std::max(block_cells_, (size_t)LD) | 1) + N,
-          0);
+          (size_t)c_ * K_N * std::max(cells_stride(), std::max(block_cells_, GROUP) | 1) + N, 0);
       s.phase_stride = pstride_;
       s.row_stride = s.phase_stride * phases_;
       // a slack row and block so the final vector's overrun stays inside the allocation

@@ -395,7 +395,9 @@ bar-detector corner cases that were bugs. The short version, with the full log i
   this host's wall clock by ±1.5% and judges items of that size by the cycles of the loop
   they change instead: the derive's records prefetched ahead of their stores (the scatter
   loop −44%) and the resize's store bound tested once per group, −1.5% of the instructions
-  more. The log says what each stage costs now, why
+  more. Step 24 derives and rolls up cells eight at a time with the group's kind stride a
+  whole cache line, so the roll-up touches each kind's line of the level-1 row half as often:
+  the gate −1.7%. The log says what each stage costs now, why
   the kernel is at the practical floor of this core, and how to measure on a machine that is
   not quiet.
 
