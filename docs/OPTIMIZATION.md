@@ -712,6 +712,20 @@ the loop by value. Instructions per frame 55.5 M → 54.6 M; pinned A/B/B/A, −
 headline configuration and with one channel, neutral at 16 px cells (16-row chunks, where
 the corrections eat the saving) and at 512². Bit-identical on the three builds.
 
+Cycles against instructions, per loop, from a `perf record` of the headline frame on the
+symbol build attributed to the same back edges as the callgrind counts: the HOG loop 28.9%
+of the module's cycles for 24.5% of its instructions, LBP 15.5% for 14.4%, the energies 13.1%
+for 15.5%, the bar detector 9.1% for 10.1%, the moments 8.5% for 8.3%, the responses 5.4%
+for 6.3%. So every loop runs between 2.6 and 3.4 instructions a cycle and the HOG loop, at
+about 12 cycles a quarter row in context, is the slowest of them. Alone in a microbenchmark
+it takes 14.5 cycles a row and two rows an iteration bring it to 12.8 (11.3 with the
+`|grad|⁴` products moved out), so both were tried in the kernel: the two-row loop as the
+microbenchmark had it (74 instructions a pair, four spills beside the eight ray operands)
+measured +0.1% at the headline configuration and +1.5–3% elsewhere; with `|grad|⁴` summed in
+the energy loop instead (same lanes, same values; the HOG loop 63 a pair) +3.3% and +5.4% at
+16 px cells. In context the loop already overlaps its rows across the phase boundary, and
+the unrolled forms only add instructions. Reverted.
+
 Where the single thread stands after step 15: 1.75× the original at the headline
 configuration (7.51 → 4.28 ms pinned on a quiet core), 1.88× at 128 px cells, 1.72× with one
 channel; the per-cell-bound configurations (8 px cells at stride 2) 1.04×. The six kernel
