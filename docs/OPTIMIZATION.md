@@ -762,6 +762,33 @@ Harvested after that and reverted, each timed pinned A/B/B/A against the build b
   cells stride 2 (two more live registers, two conversions a chunk). Reverted. The multiply
   pipe is not what the HOG loop waits for.
 
+**The fused HSV conversion, measured (October 2026).** The headline benchmark runs with
+`feature_space=None`; the library's default, and the gate's operating point, is HSV, and the
+conversion costs 0.86 ms on a 4.16 ms 1024×1024×3 frame (17% on top of the pass; it was
+0.88 ms on top of the original's 7.37, untouched since step 6). Its row loop is 228
+instructions per 32 pixels at 1.9 instructions a cycle: four groups of eight lanes, each a
+chain of some forty cycles through two converts, a float division for the shared reciprocal
+1 / (v · diff), two guesses, their floor-and-remainder corrections, two fixed-point products
+and the converts back. Tried, each bit-exact on the harness and on every one of the 2²⁴
+colours against `cv2.cvtColor` (a check worth keeping: `hsv_exhaustive.py` in the session's
+notes), and timed A/B/B/A on HSV frames:
+
+* the division replaced by the hardware's reciprocal estimate refined by two Newton steps
+  (exact by `hsv_table`'s correction from any guess within half a unit): +4.3% at 1024² and
+  +3.0% at 512². With one step (12-bit estimates suffice on x86): +2.0%. The divider was
+  overlapping other work; the dependent multiply-adds are not free;
+* two blocks an iteration, so that eight chains could overlap: +0.1% and −0.7%.
+
+So the conversion stays as it is. What would move it is a formulation with fewer dependent
+operations per lane, which is a design of its own (OpenCV's tables are of a variable divisor,
+so there is no magic-number division; an 8-lane gather costs more than the division).
+
+A note on the host: three exhaustive runs on this shared machine once reported 150, 40 and
+53 differing colours with a value read back from the input array that a byte cannot hold;
+four runs of each side afterwards agreed to the pixel on all 16.7 M colours. Transient memory
+corruption on the host, not the library: every bit-exact result in this log was taken from
+comparisons that never showed a spurious difference, and the colour check is deterministic.
+
 Where the single thread stands after step 15: 1.75× the original at the headline
 configuration (7.51 → 4.28 ms pinned on a quiet core), 1.88× at 128 px cells, 1.72× with one
 channel; the per-cell-bound configurations (8 px cells at stride 2) 1.04×. The six kernel
