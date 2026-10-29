@@ -743,6 +743,14 @@ Harvested after that and reverted, each timed pinned A/B/B/A against the build b
   against 46 per two), 54.03 M → 54.18 M, and +6% at 16 px cells. Reverted.
 * The per-frame Python work is nil (cProfile: all of a frame's time is the native call), the
   trig and division samples in `perf` are the test harness making its frame once.
+* **A profile-guided build** (GCC `-fprofile-generate`, trained on six configurations,
+  `-fprofile-use -fprofile-correction`): −0.5% at the headline configuration, −2% at 16 px
+  cells and 256², +9.6% at 8 px cells stride 2, which was not in the training set. Not
+  adopted: a build tuned to a workload, and not even a clear win on it.
+* **The plane window holding two cell rows** (`wrows_` doubled), so the halo slides every
+  other cell row: the `memmove` is 0.6% of the frame's cycles, the change ±0.1%. Reverted.
+* **`-O2` instead of `-O3`, and `-falign-loops=32`**: +0.4% and +0.9% at the headline, within
+  noise at 8 px cells stride 2. The flags stay.
 
 Where the single thread stands after step 15: 1.75× the original at the headline
 configuration (7.51 → 4.28 ms pinned on a quiet core), 1.88× at 128 px cells, 1.72× with one
