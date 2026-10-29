@@ -112,6 +112,7 @@ Chronologically. Times are single-thread `features()`; instruction counts are pe
 | 10 | The kernel rewritten as register-resident phases down the rows, with row responses cached and the HOG sums signed; then, from a callgrind profile, the per-block cell sums laid out kind-contiguous and the fold's whole-vector reductions through `ReduceSum` / `SumsOf8` (details below) | Ryzen 7 3700X (AVX2, GCC 11), one thread, `features()`, 4 levels: 1024×1024×3 finest-32 stride 1, 7.44 → 5.42 ms (1.37×); 1024×1024 (C=1), 2.50 → 1.85 (1.35×); 1024×1024×3 finest-64, 8.93 → 6.80 (1.31×); 512×512×3 finest-32, 2.22 → 1.71 (1.30×); 256×256×3 finest-32, 0.81 → 0.71 (1.15×); the fused BGR → HSV pass at 1024², finest-64, 9.85 → 7.74 (1.27×). Every output bit-identical |
 | 12 | A batch of small items chosen by the per-instruction cost table of step 11 and kept or dropped by pinned A/B timing: plane rows aligned to cache lines (the left pad half a line, the stride a whole number of lines, the buffer 64-byte aligned); the 16-bit halves of a one-cell block widened by interleaving with zero instead of `pmovzx`; the bar detector's gate as a saturating subtract and min; the one-cell fold's sign extension through promotes; the moments' fourth-power pair sums widened every two rows; HOG sign masks from a compare instead of a shift | Pinned to a core, interleaved: 1024×1024×3 finest-32 stride 1, 5.38 → 4.84 ms (−10%); stride 2, 2.48 → 2.04 (−18%); 1024×1024 (C=1), 2.42 → 2.13 (−12%); finest-64, 6.81 → 6.45 (−5%); 512×512×3, 1.68 → 1.62 (−4%); 256×256×3, −1%. Every output bit-identical |
 | 14 | Cells derived and rolled up in groups of four whatever the block width (two two-cell blocks or four one-cell blocks share one kind-major sums group), so that blocks of one or two cells no longer go to slots through the scalar flush and back through scalar gathers; the two phases of a raw row split as it is gathered | Instructions per frame: 1024×1024×3 finest-32 stride 1, 63.6 M → 52.5 M (−17%); 16 px cells, −3.6%; 8 px cells at stride 2, −2.2% (the gather). Wall clock, measured only on a machine at load 20–25 with A/B/B/A ordering: within ±2% of the build before at every configuration tried. Every output bit-identical |
+| 20 | The summary of a multi-band frame spread over the threads without changing any fold's order: each level its own accumulators; from three bands, band 0 folds its share of level 0 in-band as it goes and a third job after the join folds level 0's remaining cells on the first thread and the coarser levels whole on the others (details below) | The gate's 1080p HSV frame, pinned to as many idle cores as threads, A/B/B/A: 3 threads 2.68 → 2.48 ms (−7.4%), 4 threads 2.14 → 1.98 (−7.5%); 2 threads and 1 thread on the old path, unchanged. Every output identical across 1 to 6 threads on the three builds |
 | 19 | The level-1 roll-up two kinds per even/odd lane add (a group's one vector of children, both kinds' parents in one vector), and the finest level's summary folded once per cell row instead of once per group of four cells, the same cells in the same order (details below) | The gate's pass (1024×576, six levels from 16×9 px cells), pinned A/B/B/A, 16 rounds: 4.09 → 3.87 ms (−5.4%); 16 px cells at 1024², −3.2%; the headline, −0.2% (its roll-up and summary are under 2% of it). Instructions per two gate frames 124.0 M → 117.6 M; the roll-up loops 6.2 M → 2.7 M, the summary's 6.3 M → 4.3 M. Bit-identical on the three builds |
 | 18 | The resize's finish in one pass: with three resampled rows cached, a destination row's (up to three) tap rows are summed in tap order, rounded and stored as bytes in one sweep instead of a scaled copy, a read-modify-write pass per tap row and a rounding pass (details below, after step 17's) | 1080p → 1024×576, the resize 1.98 → 1.66 ms (−16.5%); 720p → 512×320, −4.6%; the gate's 1080p frame 6.59 → 6.16 ms (−6.6%). Bit-identical on the three builds |
 | 17 | The fused INTER_AREA resize's horizontal pass over all of a row's planes at once: a group's tap patterns and weights loaded once and the loop's bookkeeping shared across the (up to four) planes, each plane's products and sums the same in the same order (details below, after step 16) | The gate's 1080p → 1024×576 HSV frame, pinned A/B/B/A, one thread: 7.18 → 6.84 ms (−4.7%); the resize alone 2.21 → 1.90 ms (−13.7%) at that size and 0.96 → 0.74 (−22.7%) at 720p → 512×320. Bit-identical on the three builds; the resize tests against cv2 pass |
@@ -938,6 +939,27 @@ with a working set of a few hundred kilobytes and no frame-sized intermediate, i
 robustness property there as much as a speed one: what is never materialised cannot be
 corrupted, and the frame-sized arrays left — the input, the thumbnail, the outputs — are
 the ones a deployment should be prepared to see flip a byte in.
+
+**Step 20, the summary across threads (October 2026).** The gate runs with threads, and at
+two to four of them the frame's serial tail is 4.5–6.4% by Amdahl (5.41 → 2.83 → 1.61 ms
+at 1, 2, 4 threads). Its one sizeable stage is the summary over every level's cells, folded
+after the join by the main thread alone when there is more than one band: a build without
+it measured −4% at two threads and −10% at four. The fold's order is the contract (cell
+order, each level a chain of float64 sums), so it cannot be split within a level; it can be
+split across levels, and level 0's chain can start early. Each level gets its own
+accumulators, reset once a frame; band 0 folds its own share of level 0 as it goes, in
+order, as a lone band always did; and a third parallel job after the derive folds level
+0's remaining cells on the first thread, continuing the same sequence, and the coarser
+levels whole on the other threads. At two bands this is even: band 0's in-band fold only
+makes it the longer band, and the tail after the join — level 0's other half — is no
+shorter than before once the wake-up is paid (+0.4%, measured). So it engages from three
+bands (`parallel_summary()`), where band 0's share is a third or less and the tail spreads:
+pinned to as many idle cores as threads, A/B/B/A, the gate's 1080p frame 2.68 → 2.48 ms at
+three threads (−7.4%) and 2.14 → 1.98 at four (−7.5%); one and two threads take exactly the
+old path. Every output is identical across 1 to 6 threads on the GCC/AVX2, clang and
+SSE4-only builds, which is the property the whole design serves. For multi-threaded timing on
+a shared machine: pin the process to as many idle physical cores as it has threads, or a
+band stalled by someone else's process swings the frame by 10%.
 
 Where the single thread stands after step 15: 1.75× the original at the headline
 configuration (7.51 → 4.28 ms pinned on a quiet core), 1.88× at 128 px cells, 1.72× with one
