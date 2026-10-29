@@ -961,6 +961,17 @@ SSE4-only builds, which is the property the whole design serves. For multi-threa
 a shared machine: pin the process to as many idle physical cores as it has threads, or a
 band stalled by someone else's process swings the frame by 10%.
 
+Looked at after step 20 and left alone: the fixed cost of a `features()` call is about 26 µs
+(a 32×32 frame, one level), of which the 21 numpy views a gate frame returns are about
+20 µs in all (a build without them: 3882 → 3866 µs on the gate's pass), 0.4%: not worth an
+API change. A 32×32 frame with one cell runs the per-row hash path (its one cell does not
+tile the 32×32 hash grid) and the pHash DCT, 55 K instructions a frame, is a fixed cost
+too; at the gate (64×64 cells) the hash grid is tiled and the DCT is 0.4%. And the HOG
+rays read once per block instead of once per quarter block and sub-chunk (the prologue 47
+→ 39 instructions, 32 fewer a block and chunk): −0.8% of the gate pass's instructions and
++1.8% of its time, twelve rounds, minima and medians agreeing; the four vectors held across
+the whole block cost the phases around them more than the copies did. Reverted.
+
 Where the single thread stands after step 15: 1.75× the original at the headline
 configuration (7.51 → 4.28 ms pinned on a quiet core), 1.88× at 128 px cells, 1.72× with one
 channel; the per-cell-bound configurations (8 px cells at stride 2) 1.04×. The six kernel
