@@ -881,6 +881,28 @@ bit-exact claim in this log rests on comparisons that never showed a spurious di
 across dozens of runs (the harness's arrays are small), and the large-array tests should
 be read on a machine whose memory passes a memtest.
 
+**The gate's pass at 16×9 px cells, measured (October 2026).** The pass alone on the
+1024×576 thumbnail with six levels is 54.5 M instructions a frame, of which the six kernel
+loops are 24.4 M (45%); the rest is per-chunk and per-cell work: the folds 4.2 M, derive
+3.5 M, the roll-ups 3.1 M, the flush to slots 2.0 M, the summary 1.6 M, the sub-chunk
+bodies 1.5 M (nine-row chunks amortise them over little), the HOG loops' prologues 0.9 M.
+Tried: the kinds folded two at a time at two-cell blocks (the byte counts and bar maps
+through one even/odd lane add, the pair and HOG kinds two per four-input reduce instead of
+two with two inputs zero): 124.0 M → 119.5 M instructions per two frames (−3.6%), bit-exact,
+and within ±1% in time on the gate pass, the gate frame, 16 px cells at 1024² and the
+headline, so reverted. What is left there is structural: the roll-ups cost 3.25 instructions
+per child cell and kind because the sums are kind-major (a cell-major layout would sum two
+cells' kinds four at a time, six times cheaper, but derive reads four cells a vector), and
+levels two and up still go to slots and back through scalar gathers where level one derives
+in its band (step 13); each a refactor with band-boundary cases, not a harvest item.
+
+**A lesson from the host.** The machine this was tuned on corrupts large allocations
+silently (above), and the code will run on machines like it. The pass's streaming design,
+with a working set of a few hundred kilobytes and no frame-sized intermediate, is a
+robustness property there as much as a speed one: what is never materialised cannot be
+corrupted, and the frame-sized arrays left — the input, the thumbnail, the outputs — are
+the ones a deployment should be prepared to see flip a byte in.
+
 Where the single thread stands after step 15: 1.75× the original at the headline
 configuration (7.51 → 4.28 ms pinned on a quiet core), 1.88× at 128 px cells, 1.72× with one
 channel; the per-cell-bound configurations (8 px cells at stride 2) 1.04×. The six kernel
