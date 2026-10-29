@@ -1105,6 +1105,19 @@ per two gate frames (137.8 M → 136.6 M). Wall clock, pinned A/B/B/A: the gate 
 −0.6%. Bit-identical on the three builds and across 1–6 threads: every cell's sums are the
 same integers whichever group they are derived in.
 
+Looked at after step 24 and left alone: the one-cell fold's lane scatter (at 32 px cells a
+block is one cell, and its 44 kinds go to a kind-major group a scalar store each: 3% of the
+headline's cycles at 1.8 cycles per instruction share). Folding each cell's kinds contiguous
+through the fold's existing vector path into a staging row and transposing the group once at
+its end (four kinds of four cells through the fold's own interleave network) took the fold's
+loops from 803 to 679 samples and the headline's instructions −0.7%, but the gate, whose
+two-cell blocks never take the path, measured +3.6%, +3.0% out of line and +1.6% with the
+fold's target chosen at run time, and the headline +1.5% in that last form: each form
+recompiled the multi-cell fold loops around it larger (one +40%, a new 434-instruction
+loop), since `cell_row` holds every phase inlined and a pointer kept live across its block
+loop changes the allocation of all of them. Reverted. A change inside `cell_row` has to be
+judged on every configuration's loops, not only the one it targets.
+
 Where the single thread stands after step 15: 1.75× the original at the headline
 configuration (7.51 → 4.28 ms pinned on a quiet core), 1.88× at 128 px cells, 1.72× with one
 channel; the per-cell-bound configurations (8 px cells at stride 2) 1.04×. The six kernel
