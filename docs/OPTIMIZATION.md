@@ -118,6 +118,7 @@ Chronologically. Times are single-thread `features()`; instruction counts are pe
 | 23 | The finest level's records prefetched two groups ahead of the derive's stores, and the resize's horizontal pass testing its store bound once per group instead of once per plane store (details below) | Judged by cycles per loop, not the frame: the scatter loop 506 → 282 samples of 23,171 (−1.0% of the module), the prefetches free in the derive loop; the bound test within run noise, −1.5% of the module's instructions per two gate frames with it (139.9 M → 137.8 M). Wall clock, pinned A/B/B/A: the gate −2.4%, the headline −1.1%. Bit-identical on the three builds |
 | 24 | Cells derived and rolled up in groups of two vectors (eight) instead of one, with the group's kind stride a whole cache line: the roll-up writes a whole vector of parents per kind and touches each kind's line of the level-1 row (larger than L1 at the gate's sizes) half as often (details below) | By loop cycles: the roll-up loops 553 → 370 samples of 22,472 (−0.8% of the module), the folds unchanged once the stride was even (at the odd stride of 9 they had gained 100); the module's instructions per two gate frames 137.8 M → 136.6 M (−0.9%). Wall clock, pinned A/B/B/A: the gate −1.7%, 16 px cells −1.7%, the headline −0.6%. Bit-identical on the three builds |
 | 25 | The resize's rounding functions store through the saturating pack alone: the explicit clamp to [0, 255] before `DemoteTo` was the pack's own saturation done twice | By loop cycles, two runs each: the finish loop 1605 → 1351 and 1562 → 1353 samples (−0.65% of the module), the module's instructions per two gate frames 136.6 M → 135.7 M (−0.65%); the gate −1.7% pinned A/B/B/A. Byte-identical to cv2 on the three builds |
+| 26 | The resize's periodicity inside the window kernel: where the ratio's period divides the group width, every group's shuffle pattern, weights and window step are the same, which the plan checks byte for byte, and those groups run with the slot tables in registers and the slot count a compile-time constant (details below) | Gate (1920 → 1024, period 8 = one group): the horizontal pass's loops 2565 → 1737 cycle samples of 21,850 in two runs (−3.7% of the module); the module's instructions per two gate frames 135.7 M → 124.5 M (−8.3%); the gate 5.10 → 4.94 ms at one thread (−3.2%) and 2.68 → 2.58 at two (−3.7%), pinned A/B/B/A. Byte-identical to cv2 on the three builds |
 | 19 | The level-1 roll-up two kinds per even/odd lane add (a group's one vector of children, both kinds' parents in one vector), and the finest level's summary folded once per cell row instead of once per group of four cells, the same cells in the same order (details below) | The gate's pass (1024×576, six levels from 16×9 px cells), pinned A/B/B/A, 16 rounds: 4.09 → 3.87 ms (−5.4%); 16 px cells at 1024², −3.2%; the headline, −0.2% (its roll-up and summary are under 2% of it). Instructions per two gate frames 124.0 M → 117.6 M; the roll-up loops 6.2 M → 2.7 M, the summary's 6.3 M → 4.3 M. Bit-identical on the three builds |
 | 18 | The resize's finish in one pass: with three resampled rows cached, a destination row's (up to three) tap rows are summed in tap order, rounded and stored as bytes in one sweep instead of a scaled copy, a read-modify-write pass per tap row and a rounding pass (details below, after step 17's) | 1080p → 1024×576, the resize 1.98 → 1.66 ms (−16.5%); 720p → 512×320, −4.6%; the gate's 1080p frame 6.59 → 6.16 ms (−6.6%). Bit-identical on the three builds |
 | 17 | The fused INTER_AREA resize's horizontal pass over all of a row's planes at once: a group's tap patterns and weights loaded once and the loop's bookkeeping shared across the (up to four) planes, each plane's products and sums the same in the same order (details below, after step 16) | The gate's 1080p → 1024×576 HSV frame, pinned A/B/B/A, one thread: 7.18 → 6.84 ms (−4.7%); the resize alone 2.21 → 1.90 ms (−13.7%) at that size and 0.96 → 0.74 (−22.7%) at 720p → 512×320. Bit-identical on the three builds; the resize tests against cv2 pass |
@@ -1135,6 +1136,29 @@ differed by up to 3.6% on single large loops and 0.8% on the module, so an item 
 the module needs the two runs each that the finish got, and the instruction count beside
 them.
 
+**Step 26, the periods inside the window kernel (October 2026).** The resize-by-periods
+kernel of the *What did not work* list was asked for again; its commit is not in the
+repository's history, and its gain had been measured against a horizontal pass that steps
+17 and 18 have since halved. What that kernel exploited, though, is in the window kernel's
+own tables: for a ratio p/q in lowest terms the taps of column qj + m are column m's moved
+pj source columns on, with the same weights, so where q divides the group width G every
+group has the same shuffle pattern and weights and a window that starts w0step further on.
+The compiled group loop reloaded all of it per group -- the plan's pointers, the slot count,
+a pattern and a weight vector per slot, with the first-slot case tested per slot -- 86
+instructions a group of which 36 were taps. The plan now checks the periodicity byte for
+byte over the full groups (pattern, weights and window step against the first group's;
+nothing is assumed from the ratio, whose tap tables come from OpenCV's double arithmetic),
+and `area_hpass` runs those groups through `area_hpass_periodic<G, P, S>`, the S slots'
+patterns and weights in registers, the window stepping by w0step, every group whole; the
+remaining groups take the loop as before. Same taps, same weights, same order, so the same
+floats, and no second kernel: 48 instructions a group. At the gate (1920 → 1024, period 8,
+one group) the horizontal pass's loops went 2565 → 1737 cycle samples of 21,850 in two runs
+(−3.7% of the module), the module's instructions per two gate frames 135.7 M → 124.5 M
+(−8.3%), and the gate 5.10 → 4.94 ms at one thread (−3.2%), 2.68 → 2.58 at two (−3.7%),
+pinned A/B/B/A. 1080p → 256×256 (period 2) and 720p → 512×320 (period 2) qualify too.
+Byte-identical to cv2 at every size of the resize tests on the GCC/AVX2, clang and SSE4
+builds; the harness and the 740 tests pass.
+
 Where the single thread stands after step 15: 1.75× the original at the headline
 configuration (7.51 → 4.28 ms pinned on a quiet core), 1.88× at 128 px cells, 1.72× with one
 channel; the per-cell-bound configurations (8 px cells at stride 2) 1.04×. The six kernel
@@ -1210,8 +1234,8 @@ this build do the frame in 0.29× the original's single-thread time.
   0.32 ms. The maintainer reverted it: the periodicity plan is a second resize kernel to
   keep correct beside the window one, for a saving that at the gate's operating point is a
   few tenths of a millisecond. The numbers stay here because the lever is real; the commit
-  (*Resize: the horizontal pass by periods in lockstep*) can be revived if the thumbnail
-  ever dominates again.
+  (*Resize: the horizontal pass by periods in lockstep*) is no longer in the repository's
+  history, and step 26 took the lever inside the window kernel instead.
 * **float16 anywhere.** Asked and answered rather than tried: the pass holds integers until
   the last step, and the few float stages (derive, summary) are float64/float32 for a
   reason; numpy float16 arithmetic on the hosts' side is 5–15× *slower* than float32 (no

@@ -398,7 +398,10 @@ bar-detector corner cases that were bugs. The short version, with the full log i
   more. Step 24 derives and rolls up cells eight at a time with the group's kind stride a
   whole cache line, so the roll-up touches each kind's line of the level-1 row half as often:
   the gate −1.7%. Step 25 drops the resize's explicit clamp before the saturating pack,
-  another −1.7% on the gate. The log says what each stage costs now, why
+  another −1.7% on the gate. Step 26 finds the resize's periodicity inside the window
+  kernel: where the ratio's period divides the group width, which the plan checks byte for
+  byte, the groups run with their slot tables in registers, −8.3% of the gate's
+  instructions and −3.2% of its time. The log says what each stage costs now, why
   the kernel is at the practical floor of this core, and how to measure on a machine that is
   not quiet.
 

@@ -1641,7 +1641,13 @@ constexpr int AREA_MAX_G = HWY_MAX_BYTES >= 32 ? 8 : 4;
 struct AreaHPlan
 {
   int G = 0, slots = 0, groups = 0, dsize = 0;
-  bool lane4 = false;           // the pattern layout (see above)
+  bool lane4 = false; // the pattern layout (see above)
+  // The taps of a ratio p/q repeat every q columns, so where q divides G every group has the
+  // same pattern and weights and its window starts w0step further on: checked byte for byte
+  // at plan time (not assumed from the ratio), and the first `pgroups` groups are then run
+  // with the tables in registers (area_hpass_periodic)
+  bool periodic = false;
+  int pgroups = 0, w0step = 0;
   std::vector<int> w0;          // [group]
   std::vector<uint8_t> pattern; // [group][slot][16], or [group][slot][4 * G] where lane4
   std::vector<float> weight;    // [group][slot][G]
@@ -1682,6 +1688,20 @@ bool area_hplan_fit(const std::vector<std::vector<AreaTap>> &t, int G, AreaHPlan
       }
     }
   }
+  p.periodic = false, p.pgroups = 0, p.w0step = 0;
+  const int full = dsize / G; // groups whose G columns all exist
+  if (full >= 2 && p.slots >= 1)
+  {
+    const size_t sb = (size_t)p.slots * pb, sw = (size_t)p.slots * G;
+    const int step = p.w0[1] - p.w0[0];
+    int n = 1;
+    for (; n < full; ++n)
+      if (p.w0[n] - p.w0[n - 1] != step ||
+          std::memcmp(p.pattern.data() + n * sb, p.pattern.data(), sb) != 0 ||
+          std::memcmp(p.weight.data() + n * sw, p.weight.data(), sw * sizeof(float)) != 0)
+        break;
+    if (n >= 2) p.periodic = true, p.pgroups = n, p.w0step = step;
+  }
   return true;
 }
 
@@ -1712,6 +1732,55 @@ void area_hplan(const std::vector<std::vector<AreaTap>> &t, AreaHPlan &p, bool l
 // P planes at once (plane q at src + q * sstride, its row at dst + q * dstride): a group's
 // patterns and weights are loaded once for all of them, and the loop's bookkeeping is shared;
 // each plane's products and sums are the same, in the same order.
+// The first p.pgroups groups of a periodic plan: the S slots' patterns and weights in
+// registers, the window stepping by w0step, every group whole. The same taps, weights and
+// order as the loop below, so the same floats.
+template <int G, int P, int S>
+IF_STRICT_FN HWY_INLINE void area_hpass_periodic(const AreaHPlan &p, const uint8_t *IF_RESTRICT src,
+                                                 size_t sstride, float *IF_RESTRICT dst,
+                                                 size_t dstride)
+{
+  IF_STRICT_BODY
+  const hn::FixedTag<uint8_t, 16> dwin;
+  const hn::FixedTag<uint8_t, 4 * G> dpat;
+  const hn::FixedTag<int32_t, G> di;
+  const hn::Rebind<float, decltype(di)> df;
+  constexpr bool kWide = 4 * G > 16;
+  using Tab = std::conditional_t<kWide, hn::VFromD<decltype(dpat)>, hn::VFromD<decltype(dwin)>>;
+  hn::VFromD<decltype(dpat)> pk[S];
+  hn::VFromD<decltype(df)> wk[S];
+  for (int k = 0; k < S; ++k)
+  {
+    pk[k] = hn::LoadU(dpat, p.pattern.data() + (size_t)k * 4 * G);
+    wk[k] = hn::LoadU(df, p.weight.data() + (size_t)k * G);
+  }
+  const uint8_t *IF_RESTRICT w = src + p.w0[0];
+  for (int g = 0; g < p.pgroups; ++g, w += p.w0step, dst += G)
+  {
+    Tab win[P];
+    for (int q = 0; q < P; ++q)
+    {
+      if constexpr (kWide)
+        win[q] = hn::LoadDup128(dpat, w + q * sstride);
+      else
+        win[q] = hn::LoadU(dwin, w + q * sstride);
+    }
+    hn::VFromD<decltype(df)> acc[P];
+    for (int q = 0; q < P; ++q)
+    {
+      const auto sel = hn::TableLookupBytesOr0(win[q], pk[0]);
+      acc[q] = hn::Mul(hn::ConvertTo(df, hn::BitCast(di, sel)), wk[0]);
+    }
+    for (int k = 1; k < S; ++k)
+      for (int q = 0; q < P; ++q)
+      {
+        const auto sel = hn::TableLookupBytesOr0(win[q], pk[k]);
+        acc[q] = hn::Add(acc[q], hn::Mul(hn::ConvertTo(df, hn::BitCast(di, sel)), wk[k]));
+      }
+    for (int q = 0; q < P; ++q) hn::StoreU(acc[q], df, dst + q * dstride);
+  }
+}
+
 template <int G, int P>
 IF_STRICT_FN HWY_NOINLINE void area_hpass(const AreaHPlan &p, const uint8_t *IF_RESTRICT src,
                                           size_t sstride, float *IF_RESTRICT dst, size_t dstride)
@@ -1726,7 +1795,19 @@ IF_STRICT_FN HWY_NOINLINE void area_hpass(const AreaHPlan &p, const uint8_t *IF_
   constexpr bool kWide = 4 * G > 16;
   using Tab = std::conditional_t<kWide, hn::VFromD<decltype(dpat)>, hn::VFromD<decltype(dwin)>>;
   const size_t gfull = (size_t)p.dsize / G; // groups whose G outputs all exist: a whole store
-  for (size_t g = 0; g < (size_t)p.groups; ++g)
+  size_t g0 = 0;
+  if (p.periodic && p.slots <= 4) // the periodic groups first, with the tables in registers
+  {
+    switch (p.slots)
+    {
+    case 1: area_hpass_periodic<G, P, 1>(p, src, sstride, dst, dstride); break;
+    case 2: area_hpass_periodic<G, P, 2>(p, src, sstride, dst, dstride); break;
+    case 3: area_hpass_periodic<G, P, 3>(p, src, sstride, dst, dstride); break;
+    default: area_hpass_periodic<G, P, 4>(p, src, sstride, dst, dstride); break;
+    }
+    g0 = (size_t)p.pgroups;
+  }
+  for (size_t g = g0; g < (size_t)p.groups; ++g)
   {
     Tab win[P];
     for (int q = 0; q < P; ++q)
