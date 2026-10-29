@@ -726,6 +726,24 @@ the energy loop instead (same lanes, same values; the HOG loop 63 a pair) +3.3% 
 16 px cells. In context the loop already overlaps its rows across the phase boundary, and
 the unrolled forms only add instructions. Reverted.
 
+Harvested after that and reverted, each timed pinned A/B/B/A against the build before it:
+
+* **A transposing fold for cell groups.** One-cell blocks in groups of four fold their
+  four-kind batches a lane at a time into the kind-major group (a stack round trip and
+  four scalar stores per batch). Folded kind-contiguous into a temp and transposed into the
+  group four kinds at a time at the group's last block: 54.57 M → 54.03 M instructions
+  (−1.0%), bit-exact — and +0.9% at the headline configuration, +1.1% with one channel,
+  neutral at 128 px cells, over 16 rounds. The same with the group's kinds 8 cells apart so
+  that every transposed store stays inside one cache line (the forwarding to
+  `derive_block`'s loads of them was the suspect): +1.2% and +1.8%. The scalar stores spread
+  over four blocks' folds and overlap the kernel; the transpose is a burst right before the
+  loads that need it. The instruction count is not the time here.
+* **The moments' fourth-power pair sums widened every four rows** instead of two (four
+  still fit unsigned 32 bits): the loop compiles no shorter (93 instructions per four rows
+  against 46 per two), 54.03 M → 54.18 M, and +6% at 16 px cells. Reverted.
+* The per-frame Python work is nil (cProfile: all of a frame's time is the native call), the
+  trig and division samples in `perf` are the test harness making its frame once.
+
 Where the single thread stands after step 15: 1.75× the original at the headline
 configuration (7.51 → 4.28 ms pinned on a quiet core), 1.88× at 128 px cells, 1.72× with one
 channel; the per-cell-bound configurations (8 px cells at stride 2) 1.04×. The six kernel
