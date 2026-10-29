@@ -794,6 +794,14 @@ itself went from 0.86 to about 0.61 ms. Exact on the harness and on every one of
 colours against `cv2.cvtColor`, on the GCC/AVX2, clang and SSE4-only builds. The proof is a
 `static_assert` on K; the colour test is what holds the targets to it.
 
+After it, the loop is 181 instructions per 32 pixels, 51 of them (31 shifts, 20 converts)
+on the one pipe this core gives both, which is likely what binds it now. The reciprocal
+estimate with one Newton step, retried on top of the rounding: +2.8% and +1.0%; the signed
+even-lane extraction as an and, xor and subtract on the logic pipes instead of two shifts:
+±0.5%. Both reverted. The loop keeps lane order through shifts and masks because shuffles
+are the scarce port on Intel cores; on this core the balance is the other way, and a
+portable version would have to cut shifts and converts outright, not move them.
+
 A note on the host: three exhaustive runs on this shared machine once reported 150, 40 and
 53 differing colours with a value read back from the input array that a byte cannot hold;
 four runs of each side afterwards agreed to the pixel on all 16.7 M colours. Transient memory
