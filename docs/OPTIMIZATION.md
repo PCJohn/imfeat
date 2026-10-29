@@ -872,9 +872,14 @@ A note on the test suite on this host: `tests/test_resize.py` fails one of its l
 cases (3840×2160, 4096×3072, 3000×1050) in about one run in three, a different case each
 time, on this branch, on the build before step 18 and on the original build alike, while
 forty focused repeats of a failing size, single- and three-threaded, agree with cv2 to the
-byte and every thread of the resize has its own scratch and line buffer. It is the same
-transient memory corruption as above, on the largest arrays the tests allocate, not a race
-or a change on the branch.
+byte and every thread of the resize has its own scratch and line buffer. Settled without
+the library: forty rounds of numpy filling a 64 MB array, copying it twice and comparing the
+copies mismatched in eleven, by 3 to 215 bytes a round, with no machine-check or memory
+error in the kernel log (the memory is not ECC). The host's RAM corrupts large allocations
+silently; the all-colours HSV test (48 MB) fails the same way about one run in three. Every
+bit-exact claim in this log rests on comparisons that never showed a spurious difference
+across dozens of runs (the harness's arrays are small), and the large-array tests should
+be read on a machine whose memory passes a memtest.
 
 Where the single thread stands after step 15: 1.75× the original at the headline
 configuration (7.51 → 4.28 ms pinned on a quiet core), 1.88× at 128 px cells, 1.72× with one
