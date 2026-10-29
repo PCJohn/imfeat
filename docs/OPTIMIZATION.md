@@ -970,7 +970,19 @@ too; at the gate (64×64 cells) the hash grid is tiled and the DCT is 0.4%. And 
 rays read once per block instead of once per quarter block and sub-chunk (the prologue 47
 → 39 instructions, 32 fewer a block and chunk): −0.8% of the gate pass's instructions and
 +1.8% of its time, twelve rounds, minima and medians agreeing; the four vectors held across
-the whole block cost the phases around them more than the copies did. Reverted.
+the whole block cost the phases around them more than the copies did. Reverted. And the
+wake-ups themselves: a worker that has finished a job parks on a condition variable, and the
+next job of the same frame follows within tens of microseconds, so each of the two or three
+dispatches a frame pays a wake-up (at two threads, a 64×64 frame measured 56 µs on one
+thread and 69 on two: the whole parallel gain and more goes to the dispatch). A bounded
+spin before parking — an atomic mirror of the epoch and of the pending count, a worker
+spinning up to 200 µs for the next job when the dispatcher says one follows in this frame,
+the caller spinning likewise for the last worker, nothing spinning between frames — was
+bit-identical across 1–6 threads and took the 64×64 frame −9% at two threads, but the gate's
+1080p frame +1.6% and +2.2% on minima at two threads in two sessions, −4.5% on the minimum
+and +0.2% on the median at three. The ceiling at the gate is about 1% (two wake-ups of
+30–40 µs in 2.9 ms), under what the host can resolve, and a spinning worker holds a core
+that on a shared machine someone else is using. Reverted.
 
 Where the single thread stands after step 15: 1.75× the original at the headline
 configuration (7.51 → 4.28 ms pinned on a quiet core), 1.88× at 128 px cells, 1.72× with one
