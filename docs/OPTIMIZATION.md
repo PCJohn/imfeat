@@ -1180,6 +1180,17 @@ only hinted at: at the headline the kernel's time is its instructions divided by
 pipes they land on can issue, so an operation rewritten as an equal number of operations on
 other pipes is a real item, and the loop's cycle samples are its judge.
 
+Looked at after step 27 and left alone, the same lens on the other loops, each a variant
+built from step 27 and profiled on the headline (a build with no change at all measured
++3% on the HOG loop in the same session, so that is the noise of one run on one loop). The
+HOG's two sign-flips per ray as a compare mask, an xor and a subtract: the loop 34 → 47
+instructions and +22% of its cycles. The LBP's seven minima as a − (a − b saturating): 79 →
+86 instructions, +10%. The LBP's bin select as a max with an and-not instead of a blend: the
+same count, +2.7%, within the noise. The bar detector's nine maxima as a + (b − a
+saturating): 60 → 66 instructions, +13%. So the operation that moves to another pipe must
+not cost an instruction; where it does, the count wins. The HOG loop's 34 instructions and
+the bar detector's 60 are at their counts, and the LBP's one swap was the one with no cost.
+
 Where the single thread stands after step 15: 1.75× the original at the headline
 configuration (7.51 → 4.28 ms pinned on a quiet core), 1.88× at 128 px cells, 1.72× with one
 channel; the per-cell-bound configurations (8 px cells at stride 2) 1.04×. The six kernel
