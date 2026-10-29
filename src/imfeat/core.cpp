@@ -1,3 +1,4 @@
+#include "hwy/cache_control.h"
 #include "hwy/highway.h"
 
 #include <nanobind/nanobind.h>
@@ -1550,6 +1551,10 @@ void gather_row(const uint8_t *IF_RESTRICT src, int64_t cs, const int64_t *IF_RE
     for (; x + N <= (size_t)w; x += N)
     {
       decltype(hn::Zero(du)) a, b, e;
+      // the frame's lines a few hundred bytes on, asked for now: this is where the frame is
+      // first read, and its loads were waiting (two a step cover every line at this stride)
+      hwy::Prefetch(src + x * 3 + 768);
+      hwy::Prefetch(src + x * 3 + 816);
       hn::LoadInterleaved3(du, src + x * 3, a, b, e);
       hn::StoreU(a, du, out + x);
       hn::StoreU(b, du, out + ostride + x);
@@ -1842,7 +1847,7 @@ IF_STRICT_FN HWY_NOINLINE void area_finish(const float *const *IF_RESTRICT rows,
     auto sum = hn::Mul(b0, hn::LoadU(df, rows[0] + i));
     if (ntaps > 1) sum = hn::Add(sum, hn::Mul(b1, hn::LoadU(df, rows[1] + i)));
     if (ntaps > 2) sum = hn::Add(sum, hn::Mul(b2, hn::LoadU(df, rows[2] + i)));
-    const auto r = hn::NearestInt(sum);
+    const auto r = hn::ConvertInRangeTo(di, hn::Round(sum)); // in [0, 256): no overflow fix-up
     hn::StoreU(hn::DemoteTo(du, hn::Min(hn::Max(r, hn::Zero(di)), hn::Set(di, 255))), du, out + i);
   }
   for (; i < (size_t)n; ++i)
@@ -2853,32 +2858,41 @@ class FeatureComputer
                 fold_cell(A, msk, mv, adds[0], cb + at[0] * cst, kst); // (the first part's flag)
                 continue;
               }
-              for (int t = K_U8; t < K_N; ++t)
-              {
-                const V8 u8 = t < K_BARD ? (msk ? hn::And(A.u8[t - K_U8], mv) : A.u8[t - K_U8])
-                                         : hn::Zero(d8);
-                if (g >= 8) // cells of whole octets: both kinds sum to uint64 lanes of 8 columns
-                {           // in one step (psadbw for the bytes), and the cells all add alike
-                  const V64 w = hn::BitCast(d64, t < K_BARD ? hn::SumsOf8(u8)
-                                                            : hn::SumsOf4(A.bard[t - K_BARD]));
-                  fold(d64, w, g / 8, adds[0], cb + t * kst + at[0] * cst);
-                  continue;
-                }
-                if (g == 4) // cells of quads: uint32 lanes of 4 columns, one a cell
+              // The byte kinds (masked on the mesh) and the bar maps: the block width decides
+              // how each kind's columns sum to cells, so it is decided once, outside the kinds
+              if (g >= 8) // cells of whole octets: both kinds sum to uint64 lanes of 8 columns
+              {           // in one step (psadbw for the bytes), and the cells all add alike
+                for (int t = K_U8; t < K_BARD; ++t)
+                  fold(d64,
+                       hn::BitCast(d64,
+                                   hn::SumsOf8(msk ? hn::And(A.u8[t - K_U8], mv) : A.u8[t - K_U8])),
+                       g / 8, adds[0], cb + t * kst + at[0] * cst);
+                for (int t = K_BARD; t < K_N; ++t)
+                  fold(d64, hn::BitCast(d64, hn::SumsOf4(A.bard[t - K_BARD])), g / 8, adds[0],
+                       cb + t * kst + at[0] * cst);
+              }
+              else if (g == 4) // cells of quads: uint32 lanes of 4 columns, one a cell
+                for (int t = K_U8; t < K_N; ++t)
                 {
-                  const auto w = t < K_BARD ? hn::SumsOf4(u8) : hn::SumsOf2(A.bard[t - K_BARD]);
+                  const auto w =
+                      t < K_BARD ? hn::SumsOf4(msk ? hn::And(A.u8[t - K_U8], mv) : A.u8[t - K_U8])
+                                 : hn::SumsOf2(A.bard[t - K_BARD]);
                   fold(d64, hn::BitCast(d64, hn::PromoteLowerTo(du64, w)), 1, adds[0],
                        cb + t * kst + at[0] * cst);
                   fold(d64, hn::BitCast(d64, hn::PromoteUpperTo(du64, w)), 1, adds[2],
                        cb + t * kst + at[2] * cst);
-                  continue;
                 }
-                const auto sums = t < K_BARD ? hn::SumsOf2(u8) : A.bard[t - K_BARD];
-                fold32<false>(hn::BitCast(d32, hn::PromoteLowerTo(du32, sums)), g / 2, adds[0],
-                              cb + t * kst + at[0] * cst);
-                fold32<false>(hn::BitCast(d32, hn::PromoteUpperTo(du32, sums)), g / 2, adds[2],
-                              cb + t * kst + at[2] * cst);
-              }
+              else
+                for (int t = K_U8; t < K_N; ++t)
+                {
+                  const auto sums =
+                      t < K_BARD ? hn::SumsOf2(msk ? hn::And(A.u8[t - K_U8], mv) : A.u8[t - K_U8])
+                                 : A.bard[t - K_BARD];
+                  fold32<false>(hn::BitCast(d32, hn::PromoteLowerTo(du32, sums)), g / 2, adds[0],
+                                cb + t * kst + at[0] * cst);
+                  fold32<false>(hn::BitCast(d32, hn::PromoteUpperTo(du32, sums)), g / 2, adds[2],
+                                cb + t * kst + at[2] * cst);
+                }
 #if HWY_MAX_BYTES >= 32 && !HWY_HAVE_SCALABLE
               if (FOLDH)
               {

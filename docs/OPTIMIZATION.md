@@ -114,6 +114,7 @@ Chronologically. Times are single-thread `features()`; instruction counts are pe
 | 14 | Cells derived and rolled up in groups of four whatever the block width (two two-cell blocks or four one-cell blocks share one kind-major sums group), so that blocks of one or two cells no longer go to slots through the scalar flush and back through scalar gathers; the two phases of a raw row split as it is gathered | Instructions per frame: 1024×1024×3 finest-32 stride 1, 63.6 M → 52.5 M (−17%); 16 px cells, −3.6%; 8 px cells at stride 2, −2.2% (the gather). Wall clock, measured only on a machine at load 20–25 with A/B/B/A ordering: within ±2% of the build before at every configuration tried. Every output bit-identical |
 | 20 | The summary of a multi-band frame spread over the threads without changing any fold's order: each level its own accumulators; from three bands, band 0 folds its share of level 0 in-band as it goes and a third job after the join folds level 0's remaining cells on the first thread and the coarser levels whole on the others (details below) | The gate's 1080p HSV frame, pinned to as many idle cores as threads, A/B/B/A: 3 threads 2.68 → 2.48 ms (−7.4%), 4 threads 2.14 → 1.98 (−7.5%); 2 threads and 1 thread on the old path, unchanged. Every output identical across 1 to 6 threads on the three builds |
 | 21 | The summary after the join split over the threads by lane instead of by level: a run is one level's cells, one channel, a range of eight-feature groups (or its moments), folded on one thread in cell order, the runs dealt out by cumulative size; band 0's in-band share and the two-band serial fold go, so every multi-band frame takes the one path (details below) | The gate's 1080p HSV frame, pinned to as many idle cores as threads, A/B/B/A: 2 threads 2.83 → 2.77 and 2.78 → 2.71 ms (−2.1%, −2.4%); 3 and 4 threads within ±0.5% in two sessions each; 1 thread the same code. Every output identical across 1 to 6 threads on the three builds |
+| 22 | Three items from a cycle profile per loop set against the instruction profile (where cycles outrun instructions, something stalls): the three-channel gather, where the frame is first read and its loads waited, asks for the lines 768 bytes on; the resize's finish converts without Highway's overflow fix-up (the sum is a weighted mean of bytes, so in range); a multi-cell block's byte and bar-map kinds decide the block width once outside the kinds loop instead of per kind | Alone, pinned A/B/B/A on the gate's 1080p frame: the prefetch −1.1%, −0.9%, −0.9%; the finish −0.5%, −0.4%; the kinds loop −0.6%, −1.2% (headline −0.7%). Together: the gate −0.0% and −0.4% (medians −0.2%, −1.0%), two threads −0.5%, the headline −0.7%; the module's instructions per two gate frames 142.7 M → 139.5 M (−2.2%). Bit-identical on the three builds |
 | 19 | The level-1 roll-up two kinds per even/odd lane add (a group's one vector of children, both kinds' parents in one vector), and the finest level's summary folded once per cell row instead of once per group of four cells, the same cells in the same order (details below) | The gate's pass (1024×576, six levels from 16×9 px cells), pinned A/B/B/A, 16 rounds: 4.09 → 3.87 ms (−5.4%); 16 px cells at 1024², −3.2%; the headline, −0.2% (its roll-up and summary are under 2% of it). Instructions per two gate frames 124.0 M → 117.6 M; the roll-up loops 6.2 M → 2.7 M, the summary's 6.3 M → 4.3 M. Bit-identical on the three builds |
 | 18 | The resize's finish in one pass: with three resampled rows cached, a destination row's (up to three) tap rows are summed in tap order, rounded and stored as bytes in one sweep instead of a scaled copy, a read-modify-write pass per tap row and a rounding pass (details below, after step 17's) | 1080p → 1024×576, the resize 1.98 → 1.66 ms (−16.5%); 720p → 512×320, −4.6%; the gate's 1080p frame 6.59 → 6.16 ms (−6.6%). Bit-identical on the three builds |
 | 17 | The fused INTER_AREA resize's horizontal pass over all of a row's planes at once: a group's tap patterns and weights loaded once and the loop's bookkeeping shared across the (up to four) planes, each plane's products and sums the same in the same order (details below, after step 16) | The gate's 1080p → 1024×576 HSV frame, pinned A/B/B/A, one thread: 7.18 → 6.84 ms (−4.7%); the resize alone 2.21 → 1.90 ms (−13.7%) at that size and 0.96 → 0.74 (−22.7%) at 720p → 512×320. Bit-identical on the three builds; the resize tests against cv2 pass |
@@ -1014,6 +1015,35 @@ prefetch of the next batch's lines (`hwy::Prefetch`, one per line per cell) did 
 +2% at four threads against the split without it, +4.8% at three, the two-thread gain gone.
 Reverted. What would fix it is folding in-band on every band, which needs per-band partial
 sums and so reassociates the additions: the one thing the contract forbids.
+
+**Step 22, cycles against instructions (October 2026).** With every loop at its instruction
+count, the next map was a cycle profile of the gate's frame (`perf record` on the symbol
+build, samples attributed to the same loop ranges as callgrind's counts) set against the
+instruction profile: a loop whose share of cycles outruns its share of instructions stalls
+on something counting cannot see. The kernel loops run at 0.8–1.15 cycles per instruction
+share and the resize's horizontal pass at 0.5–0.7; what stood out was the three-channel
+gather at 1.96 (34% of its samples on its first load: this is where the frame is first read,
+and the loads wait on memory the hardware prefetcher had not fetched), the derive's scatter
+at 1.9 (its four record stores), the fold of a multi-cell block's byte kinds at 2.3 (fifteen
+branches a block, each kind testing the block width again), the row responses at 1.6 (eight
+stores a row: the store port's floor), and the resize's finish at 1.2. Five items came out
+of it, each built alone as a variant and timed pinned A/B/B/A against the build before;
+three stayed. The gather asks for the frame's lines 768 bytes on (two prefetches a step
+cover every line at the 96-byte stride): −1.1%, −0.9% and −0.9% on the gate's frame in
+three sessions. The finish converts its rounded sum with `ConvertInRangeTo` instead of
+`NearestInt`: the sum is a weighted mean of bytes, so Highway's compare-and-blend against
+overflow was two instructions per eight outputs for nothing; −0.5% and −0.4%. The kinds
+loop decides the block width once, outside the loop over kinds, the bodies the same: −0.6%
+and −1.2% on the gate, −0.7% on the headline. Together they measured −0.0% and −0.4% on the
+gate (medians −0.2% and −1.0%), −0.5% at two threads and −0.7% on the headline, with the
+module's instructions per two gate frames 142.7 M → 139.5 M (−2.2%): less than the sum of
+the parts, never above zero in twelve runs. Reverted: the horizontal pass with its first
+slot peeled so the slot loop has no `k == 0` to test (+2.2% and +1.5% on the gate; the
+select was never the cost, the samples had skidded onto it), and the records two groups on
+prefetched ahead of the scatter's stores (−0.9% on the gate, +1.4% on the headline). A
+lesson relearnt on the way: the first versions of two items used lambdas capturing the
+block's vectors by reference, and GCC spilled them, +8.6% and +3.3%; the same code written
+out was what measured above.
 
 Where the single thread stands after step 15: 1.75× the original at the headline
 configuration (7.51 → 4.28 ms pinned on a quiet core), 1.88× at 128 px cells, 1.72× with one
