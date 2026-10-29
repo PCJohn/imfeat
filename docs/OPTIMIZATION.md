@@ -115,6 +115,7 @@ Chronologically. Times are single-thread `features()`; instruction counts are pe
 | 20 | The summary of a multi-band frame spread over the threads without changing any fold's order: each level its own accumulators; from three bands, band 0 folds its share of level 0 in-band as it goes and a third job after the join folds level 0's remaining cells on the first thread and the coarser levels whole on the others (details below) | The gate's 1080p HSV frame, pinned to as many idle cores as threads, A/B/B/A: 3 threads 2.68 → 2.48 ms (−7.4%), 4 threads 2.14 → 1.98 (−7.5%); 2 threads and 1 thread on the old path, unchanged. Every output identical across 1 to 6 threads on the three builds |
 | 21 | The summary after the join split over the threads by lane instead of by level: a run is one level's cells, one channel, a range of eight-feature groups (or its moments), folded on one thread in cell order, the runs dealt out by cumulative size; band 0's in-band share and the two-band serial fold go, so every multi-band frame takes the one path (details below) | The gate's 1080p HSV frame, pinned to as many idle cores as threads, A/B/B/A: 2 threads 2.83 → 2.77 and 2.78 → 2.71 ms (−2.1%, −2.4%); 3 and 4 threads within ±0.5% in two sessions each; 1 thread the same code. Every output identical across 1 to 6 threads on the three builds |
 | 22 | Three items from a cycle profile per loop set against the instruction profile (where cycles outrun instructions, something stalls): the three-channel gather, where the frame is first read and its loads waited, asks for the lines 768 bytes on; the resize's finish converts without Highway's overflow fix-up (the sum is a weighted mean of bytes, so in range); a multi-cell block's byte and bar-map kinds decide the block width once outside the kinds loop instead of per kind | Alone, pinned A/B/B/A on the gate's 1080p frame: the prefetch −1.1%, −0.9%, −0.9%; the finish −0.5%, −0.4%; the kinds loop −0.6%, −1.2% (headline −0.7%). Together: the gate −0.0% and −0.4% (medians −0.2%, −1.0%), two threads −0.5%, the headline −0.7%; the module's instructions per two gate frames 142.7 M → 139.5 M (−2.2%). Bit-identical on the three builds |
+| 23 | The finest level's records prefetched two groups ahead of the derive's stores, and the resize's horizontal pass testing its store bound once per group instead of once per plane store (details below) | Judged by cycles per loop, not the frame: the scatter loop 506 → 282 samples of 23,171 (−1.0% of the module), the prefetches free in the derive loop; the bound test within run noise, −1.5% of the module's instructions per two gate frames with it (139.9 M → 137.8 M). Wall clock, pinned A/B/B/A: the gate −2.4%, the headline −1.1%. Bit-identical on the three builds |
 | 19 | The level-1 roll-up two kinds per even/odd lane add (a group's one vector of children, both kinds' parents in one vector), and the finest level's summary folded once per cell row instead of once per group of four cells, the same cells in the same order (details below) | The gate's pass (1024×576, six levels from 16×9 px cells), pinned A/B/B/A, 16 rounds: 4.09 → 3.87 ms (−5.4%); 16 px cells at 1024², −3.2%; the headline, −0.2% (its roll-up and summary are under 2% of it). Instructions per two gate frames 124.0 M → 117.6 M; the roll-up loops 6.2 M → 2.7 M, the summary's 6.3 M → 4.3 M. Bit-identical on the three builds |
 | 18 | The resize's finish in one pass: with three resampled rows cached, a destination row's (up to three) tap rows are summed in tap order, rounded and stored as bytes in one sweep instead of a scaled copy, a read-modify-write pass per tap row and a rounding pass (details below, after step 17's) | 1080p → 1024×576, the resize 1.98 → 1.66 ms (−16.5%); 720p → 512×320, −4.6%; the gate's 1080p frame 6.59 → 6.16 ms (−6.6%). Bit-identical on the three builds |
 | 17 | The fused INTER_AREA resize's horizontal pass over all of a row's planes at once: a group's tap patterns and weights loaded once and the loop's bookkeeping shared across the (up to four) planes, each plane's products and sums the same in the same order (details below, after step 16) | The gate's 1080p → 1024×576 HSV frame, pinned A/B/B/A, one thread: 7.18 → 6.84 ms (−4.7%); the resize alone 2.21 → 1.90 ms (−13.7%) at that size and 0.96 → 0.74 (−22.7%) at 720p → 512×320. Bit-identical on the three builds; the resize tests against cv2 pass |
@@ -1063,6 +1064,28 @@ half's widening became a branch, since the half is a loop variable there. A roll
 (a row's lower row is the next row's centre at stride 1) would cut that to one load a row,
 for a net of about nothing against the two stores. Reverted.
 
+**Step 23, cycles per loop as the judge (October 2026).** Two of step 22's rejects were
+rejected by the headline's wall clock while the gate's said otherwise, and a control settled
+which to believe: the committed source with 8 or 24 bytes of padding at the top of
+`cell_row` -- no change in what runs -- measured −0.6% and −0.2% on the headline and −1.5%
+on the gate, pinned A/B/B/A, twelve runs each. Code placement alone moves this host's wall
+clock by about ±1.5%, which is the size of the items left. So the judge for an item under 2%
+is now the cycle profile of the loop it changes: `perf record` on each build, samples
+attributed to loops found by their backward jumps, loops matched between builds by their
+length and instruction mix, the second build scaled by the loops both have unchanged
+(`loopdiff.py`), with the module's instruction count as the load-independent check. By that
+judge the eight-float scatter had been worse after all (its derive loop split in three, +285
+samples), the three items kept in step 22 show where they should (the gather −320 samples,
+the finish −100, the kinds loop −150), and the records prefetched two groups ahead of the
+derive's scatter -- rejected on the headline's +1.4% -- take the scatter loop from 506 to 282
+samples of 23,171 at no cost in the derive loop, 1.0% of the module, so it is in. With it the
+horizontal pass's store bound, which the compiler reloaded from the plan and tested before
+each of a group's three stores, is tested once per group (`gfull`): within run noise on
+cycles, and the module's instructions per two gate frames 139.9 M → 137.8 M (−1.5%) for the
+two together. Wall clock, for the record: the gate 5.36 → 5.23 ms (−2.4%), the headline
+4.37 → 4.32 (−1.1%). The compiler had also already peeled the slot loop's first iteration,
+which is why step 22's peel by hand had nothing to gain.
+
 Where the single thread stands after step 15: 1.75× the original at the headline
 configuration (7.51 → 4.28 ms pinned on a quiet core), 1.88× at 128 px cells, 1.72× with one
 channel; the per-cell-bound configurations (8 px cells at stride 2) 1.04×. The six kernel
@@ -1186,6 +1209,12 @@ this build do the frame in 0.29× the original's single-thread time.
    the enclosing function's live values crowd the registers, took them out (step 15).
 12. **Symmetries of the constants are algebra too.** The HOG rays' mirror symmetry halved
    the kernel's largest loop's multiplies (step 15); it had been in the table since step 1.
+
+13. **Below two percent, judge a change by its own loop's cycles.** Code placement alone
+    moved the wall clock of this host by ±1.5% (a padding of 24 bytes in a function, nothing
+    else); items of that size were accepted and rejected on that noise until the judge
+    became the cycle samples of the loop the item changes, matched between builds by the
+    loop's signature, with the module's instruction count as the second witness.
 
 ## Measuring
 

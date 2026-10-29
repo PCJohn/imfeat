@@ -1721,6 +1721,7 @@ IF_STRICT_FN HWY_NOINLINE void area_hpass(const AreaHPlan &p, const uint8_t *IF_
   // every 16-byte block of a pattern-sized vector (the shuffle looks up within blocks)
   constexpr bool kWide = 4 * G > 16;
   using Tab = std::conditional_t<kWide, hn::VFromD<decltype(dpat)>, hn::VFromD<decltype(dwin)>>;
+  const size_t gfull = (size_t)p.dsize / G; // groups whose G outputs all exist: a whole store
   for (size_t g = 0; g < (size_t)p.groups; ++g)
   {
     Tab win[P];
@@ -1750,7 +1751,7 @@ IF_STRICT_FN HWY_NOINLINE void area_hpass(const AreaHPlan &p, const uint8_t *IF_
     for (int q = 0; q < P; ++q)
     {
       float *IF_RESTRICT o = dst + q * dstride + g * G;
-      if (g * G + G <= (size_t)p.dsize)
+      if (g < gfull)
         hn::StoreU(acc[q], df, o);
       else
         hn::StoreN(acc[q], df, o, (size_t)p.dsize - g * G);
@@ -2601,6 +2602,9 @@ class FeatureComputer
                       L.mom + ((cell + i) * c_ + k) * NMOM);
         derive_lanes(S, M, hn::Set(dd, invn), hog_card_, out);
         float *IF_RESTRICT f = L.feat + ((cell + i) * c_ + k) * NMAP;
+        for (size_t l = 0; l < LD; ++l) // the records two groups on: their lines, ahead of the
+          for (size_t o = 0; o < NMAP * sizeof(float); o += 64) // stores that would miss
+            hwy::Prefetch(reinterpret_cast<const char *>(f + (2 * LD + l) * (size_t)c_ * NMAP) + o);
         scatter(out, std::min<size_t>(LD, cells - i), (size_t)c_ * NMAP, f);
       }
   }

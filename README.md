@@ -391,7 +391,11 @@ bar-detector corner cases that were bugs. The short version, with the full log i
   instruction profile and keeps three of five items where cycles outran instructions (the
   frame's lines prefetched where it is first read, the resize's finish converting without an
   overflow fix-up, a block's kinds loop deciding the block width once): −2.2% of the
-  instructions, each item −0.4 to −1.2% alone. The log says what each stage costs now, why
+  instructions, each item −0.4 to −1.2% alone. Step 23 finds that code placement alone moves
+  this host's wall clock by ±1.5% and judges items of that size by the cycles of the loop
+  they change instead: the derive's records prefetched ahead of their stores (the scatter
+  loop −44%) and the resize's store bound tested once per group, −1.5% of the instructions
+  more. The log says what each stage costs now, why
   the kernel is at the practical floor of this core, and how to measure on a machine that is
   not quiet.
 
