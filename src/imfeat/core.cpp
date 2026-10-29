@@ -1618,8 +1618,11 @@ std::vector<std::vector<AreaTap>> area_taps(int ssize, int dsize)
 }
 
 // The horizontal plan: groups of G destination columns, each with the start of the 16-byte
-// source window its taps lie in, a shuffle pattern per tap slot (0x80 picks a zero byte, whose
-// weight is 0) and G weights per slot. G is the widest of 8 (4 on 128-bit targets), 4, 2, 1
+// source window its taps lie in, a shuffle pattern per tap slot and G weights per slot. The
+// pattern is G bytes at the front of 16 (0x80 picks a zero byte, whose weight is 0) for the
+// whole-number block sums, and for the float taps (`lane4`) 4 bytes a lane, the tap's byte at
+// the lane's low byte and zeros elsewhere, so that the shuffle lands each tap in its int32
+// lane with no widening after it. G is the widest of 8 (4 on 128-bit targets), 4, 2, 1
 // that fits every group in a window; when even one column's taps do not (a ratio near 16 or
 // more), G is 0 and the row goes through the scalar loop, which is the same sum in the same
 // order.
@@ -1628,8 +1631,9 @@ constexpr int AREA_MAX_G = HWY_MAX_BYTES >= 32 ? 8 : 4;
 struct AreaHPlan
 {
   int G = 0, slots = 0, groups = 0, dsize = 0;
+  bool lane4 = false;           // the pattern layout (see above)
   std::vector<int> w0;          // [group]
-  std::vector<uint8_t> pattern; // [group][slot][16]
+  std::vector<uint8_t> pattern; // [group][slot][16], or [group][slot][4 * G] where lane4
   std::vector<float> weight;    // [group][slot][G]
   std::vector<int> toff;        // scalar: index i's taps are taps[toff[i] .. toff[i+1])
   std::vector<AreaTap> taps;
@@ -1644,7 +1648,8 @@ bool area_hplan_fit(const std::vector<std::vector<AreaTap>> &t, int G, AreaHPlan
   p.slots = 0;
   for (const auto &taps : t) p.slots = std::max(p.slots, (int)taps.size());
   p.w0.assign((size_t)p.groups, 0);
-  p.pattern.assign((size_t)p.groups * p.slots * 16, 0x80);
+  const size_t pb = p.lane4 ? 4 * (size_t)G : 16, pl = p.lane4 ? 4 : 1; // a slot's bytes, a lane's
+  p.pattern.assign((size_t)p.groups * p.slots * pb, 0x80);
   p.weight.assign((size_t)p.groups * p.slots * G, 0.0f);
   for (int g = 0; g < p.groups; ++g)
   {
@@ -1662,7 +1667,7 @@ bool area_hplan_fit(const std::vector<std::vector<AreaTap>> &t, int G, AreaHPlan
       const auto &taps = t[(size_t)g * G + l];
       for (int k = 0; k < (int)taps.size(); ++k)
       {
-        p.pattern[((size_t)g * p.slots + k) * 16 + l] = (uint8_t)(taps[k].si - lo);
+        p.pattern[((size_t)g * p.slots + k) * pb + pl * l] = (uint8_t)(taps[k].si - lo);
         p.weight[((size_t)g * p.slots + k) * G + l] = taps[k].alpha;
       }
     }
@@ -1670,8 +1675,9 @@ bool area_hplan_fit(const std::vector<std::vector<AreaTap>> &t, int G, AreaHPlan
   return true;
 }
 
-void area_hplan(const std::vector<std::vector<AreaTap>> &t, AreaHPlan &p)
+void area_hplan(const std::vector<std::vector<AreaTap>> &t, AreaHPlan &p, bool lane4)
 {
+  p.lane4 = lane4;
   for (int G = AREA_MAX_G; G >= 1; G /= 2)
     if (area_hplan_fit(t, G, p)) return;
   p = AreaHPlan(); // scalar
@@ -1702,24 +1708,35 @@ IF_STRICT_FN HWY_NOINLINE void area_hpass(const AreaHPlan &p, const uint8_t *IF_
 {
   IF_STRICT_BODY
   const hn::FixedTag<uint8_t, 16> dwin;
-  const hn::FixedTag<uint8_t, G> dg;
-  const hn::Rebind<int32_t, decltype(dg)> di;
-  const hn::Rebind<float, decltype(dg)> df;
+  const hn::FixedTag<uint8_t, 4 * G> dpat; // a slot's pattern: G int32 lanes' worth of bytes
+  const hn::FixedTag<int32_t, G> di;
+  const hn::Rebind<float, decltype(di)> df;
+  // the window as the shuffle's table: itself where a pattern is at most 16 bytes, else in
+  // every 16-byte block of a pattern-sized vector (the shuffle looks up within blocks)
+  constexpr bool kWide = 4 * G > 16;
+  using Tab = std::conditional_t<kWide, hn::VFromD<decltype(dpat)>, hn::VFromD<decltype(dwin)>>;
   for (size_t g = 0; g < (size_t)p.groups; ++g)
   {
-    hn::VFromD<decltype(dwin)> win[P];
-    for (int q = 0; q < P; ++q) win[q] = hn::LoadU(dwin, src + q * sstride + p.w0[g]);
-    const uint8_t *IF_RESTRICT pat = p.pattern.data() + g * p.slots * 16;
+    Tab win[P];
+    for (int q = 0; q < P; ++q)
+    {
+      const auto w16 = hn::LoadU(dwin, src + q * sstride + p.w0[g]);
+      if constexpr (kWide)
+        win[q] = hn::Combine(dpat, w16, w16);
+      else
+        win[q] = w16;
+    }
+    const uint8_t *IF_RESTRICT pat = p.pattern.data() + g * p.slots * 4 * G;
     const float *IF_RESTRICT wgt = p.weight.data() + g * p.slots * G;
     hn::VFromD<decltype(df)> acc[P];
     for (size_t k = 0; k < (size_t)p.slots; ++k)
     {
-      const auto pk = hn::LoadU(dwin, pat + k * 16);
+      const auto pk = hn::LoadU(dpat, pat + k * 4 * G);
       const auto wk = hn::LoadU(df, wgt + k * G);
       for (int q = 0; q < P; ++q)
       {
-        const auto sel = hn::TableLookupBytesOr0(win[q], pk);
-        const auto v = hn::ConvertTo(df, hn::PromoteTo(di, hn::ResizeBitCast(dg, sel)));
+        const auto sel = hn::TableLookupBytesOr0(win[q], pk); // each tap's byte in its lane
+        const auto v = hn::ConvertTo(df, hn::BitCast(di, sel));
         const auto prod = hn::Mul(v, wk);               // rounded, like OpenCV's S * alpha
         acc[q] = k == 0 ? prod : hn::Add(acc[q], prod); // 0 + the first product is the product
       }
@@ -1937,11 +1954,11 @@ struct AreaResizer
       std::vector<std::vector<AreaTap>> t((size_t)dw);
       for (int dx = 0; dx < dw; ++dx)
         for (int k = 0; k < ix; ++k) t[dx].push_back({dx * ix + k, 1.0f});
-      area_hplan(t, hp);
+      area_hplan(t, hp, false);
       return;
     }
     mode = GENERIC;
-    area_hplan(area_taps(sw, dw), hp);
+    area_hplan(area_taps(sw, dw), hp, true);
     const auto yt = area_taps(sh, dh);
     yoff.assign((size_t)dh + 1, 0);
     for (int dy = 0; dy < dh; ++dy)

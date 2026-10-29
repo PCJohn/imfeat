@@ -833,6 +833,21 @@ the same), bit-exact and the tests passing, and slower: the resize +5% at 1080p 
 and +10% at 720p → 512×320, the gate frame +0.6%. The read-modify-write stores inside the
 group loop cost more than the streaming pass they replaced. Reverted.
 
+What did pay next was the tap's widening. The plan's shuffle pattern put a group's G
+selected bytes at the front of a 16-byte vector, and each tap then widened them to int32
+lanes (`pmovzxbd`) before the convert to float. With 4 bytes a lane in the pattern, the
+tap's byte at the lane's low byte and zeros elsewhere, the shuffle lands each tap in its
+int32 lane and the widening goes: four operations a tap and plane instead of five, the same
+lanes and so the same floats. On the 256-bit target the 16-byte window is duplicated into
+both halves of a 32-byte table once per group (`Combine`), since the shuffle looks up within
+16-byte blocks. The whole-number-ratio block sums (`area_hsum`, one plane at a time, two taps
+a column at 2×) were given the same layout first and measured +4% (their pattern loads
+doubled for less than a widening's worth of work), so the layout is the float path's alone
+(`AreaHPlan::lane4`) and that kernel is as it was. 1080p → 1024×576, the resize −8%
+(1.63 → 1.54 ms; five runs between −5.6 and −8.3%); 720p → 512×320, −5 to −6%; the gate
+frame −1 to −2%, within a noisy session. Bit-identical on the three builds; the resize tests
+against cv2 at every size pass.
+
 Where the single thread stands after step 15: 1.75× the original at the headline
 configuration (7.51 → 4.28 ms pinned on a quiet core), 1.88× at 128 px cells, 1.72× with one
 channel; the per-cell-bound configurations (8 px cells at stride 2) 1.04×. The six kernel
