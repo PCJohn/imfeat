@@ -1045,6 +1045,24 @@ lesson relearnt on the way: the first versions of two items used lambdas capturi
 block's vectors by reference, and GCC spilled them, +8.6% and +3.3%; the same code written
 out was what measured above.
 
+Looked at after step 22 and left alone. The clang build of the same source, which the
+verification runs anyway: +3.1% on the gate's frame and +6.2% on the headline against GCC
+11, so GCC stays. The derive's scatter storing two four-feature groups of a record at once
+(eight-float stores, `Combine` of the two transposes' rows: the loop was at the store
+port's floor, fourteen 16-byte stores a record): −0.8% on the gate and −0.9% at 16 px cells,
++1.7% and +1.6% on the headline in two sessions; the headline's records are a quarter as
+many, so the swing there is the kernel's loops moving with the code size inside their
+function, which this host has shown before (`-falign-loops`, step 12). Mixed, so reverted.
+And the centre response dropped from the stored set (the row responses loop stores eight
+vectors a row and sits at the store port's floor; the moments phase, its only reader,
+would widen the centre from the row bytes instead, one instruction a row each as the loads
+were, and the slots shrink by a quarter): +2.7% on the gate, +3.1% on the headline and at
+16 px cells. The moments loop had gone from 46 to 79 instructions per two rows: the three
+row addresses are loaded from the distance table and added to the base per row, and the
+half's widening became a branch, since the half is a loop variable there. A rolling centre
+(a row's lower row is the next row's centre at stride 1) would cut that to one load a row,
+for a net of about nothing against the two stores. Reverted.
+
 Where the single thread stands after step 15: 1.75× the original at the headline
 configuration (7.51 → 4.28 ms pinned on a quiet core), 1.88× at 128 px cells, 1.72× with one
 channel; the per-cell-bound configurations (8 px cells at stride 2) 1.04×. The six kernel
