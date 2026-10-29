@@ -921,6 +921,16 @@ cut 3.6% of the instructions for no time, and these, which cut 5.1% for 5.4% of 
 differ in one thing: the fold's reduce steps were hidden behind its own stores, while the
 roll-up's loop bookkeeping and the summary's accumulator reloads were on the critical path.
 
+Tried after it at the same configuration and dropped: the stride-1 product sums only for
+chunks of sixteen rows and up (their once-per-chunk corrections, about three hundred
+instructions, against nine a half row saved: at nine-row chunks the plain loop should win),
+−0.8% of the gate pass's instructions and, timed twice, −2.0% then +3.1%; and the HOG rays
+handed to the kernel as a pointer to int16 lanes instead of a vector array, which changed
+nothing in the generated loop (GCC copies the four vectors to stack slots per quarter either
+way). The per-chunk fixed costs at nine-row chunks — the energy phase's epilogue, the HOG
+quarters' prologues, the byte-count fold — are about 1150 instructions a block and chunk
+against 3970 in the loops, and each is a few hundred; the day's noise on this host is ±3%.
+
 
 **A lesson from the host.** The machine this was tuned on corrupts large allocations
 silently (above), and the code will run on machines like it. The pass's streaming design,
