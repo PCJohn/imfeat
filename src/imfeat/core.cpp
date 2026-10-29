@@ -1821,6 +1821,42 @@ IF_STRICT_FN HWY_NOINLINE void area_round(const float *IF_RESTRICT sum, int n,
   }
 }
 
+// A destination row from its (up to three) resampled tap rows in one pass: OpenCV's mul and
+// muladds element by element in tap order (each product rounded, then each sum), and its
+// saturate_cast<uchar> -- the same operations area_vmul, area_vmuladd and area_round do over
+// a stored sum, without the sum.
+IF_STRICT_FN HWY_NOINLINE void area_finish(const float *const *IF_RESTRICT rows,
+                                           const float *IF_RESTRICT betas, int ntaps, int n,
+                                           uint8_t *IF_RESTRICT out)
+{
+  IF_STRICT_BODY
+  const hn::ScalableTag<float> df;
+  const hn::Rebind<int32_t, decltype(df)> di;
+  const hn::Rebind<uint8_t, decltype(df)> du;
+  const auto b0 = hn::Set(df, betas[0]), b1 = hn::Set(df, ntaps > 1 ? betas[1] : 0.0f),
+             b2 = hn::Set(df, ntaps > 2 ? betas[2] : 0.0f);
+  size_t i = 0;
+  for (; i + hn::Lanes(df) <= (size_t)n; i += hn::Lanes(df))
+  {
+    auto sum = hn::Mul(b0, hn::LoadU(df, rows[0] + i));
+    if (ntaps > 1) sum = hn::Add(sum, hn::Mul(b1, hn::LoadU(df, rows[1] + i)));
+    if (ntaps > 2) sum = hn::Add(sum, hn::Mul(b2, hn::LoadU(df, rows[2] + i)));
+    const auto r = hn::NearestInt(sum);
+    hn::StoreU(hn::DemoteTo(du, hn::Min(hn::Max(r, hn::Zero(di)), hn::Set(di, 255))), du, out + i);
+  }
+  for (; i < (size_t)n; ++i)
+  {
+    float sum = betas[0] * rows[0][i];
+    for (int t = 1; t < ntaps; ++t)
+    {
+      const float prod = betas[t] * rows[t][i];
+      sum = sum + prod;
+    }
+    const int v = (int)std::nearbyint(sum);
+    out[i] = (uint8_t)std::min(std::max(v, 0), 255);
+  }
+}
+
 // The whole-number path's rounding: (sum + 2) >> 2 for 2x2, else sum * (1 / area) in float32
 // rounded half to even -- OpenCV's resizeAreaFast_ on its two branches.
 IF_STRICT_FN HWY_NOINLINE void area_int_round(const int32_t *IF_RESTRICT sum, int n, float scale,
@@ -1969,15 +2005,16 @@ struct AreaResizer
   }
 };
 
-// One band's (or thread's) working set: a de-interleaved source row, the two most recently
+// One band's (or thread's) working set: a de-interleaved source row, the three most recently
 // resampled source rows (a source row feeds at most the destination row it ends and the one it
-// starts, in order, so two are enough), and the destination row's sums.
+// starts, in order, so two are enough to resample each once; three hold every tap row of a
+// destination row with up to three, for the one-pass finish), and the destination row's sums.
 struct AreaScratch
 {
   int planes = 0, plane_stride = 0, dw = 0;
   std::vector<uint8_t> src;        // [plane][sw + 32]: the taps read a 16-byte window, so slack
-  std::vector<float> hrow[2];      // [plane][dw] resampled rows
-  int hsy[2] = {-1, -1};           // ... and which source rows they hold
+  std::vector<float> hrow[3];      // [plane][dw] resampled rows
+  int hsy[3] = {-1, -1, -1};       // ... and which source rows they hold
   std::vector<int32_t> isum, irow; // INTEGER: the block sums in flight, and one row's
   std::vector<float> sum;          // GENERIC: the destination row in flight
 
@@ -1993,15 +2030,18 @@ struct AreaScratch
     sum.assign((size_t)planes * dw, 0.0f);
     reset();
   }
-  void reset() { hsy[0] = hsy[1] = -1; }
+  void reset() { hsy[0] = hsy[1] = hsy[2] = -1; }
 };
 
 // The GENERIC resample of source row sy on the planes the scratch holds, from the cache or afresh.
 const float *area_resampled(const AreaResizer &r, AreaScratch &s, int sy)
 {
-  for (int c = 0; c < 2; ++c)
+  int slot = 0;
+  for (int c = 0; c < 3; ++c)
+  {
     if (s.hsy[c] == sy) return s.hrow[c].data();
-  const int slot = s.hsy[0] < s.hsy[1] ? 0 : 1; // the older one goes
+    if (s.hsy[c] < s.hsy[slot]) slot = c; // the oldest one goes
+  }
   float *out = s.hrow[slot].data();
   const uint8_t *IF_RESTRICT src = s.src.data();
   const size_t ss = (size_t)s.plane_stride, ds = (size_t)s.dw;
@@ -2086,21 +2126,34 @@ void area_row(const AreaResizer &r, AreaScratch &s, const uint8_t *IF_RESTRICT i
                      out + (size_t)p * ostride);
     return;
   case AreaResizer::GENERIC:
-    for (int j = r.yoff[dy]; j < r.yoff[dy + 1]; ++j)
+  {
+    const int j0 = r.yoff[dy], ntaps = r.yoff[dy + 1] - j0;
+    const float *rows[3];
+    for (int j = j0; j < j0 + ntaps; ++j)
     {
       const int sy = r.ysi[j];
       bool cached = false;
-      for (int c = 0; c < 2; ++c) cached = cached || s.hsy[c] == sy;
+      for (int c = 0; c < 3; ++c) cached = cached || s.hsy[c] == sy;
       if (!cached) load(sy);
       const float *row = area_resampled(r, s, sy);
-      if (j == r.yoff[dy])
+      if (ntaps <= 3)
+        rows[j - j0] = row; // (all three slots: every tap row stays cached)
+      else if (j == j0)
         area_vmul(row, n, r.ybeta[j], s.sum.data());
       else
         area_vmuladd(row, n, r.ybeta[j], s.sum.data());
     }
     for (int p = 0; p < s.planes; ++p)
-      area_round(s.sum.data() + (size_t)p * r.dw, r.dw, out + (size_t)p * ostride);
+      if (ntaps <= 3) // the usual case, in one pass from the cached rows
+      {
+        const float *prow[3];
+        for (int t = 0; t < ntaps; ++t) prow[t] = rows[t] + (size_t)p * r.dw;
+        area_finish(prow, &r.ybeta[j0], ntaps, r.dw, out + (size_t)p * ostride);
+      }
+      else
+        area_round(s.sum.data() + (size_t)p * r.dw, r.dw, out + (size_t)p * ostride);
     return;
+  }
   }
 }
 
