@@ -381,9 +381,10 @@ bar-detector corner cases that were bugs. The short version, with the full log i
   720p → 512×320, the gate's whole 1080p frame −4.7%; its float taps then shuffle straight
   into their lanes (−6 to −8% more on the resize), and step 18 finishes a destination row
   in one pass from its cached tap rows instead of four or five streaming passes (the resize
-  −16% at 1080p, the gate frame −6.6%). The log says what each stage costs now, why the
-  kernel is at the practical floor of this core, and how to measure on a machine that is
-  not quiet.
+  −16% at 1080p, the gate frame −6.6%). Step 19 rolls up two kinds per lane add and folds
+  the summary once per cell row: the gate's pass −5.4%, 16 px cells −3.2%. The log says
+  what each stage costs now, why the kernel is at the practical floor of this core, and how
+  to measure on a machine that is not quiet.
 
 ---
 

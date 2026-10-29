@@ -112,6 +112,7 @@ Chronologically. Times are single-thread `features()`; instruction counts are pe
 | 10 | The kernel rewritten as register-resident phases down the rows, with row responses cached and the HOG sums signed; then, from a callgrind profile, the per-block cell sums laid out kind-contiguous and the fold's whole-vector reductions through `ReduceSum` / `SumsOf8` (details below) | Ryzen 7 3700X (AVX2, GCC 11), one thread, `features()`, 4 levels: 1024×1024×3 finest-32 stride 1, 7.44 → 5.42 ms (1.37×); 1024×1024 (C=1), 2.50 → 1.85 (1.35×); 1024×1024×3 finest-64, 8.93 → 6.80 (1.31×); 512×512×3 finest-32, 2.22 → 1.71 (1.30×); 256×256×3 finest-32, 0.81 → 0.71 (1.15×); the fused BGR → HSV pass at 1024², finest-64, 9.85 → 7.74 (1.27×). Every output bit-identical |
 | 12 | A batch of small items chosen by the per-instruction cost table of step 11 and kept or dropped by pinned A/B timing: plane rows aligned to cache lines (the left pad half a line, the stride a whole number of lines, the buffer 64-byte aligned); the 16-bit halves of a one-cell block widened by interleaving with zero instead of `pmovzx`; the bar detector's gate as a saturating subtract and min; the one-cell fold's sign extension through promotes; the moments' fourth-power pair sums widened every two rows; HOG sign masks from a compare instead of a shift | Pinned to a core, interleaved: 1024×1024×3 finest-32 stride 1, 5.38 → 4.84 ms (−10%); stride 2, 2.48 → 2.04 (−18%); 1024×1024 (C=1), 2.42 → 2.13 (−12%); finest-64, 6.81 → 6.45 (−5%); 512×512×3, 1.68 → 1.62 (−4%); 256×256×3, −1%. Every output bit-identical |
 | 14 | Cells derived and rolled up in groups of four whatever the block width (two two-cell blocks or four one-cell blocks share one kind-major sums group), so that blocks of one or two cells no longer go to slots through the scalar flush and back through scalar gathers; the two phases of a raw row split as it is gathered | Instructions per frame: 1024×1024×3 finest-32 stride 1, 63.6 M → 52.5 M (−17%); 16 px cells, −3.6%; 8 px cells at stride 2, −2.2% (the gather). Wall clock, measured only on a machine at load 20–25 with A/B/B/A ordering: within ±2% of the build before at every configuration tried. Every output bit-identical |
+| 19 | The level-1 roll-up two kinds per even/odd lane add (a group's one vector of children, both kinds' parents in one vector), and the finest level's summary folded once per cell row instead of once per group of four cells, the same cells in the same order (details below) | The gate's pass (1024×576, six levels from 16×9 px cells), pinned A/B/B/A, 16 rounds: 4.09 → 3.87 ms (−5.4%); 16 px cells at 1024², −3.2%; the headline, −0.2% (its roll-up and summary are under 2% of it). Instructions per two gate frames 124.0 M → 117.6 M; the roll-up loops 6.2 M → 2.7 M, the summary's 6.3 M → 4.3 M. Bit-identical on the three builds |
 | 18 | The resize's finish in one pass: with three resampled rows cached, a destination row's (up to three) tap rows are summed in tap order, rounded and stored as bytes in one sweep instead of a scaled copy, a read-modify-write pass per tap row and a rounding pass (details below, after step 17's) | 1080p → 1024×576, the resize 1.98 → 1.66 ms (−16.5%); 720p → 512×320, −4.6%; the gate's 1080p frame 6.59 → 6.16 ms (−6.6%). Bit-identical on the three builds |
 | 17 | The fused INTER_AREA resize's horizontal pass over all of a row's planes at once: a group's tap patterns and weights loaded once and the loop's bookkeeping shared across the (up to four) planes, each plane's products and sums the same in the same order (details below, after step 16) | The gate's 1080p → 1024×576 HSV frame, pinned A/B/B/A, one thread: 7.18 → 6.84 ms (−4.7%); the resize alone 2.21 → 1.90 ms (−13.7%) at that size and 0.96 → 0.74 (−22.7%) at 720p → 512×320. Bit-identical on the three builds; the resize tests against cv2 pass |
 | 16 | The fused HSV conversion's table step as one rounding: the float guess of OpenCV's table value round(K / x) is within 2⁻²³ of it and the quotient is at least 1 / (2x) from a half-integer, with 2K 2⁻²³ = 0.25, so the floor-and-remainder correction (six dependent ops per table) goes (details below, after step 15) | HSV frames, pinned A/B/B/A: 1024×1024×3 finest-32 stride 1, 5.05 → 4.77 ms (−5.4%); 512², −4.3%; 256², −3.9%. The conversion 0.86 → 0.61 ms. Exact on every one of the 2²⁴ colours against cv2 on the three builds |
@@ -895,6 +896,31 @@ per child cell and kind because the sums are kind-major (a cell-major layout wou
 cells' kinds four at a time, six times cheaper, but derive reads four cells a vector), and
 levels two and up still go to slots and back through scalar gathers where level one derives
 in its band (step 13); each a refactor with band-boundary cases, not a harvest item.
+
+Measured before taking the second one on: by source range over the gate pass (the one-time
+resize of the profiling script excluded), the whole slot path for levels two and up is
+about 2% — `flush4` 0.5%, the slot pyramid 0.4%, the per-record derives and their moments
+1.1% — and an earlier 3.7% for "the flush" was the fold's byte-count loop misread. Not worth
+a day's refactor. The two ranges that are large, the roll-up (5.2%) and the summary (5.3%),
+each had a contained item instead (step 19).
+
+**Step 19, the roll-up two kinds at a time and the summary once per row (October 2026).**
+`pair_up` took a kind at a time: a group's one vector of four children, two shuffles, an
+add, a half store, and the loop's pointer bumps, per kind, 126 times per group of four
+cells. Two kinds at a time, one even/odd lane add of their two vectors lands kind r's two
+parents in the low half and kind r + 1's in the high half: half the shuffles, adds and
+bookkeeping for the same stores and the same integer sums. And the finest level's summary
+was folded once per group of four cells, each call reloading and storing its six groups of
+four double accumulators (min, max, sum, sum of squares) — about a sixth of its work;
+folded once per cell row, the same cells go in in the same order, so every double rounds as
+before. Together, at the gate's pass: 124.0 M → 117.6 M instructions per two frames, the
+roll-up loops 6.2 M → 2.7 M and the summary's 6.3 M → 4.3 M; pinned A/B/B/A over 16 rounds
+4.09 → 3.87 ms (−5.4%); 16 px cells at 1024², −3.2%; 8 px cells stride 2, about −1%; the
+headline unchanged (−0.2%). Bit-identical on the three builds. The paired folds above, which
+cut 3.6% of the instructions for no time, and these, which cut 5.1% for 5.4% of the time,
+differ in one thing: the fold's reduce steps were hidden behind its own stores, while the
+roll-up's loop bookkeeping and the summary's accumulator reloads were on the critical path.
+
 
 **A lesson from the host.** The machine this was tuned on corrupts large allocations
 silently (above), and the code will run on machines like it. The pass's streaming design,

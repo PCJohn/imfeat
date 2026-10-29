@@ -2908,13 +2908,15 @@ class FeatureComputer
               if (derives)
               {
                 derive_block(levels_[0], s.cells.data(), nxs, cy * nfx + e, cells, n);
-                if (bands_.size() == 1) summary_fold(levels_[0], cy * nfx + e, cells);
                 if (rolls) roll_block(s, s.cells.data(), nxs, cy, e, cells, n, hs);
               }
             }
           }
     }
     if (!local) flush(s.cells.data(), nxs, kst, cst, 0, nfx, 0, c_, n, dst);
+    // the row's cells into the summary in one call, the same cells in the same order as a
+    // call per group would fold them, without a group's reload of the accumulators
+    if (derives && bands_.size() == 1) summary_fold(levels_[0], cy * nfx, nfx);
     if (derives && rolls) s.up_n += n * levels_[1].fx;
     return derives;
   }
@@ -2972,6 +2974,26 @@ class FeatureComputer
         const V64 a = hn::LoadU(d64, src), b = hn::LoadU(d64, src + L);
         const V64 sum2 = hn::Add(hn::ConcatEven(d64, b, a), hn::ConcatOdd(d64, b, a));
         hn::StoreU(TOP ? sum2 : hn::Add(hn::LoadU(d64, dst), sum2), d64, dst);
+      }
+      return;
+    }
+    if (cells == L) // a group of one vector of children: two kinds an even/odd lane add, its
+    {               // lanes kind r's parents then kind r + 1's
+      size_t r = 0;
+      for (; r + 1 < kinds; r += 2, src += 2 * nxs, dst += 2 * nxu)
+      {
+        const V64 a = hn::LoadU(d64, src), b = hn::LoadU(d64, src + nxs);
+        const V64 sum2 = hn::Add(hn::ConcatEven(d64, b, a), hn::ConcatOdd(d64, b, a));
+        const auto lo = hn::LowerHalf(dh, sum2), hi = hn::UpperHalf(dh, sum2);
+        hn::StoreU(TOP ? lo : hn::Add(hn::LoadU(dh, dst), lo), dh, dst);
+        hn::StoreU(TOP ? hi : hn::Add(hn::LoadU(dh, dst + nxu), hi), dh, dst + nxu);
+      }
+      for (; r < kinds; ++r, src += nxs, dst += nxu)
+      {
+        const V64 v = hn::LoadU(d64, src);
+        const auto sum2 =
+            hn::LowerHalf(dh, hn::Add(hn::ConcatEven(d64, v, v), hn::ConcatOdd(d64, v, v)));
+        hn::StoreU(TOP ? sum2 : hn::Add(hn::LoadU(dh, dst), sum2), dh, dst);
       }
       return;
     }
