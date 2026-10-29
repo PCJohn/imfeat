@@ -119,6 +119,7 @@ Chronologically. Times are single-thread `features()`; instruction counts are pe
 | 24 | Cells derived and rolled up in groups of two vectors (eight) instead of one, with the group's kind stride a whole cache line: the roll-up writes a whole vector of parents per kind and touches each kind's line of the level-1 row (larger than L1 at the gate's sizes) half as often (details below) | By loop cycles: the roll-up loops 553 → 370 samples of 22,472 (−0.8% of the module), the folds unchanged once the stride was even (at the odd stride of 9 they had gained 100); the module's instructions per two gate frames 137.8 M → 136.6 M (−0.9%). Wall clock, pinned A/B/B/A: the gate −1.7%, 16 px cells −1.7%, the headline −0.6%. Bit-identical on the three builds |
 | 25 | The resize's rounding functions store through the saturating pack alone: the explicit clamp to [0, 255] before `DemoteTo` was the pack's own saturation done twice | By loop cycles, two runs each: the finish loop 1605 → 1351 and 1562 → 1353 samples (−0.65% of the module), the module's instructions per two gate frames 136.6 M → 135.7 M (−0.65%); the gate −1.7% pinned A/B/B/A. Byte-identical to cv2 on the three builds |
 | 26 | The resize's periodicity inside the window kernel: where the ratio's period divides the group width, every group's shuffle pattern, weights and window step are the same, which the plan checks byte for byte, and those groups run with the slot tables in registers and the slot count a compile-time constant (details below) | Gate (1920 → 1024, period 8 = one group): the horizontal pass's loops 2565 → 1737 cycle samples of 21,850 in two runs (−3.7% of the module); the module's instructions per two gate frames 135.7 M → 124.5 M (−8.3%); the gate 5.10 → 4.94 ms at one thread (−3.2%) and 2.68 → 2.58 at two (−3.7%), pinned A/B/B/A. Byte-identical to cv2 on the three builds |
+| 27 | The LBP ring's eight neighbour tests as a saturating subtract compared with zero instead of a max compared with the neighbour: the same mask, the same instruction count, off the two pipes the ring's minima and shuffles queue on (details below) | Headline, by loop cycles, two runs: the LBP loop 3331 → 2966 and 3301 → 2975 samples (−11%, −10%), the module −1.3% and −0.8%. Bit-identical on the three builds |
 | 19 | The level-1 roll-up two kinds per even/odd lane add (a group's one vector of children, both kinds' parents in one vector), and the finest level's summary folded once per cell row instead of once per group of four cells, the same cells in the same order (details below) | The gate's pass (1024×576, six levels from 16×9 px cells), pinned A/B/B/A, 16 rounds: 4.09 → 3.87 ms (−5.4%); 16 px cells at 1024², −3.2%; the headline, −0.2% (its roll-up and summary are under 2% of it). Instructions per two gate frames 124.0 M → 117.6 M; the roll-up loops 6.2 M → 2.7 M, the summary's 6.3 M → 4.3 M. Bit-identical on the three builds |
 | 18 | The resize's finish in one pass: with three resampled rows cached, a destination row's (up to three) tap rows are summed in tap order, rounded and stored as bytes in one sweep instead of a scaled copy, a read-modify-write pass per tap row and a rounding pass (details below, after step 17's) | 1080p → 1024×576, the resize 1.98 → 1.66 ms (−16.5%); 720p → 512×320, −4.6%; the gate's 1080p frame 6.59 → 6.16 ms (−6.6%). Bit-identical on the three builds |
 | 17 | The fused INTER_AREA resize's horizontal pass over all of a row's planes at once: a group's tap patterns and weights loaded once and the loop's bookkeeping shared across the (up to four) planes, each plane's products and sums the same in the same order (details below, after step 16) | The gate's 1080p → 1024×576 HSV frame, pinned A/B/B/A, one thread: 7.18 → 6.84 ms (−4.7%); the resize alone 2.21 → 1.90 ms (−13.7%) at that size and 0.96 → 0.74 (−22.7%) at 720p → 512×320. Bit-identical on the three builds; the resize tests against cv2 pass |
@@ -1158,6 +1159,26 @@ one group) the horizontal pass's loops went 2565 → 1737 cycle samples of 21,85
 pinned A/B/B/A. 1080p → 256×256 (period 2) and 720p → 512×320 (period 2) qualify too.
 Byte-identical to cv2 at every size of the resize tests on the GCC/AVX2, clang and SSE4
 builds; the harness and the 740 tests pass.
+
+**Step 27, the pipes (October 2026).** Toward 2× at the headline, where the six kernel loops
+are 81% of the time, two experiments on the HOG quarter loop said what binds it. Loading each
+row's inputs a row ahead, to take the load's latency off the row's chain, changed nothing
+(6582 → 6710 and 6740 → 6569 samples). Two timing-only ablations did: without the
+fourth-power sum (five instructions, two multiplies) the loop lost 2.6 cycles a row, without
+two of the four rays (ten instructions, two multiplies) 4.5 -- about 0.45 cycles per
+instruction either way, so not the multiply pipe, and not latency: the loop runs its 34
+instructions in 12.7 cycles because its sign-flips and adds share two or three of this
+core's four vector pipes while the multiplies fill another. The same lens on the LBP ring
+(80 instructions in 28 cycles): splitting its three serial chains over two accumulators each
+made it slower (+4% and +8%), but its eight neighbour tests, max(nb, c) == nb, rewritten as
+the same mask from a saturating subtract compared with zero (c − nb saturates to 0 exactly
+when nb ≥ c), one instruction for one, took the loop from 3331 → 2966 and 3301 → 2975
+samples (−11%, −10%) and the module −1.3% and −0.8%: the max had queued on the pipes the
+ring's minima and shuffles use, the subtract does not. Bit-identical on the three builds,
+the harness and the 740 tests. The lesson, which the per-pipe issue widths of step 11 had
+only hinted at: at the headline the kernel's time is its instructions divided by what the
+pipes they land on can issue, so an operation rewritten as an equal number of operations on
+other pipes is a real item, and the loop's cycle samples are its judge.
 
 Where the single thread stands after step 15: 1.75× the original at the headline
 configuration (7.51 → 4.28 ms pinned on a quiet core), 1.88× at 128 px cells, 1.72× with one

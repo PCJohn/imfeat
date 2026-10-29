@@ -447,7 +447,10 @@ HWY_INLINE void block(const Chunk &C, const uint8_t *IF_RESTRICT mask,
         const uint8_t *IF_RESTRICT ra = rb - rs, *IF_RESTRICT re = rb + rs;
         const V8 c = hn::LoadU(d8, rb + tm);
         V8 mn = hn::LoadU(d8, ra + tl);
-        auto ge = [&](V8 nb) { return hn::VecFromMask(d8, hn::Eq(hn::Max(nb, c), nb)); };
+        // nb >= c as c - nb saturating to 0: the same mask as max(nb, c) == nb, off the pipes
+        // the ring's minima and shuffles queue on
+        auto ge = [&](V8 nb)
+        { return hn::VecFromMask(d8, hn::Eq(hn::SaturatedSub(c, nb), hn::Zero(d8))); };
         const V8 s0 = ge(mn);
         V8 prev = s0, npc = s0, ntr = hn::Zero(d8);
         auto next = [&](const uint8_t *p) // the ring, a neighbour at a time: few tests stay alive
