@@ -1525,6 +1525,15 @@ straight-line code +400, the target +3.2% / +3.0% at one thread and +3.4% at fou
 identical on the three builds. Not kept; what the bar detector's loop needed (step 15: its
 spilled lag loads), the HOG's did not have.
 
+Tried after step 35 and reverted, the same lever on the other phase: the stride-1 energy
+corrections (142 instructions per half, about twenty vectors live inside `block()`) as a
+function of their own, called once per half and chunk. Bit-identical; the module's
+instructions +0.9%, the energy row loop 44 → 46 instructions and +14% samples, the
+straight-line code +523, the target +3.6% / +4.2% at one thread. Not kept. With these two,
+every phase of `block()` but the bar detector's has now been tried out of line and lost;
+the allocation inside `block()` after step 35 is what it is, and the responses loop's five
+extra scalar instructions since that step (33 → 38) are the one visible cost left of it.
+
 Where the target stands after step 35 (pinned to cores 4–7 of one complex, A/B/B/A, six
 rounds, minima): against the branch's start (step 27) 5.88 → 5.60 ms at one thread (−4.7%),
 3.03 → 2.87 at two (−5.4%), 1.60 → 1.50 at four (−6.0%); against the original build in the
