@@ -14,7 +14,8 @@ measured timeline and the summary of lessons. Read this one first, that one for 
 |---|---|---|---|
 | start | `3957392` | 2026-10-28 | `main` at *Add AGENTS.md*: the code before this branch. Steps 1–9 of the engineering log are already in it. Every "original" or "base" number below is this commit |
 | last code change | `cf40d37` | 2026-10-29 | step 27, *LBP ring: the neighbour test as a saturating subtract compared with zero* |
-| end | the commit that adds this file (`git log -1 --format=%h -- docs/LEARNINGS.md`) | 2026-10-29 | this report, the benchmark it adds and the measurement script; no change to the core |
+| checkpoint | `b6f55fb` | 2026-10-29 | this report's first version, the benchmark it adds and the measurement script; no change to the core |
+| continued | `bde5b6c`..`b4e65e4` | 2026-10-30 | steps 28–32 of the log, from a per-loop profile of the target scenario itself (branch `claude/toward-2x-f3c09d`): five small exact items, 1.73× / 1.74× / 1.75× the base at 1 / 2 / 4 threads |
 
 Between them: 26 commits that change `src/imfeat/core.cpp` (the engineering log's steps
 10–27; some steps took two or three commits) and 25 commits that change only the log and the
@@ -79,7 +80,9 @@ Minimum latency in ms of the target scenario at 1, 2 and 4 threads, and of the s
 and after every code commit, oldest first. Index 0 is the base. Each number is the minimum
 over the three runs of section 2; the runs on their own are
 [run 1](learnings/latency_by_commit_run1.md), [run 2](learnings/latency_by_commit_run2.md)
-and the [single-complex target run](learnings/latency_by_commit_ccx.md). The 2- and 4-thread
+and the [single-complex target run](learnings/latency_by_commit_ccx.md). Rows 27–31
+(October 30) were added by the same three runs resumed over the new commits alone, on a
+busier day: their numbers are one run each, not the quiet minimum of several sessions. The 2- and 4-thread
 rows come almost entirely from the last (25 and 27 of the 27 entries), the only run whose
 threads never crossed the core complexes; the 1-thread row and the headline, which the
 target run does not include, come mostly from run 2 (23 and 24 of 27), the quieter of the
@@ -114,6 +117,11 @@ two full runs.
 | 24 | `858fe52` | 5.824 | 3.016 | 1.591 | 5.246 | Resize rounding: the saturating pack is the clamp |
 | 25 | `bac2b23` | 5.848 | 3.023 | 1.607 | 5.345 | Resize: the periodic groups of the horizontal pass with their slot tables in registers |
 | 26 | `cf40d37` | 5.781 | 2.975 | 1.574 | 5.198 | LBP ring: the neighbour test as a saturating subtract compared with zero |
+| 27 | `bde5b6c` | 5.701 | 2.940 | 1.571 | 5.061 | Two-cell blocks widen in-lane; their int32 kinds fold from the 128-bit halves |
+| 28 | `fc5afd0` | 5.665 | 2.918 | 1.542 | 5.103 | HSV row: the >> 12 and the lane merges folded into the float path |
+| 29 | `9544713` | 5.614 | 2.915 | 1.557 | 5.091 | Per-block bookkeeping: the group modulo as a mask; the bar detector's run bounds once per chunk |
+| 30 | `dfe62b0` | 5.681 | 2.980 | 1.562 | 5.172 | HSV row: one reciprocal carries HNUM, so hdiv's guess is one multiply |
+| 31 | `b4e65e4` | 5.619 | 2.907 | 1.538 | 5.119 | LBP phase: one loop down the rows, the nibbles emptied on the way |
 
 The same, as speed-ups against the base:
 
@@ -146,6 +154,11 @@ The same, as speed-ups against the base:
 | 24 | `858fe52` | 1.62× | 1.66× | 1.68× | 1.64× | Resize rounding: the saturating pack is the clamp |
 | 25 | `bac2b23` | 1.62× | 1.66× | 1.66× | 1.61× | Resize: the periodic groups of the horizontal pass with their slot tables in registers |
 | 26 | `cf40d37` | 1.63× | 1.68× | 1.69× | 1.65× | LBP ring: the neighbour test as a saturating subtract compared with zero |
+| 27 | `bde5b6c` | 1.66× | 1.70× | 1.70× | 1.70× | Two-cell blocks widen in-lane; their int32 kinds fold from the 128-bit halves |
+| 28 | `fc5afd0` | 1.67× | 1.72× | 1.73× | 1.68× | HSV row: the >> 12 and the lane merges folded into the float path |
+| 29 | `9544713` | 1.68× | 1.72× | 1.71× | 1.69× | Per-block bookkeeping: the group modulo as a mask; the bar detector's run bounds once per chunk |
+| 30 | `dfe62b0` | 1.66× | 1.68× | 1.71× | 1.66× | HSV row: one reciprocal carries HNUM, so hdiv's guess is one multiply |
+| 31 | `b4e65e4` | 1.68× | 1.72× | 1.73× | 1.68× | LBP phase: one loop down the rows, the nibbles emptied on the way |
 
 ## 4. What worked: the committed changes
 
@@ -184,8 +197,19 @@ this column is the log's: 1024×1024×3 at a 32×32 finest grid, stride 1, one t
 | 24 | `858fe52` | 25 | The resize's rounding stores through the saturating pack alone: the explicit clamp was the pack's saturation done twice | the finish loop −0.65% of the module by cycles; the gate −1.7% |
 | 25 | `bac2b23` | 26 | The resize's periodic groups (where the ratio's period divides the group width) run with the slot tables in registers and the slot count a compile-time constant | the horizontal pass's loops 2565 → 1737 cycle samples (−3.7% of the module); instructions per two gate frames 135.7 M → 124.5 M (−8.3%); the gate 5.10 → 4.94 ms at one thread (−3.2%), 2.68 → 2.58 at two (−3.7%) |
 | 26 | `cf40d37` | 27 | The LBP ring's eight neighbour tests as a saturating subtract compared with zero: the same mask off the two pipes the ring's minima and shuffles queue on | the LBP loop 3331 → 2966 and 3301 → 2975 cycle samples (−11%, −10%); the module −1.3% and −0.8% |
+| 27 | `bde5b6c` | 28 | Two-cell blocks (the target's 16 px cells) widen their row responses in-lane, and their int32 kinds fold from the 128-bit halves of the vectors, each half one cell | the target −3.3% / −4.6% / −3.0% at 1 / 2 / 4 threads; the responses loop 4059 → 2127 cycle samples |
+| 28 | `fc5afd0` | 29 | HSV row: the `>> 12` as a floor in the float path, the odd lanes 2¹⁶ higher so the merge into 16-bit lanes is one blend | 176 instructions per 32 pixels from 181; the HSV loop −5% in two runs; the target −0.7% / −0.9% at one thread |
+| 29 | `9544713` | 30 | `cell % group` (an integer divide per block) as a mask; the bar detector's run bounds once per chunk | 2,048 `divq` a frame gone, 0.3% by the samples outside loops; 122 K instructions a frame fewer |
+| 30 | `dfe62b0` | 31 | HSV row: the shared reciprocal carries HNUM, so hdiv's guess is one multiply | 172 instructions per 32 pixels; the HSV loop's share 9.8% → 9.45% of the module in two runs |
+| 31 | `b4e65e4` | 32 | LBP phase as one loop down the rows, the nibbles emptied every 15 rows on the way instead of a second pass for a 16-row chunk's last row | 225 K instructions a frame fewer; the target −1.1% / −1.0% at one thread |
 
-Where the time went, in the end. The six kernel loops (the LBP ring, the bar detector, the
+Where the time went at the target after step 32 (the log's "Profiled after step 27" entry
+has the table): the six kernel loops 66% of the frame, the HSV row 12%, the per-chunk
+prologues and epilogues 5%, the folds 6%, derive 4%, the summary 3%, the roll-up 2%; 69.6 M
+instructions a frame at 2.9 a cycle; 8 K branch mispredictions. Parallel efficiency 93% at
+four threads, so the multi-thread target follows the single thread.
+
+Where the time went, in the end of the first branch. The six kernel loops (the LBP ring, the bar detector, the
 row responses, the Gram energies, the moments and the HOG ray tests) are about four fifths
 of a single-thread frame at the headline configuration, each at or within a few instructions
 of what its arithmetic needs and, measured by ablation and by the core's pipe widths, within
@@ -325,6 +349,17 @@ What the branch as a whole says, for whoever picks this up (the engineering log'
     complexes gives bimodal multi-thread numbers that look like noisy code. Lesson 5's
     ±1.5% is the single-thread figure; multi-thread needs the pin set chosen for the
     topology (`lscpu -e` shows it) before any of it is read.
+
+11. **A profile of the target itself found what the headline's profiles could not.** The
+    branch's profiles were of the headline (one cell a block) and the gate's 1080p frame;
+    the target is two cells a block and 16-row chunks, and its own per-loop profile put the
+    row responses at 1.44 cycles per instruction share (a `pmovzx` widening confined to
+    one-cell blocks: step 28, −3.3%), the LBP's outer pass running twice (step 32, −1.1%),
+    and, from a count of executed divider instructions, an integer divide per block in
+    `cell % group` (step 30). Four of the five steps were below the wall clock's resolution
+    and were taken on their loop samples and instruction counts (lesson 5); together they
+    are the 4% the profile had put as the ceiling of the exact items, and the kernel loops
+    are where they were: 2× is not available within the contract from this instruction mix.
 
 ## 7. Reproducing the table on another machine
 

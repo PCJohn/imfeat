@@ -27,3 +27,8 @@
 | 24 | 858fe52 | 5.824 | 3.616 | 1.930 | 5.246 | Resize rounding: the saturating pack is the clamp |
 | 25 | bac2b23 | 5.886 | 3.631 | 1.972 | 5.385 | Resize: the periodic groups of the horizontal pass with their slot tables in registers |
 | 26 | cf40d37 | 5.845 | 4.552 | 2.420 | 5.280 | LBP ring: the neighbour test as a saturating subtract compared with zero |
+| 27 | bde5b6c | 5.701 | 3.486 | 1.906 | 5.061 | Two-cell blocks widen in-lane; their int32 kinds fold from the 128-bit halves |
+| 28 | fc5afd0 | 5.665 | 2.918 | 1.838 | 5.103 | HSV row: the >> 12 and the lane merges folded into the float path |
+| 29 | 9544713 | 5.614 | 3.488 | 3.507 | 5.184 | Per-block bookkeeping: the group modulo as a mask; the bar detector's run bounds once per chunk |
+| 30 | dfe62b0 | 5.738 | 3.490 | 1.920 | 5.172 | HSV row: one reciprocal carries HNUM, so hdiv's guess is one multiply |
+| 31 | b4e65e4 | 5.646 | 3.545 | 1.956 | 5.119 | LBP phase: one loop down the rows, the nibbles emptied on the way |
