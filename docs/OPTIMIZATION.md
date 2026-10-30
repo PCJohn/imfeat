@@ -1219,6 +1219,50 @@ patch is in the session scratchpad as `summary_rows.patch`. The decision: a chan
 outputs would have to pay across the board, the single thread included, and this one costs
 the single thread; the bit-exact contract stands.
 
+**Profiled after step 27: the target scenario (October 30, 2026).** The branch's profiles
+were of the headline (32 px cells, one cell a block) and of the gate's 1080p frame; the target
+(1024×1024×3, HSV, stride 1, the seven levels from 64×64 cells) is 16 px cells, two cells a
+block, one 16-row chunk per cell row. Per frame on the Ryzen (`perf stat`, differenced over
+50 and 250 frames): 24.6 M cycles, 72.5 M instructions (2.9 a cycle; callgrind's module count
+72.1 M), 3.1 M branches, 8 K mispredictions. Cycle samples by loop (`perf record` on the
+symbol build, 400 frames, one thread, 5.81 ms a frame, loops found by their back edges):
+the HOG quarter loop 22%, the fused HSV row 12% (0.57 ms by ablation: 5.82 → 5.25 ms with
+`feature_space=None`), the LBP ring 11%, the energy phase's product-sum loop 10%, the row
+responses 9% (at 1.44 cycles per instruction share: eight stores and six `pmovzx` a row),
+the bar detector 8%, the moments 7%; the per-chunk prologues and epilogues (the energies'
+corrections, the HOG quarters' init and store, the LBP nibble emptying) about 5%; the folds
+6%, derive 4% (`derive_block`, its scatter, `derive_lanes`), the summary fold 3%, the
+level-1 roll-up 2%, `flush4` 1.3%; straight-line code outside any loop 5.6%. Four threads
+pinned inside one core complex: 1.554 ms with the same loop shares and 50,970 module
+samples against 51,307 at one thread, so the parallel efficiency is 93% and the
+multi-thread target can only follow the single thread.
+
+Measured and closed, each timed pinned A/B/B/A against step 27 at one thread:
+
+* **Loop-exit mispredictions at 16-row chunks.** Step 10 had estimated 5–7% of the cycles
+  if every exit mispredicted, and `perf` was locked then. Counted now: 8,017 branch misses a
+  frame, about 0.15 M cycles, 0.6% of the frame. The predictor learns the 16-iteration
+  exits. Not a lever.
+* **The packed-BGR deinterleave of the HSV row** (`LoadInterleaved3`, a dozen shuffles per
+  32 pixels), replaced by three plain loads (timing only, outputs wrong): +0.2% on the
+  minimum, −0.2% on the median. Not a cost.
+* **In-lane widening of the row responses for two-cell blocks** (step 12's largest item,
+  used only for one-cell blocks because it reorders the 16-bit lanes), forced on (timing
+  only; done properly, the folds would read a cell from the two 128-bit halves of both
+  half blocks instead of from one half block each, the same integer sums regrouped): −1.6%
+  and −1.7% at one thread. That is the item's ceiling, and it is the largest item left.
+
+Where that leaves 2×: the six kernel loops are 66% of the frame at 2.9 instructions a cycle
+and at their instruction counts (re-derived per loop: the HOG's 34 a quarter row, the LBP's
+79, the energy loop's 43, the bar detector's 60, the moments' 46 per two rows); 2× at one
+thread is 4.72 ms, some 59 M instructions at this rate, −18%; and the items left measure
+1.6% (above), about 1% (the two-cell folds' `sum4x4` with two zero inputs) and about 1% (the
+HSV row's `>> 12` shifts folded into its float path: eight of the 31 shifts on the loop's
+one shift-and-convert pipe), some 4% together, 1.69× at one thread. The contract's 2× is not
+available from this instruction mix; lesson 1 of LEARNINGS.md holds at the target as at the
+headline. The per-loop table, the scripts and the ablation builds are in `scripts/measure/`
+and the session's notes.
+
 Where the single thread stands after step 15: 1.75× the original at the headline
 configuration (7.51 → 4.28 ms pinned on a quiet core), 1.88× at 128 px cells, 1.72× with one
 channel; the per-cell-bound configurations (8 px cells at stride 2) 1.04×. The six kernel
