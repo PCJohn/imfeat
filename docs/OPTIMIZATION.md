@@ -1398,6 +1398,57 @@ rows (2 of 18) would need the responses kept per block across cell rows for 0.3%
 quarters' prologue copies the rays between stack slots (0.3%), where two earlier attempts
 lost; none built.
 
+**The 2× question after step 34, costed (October 30, 2026).** The target's 2× is 4.72 /
+2.51 / 1.33 ms against 5.69 / 2.92 / 1.51 now: −17% at one thread, −14% at two, −12% at
+four. At four threads the band work alone is a quarter of the single-thread frame, 1.42 ms,
+already above the 1.33 ms mark before any tail, so no threading change can reach it: every
+thread count needs the single-thread frame cut by about a sixth, and the six kernel loops
+are two thirds of it. Reformulations costed per instruction and not built, because each
+comes out at or above the count it would replace:
+
+* **HOG ray sums two pixels a lane.** `pmaddwd` could add two pixels' signed energies in one
+  lane if |grad|² fitted 16 bits; split as hi·2¹¹ + lo it takes two multiply-adds per ray and
+  16 pixels, the same four operations the sign-flip and add cost per ray and 8 pixels, and
+  the ±1 sign lanes would cost more to make than the flips. The sector index (four compares,
+  three adds) with the energy scattered by moments Σ g² kᵐ, m = 0..4, solved exactly at the
+  flush: 19 operations per 8 pixels against 16 for the signed sums, before the side split.
+  A 16-bit test needs the rays scaled down, which moves the bin boundaries: not the same
+  feature. The loop stays at 34.
+* **LBP transitions.** Packing the eight sign masks into a code byte (16 operations) and
+  looking its transitions and popcount up by nibble (about 13 more) is 29 against the 24 of
+  the eight xors, eight adds and eight adds it does now; counting rises as Σ s_{i+1} − Σ
+  (s_i ∧ s_{i+1}) is the same 16. A plane biased by 128 would save the eight saturating
+  subtracts of the tests (one compare each) but costs the bar detector thirteen xors a row
+  or a second set of planes from the gather, a wash.
+* **HSV.** OpenCV's s is floor((diff·sdiv[v] + 2¹¹) >> 12) with sdiv[v] rounded first; it
+  differs from round(255 diff / v) wherever 255 diff / v is within 0.03 of a half-integer,
+  so the table value has to be made exactly, and one float division per eight pixels is the
+  cheapest exact way found (the log's reciprocal estimates were slower); of the 172
+  instructions per 32 pixels about 68 are the two table steps, the rest the lane plumbing
+  and the hue numerator's selects, each already at one or two operations.
+* **Two cell rows a chunk** (32-row chunks at the target), to halve the per-chunk prologues
+  and epilogues: those are mostly per cell, not per chunk -- the energy phase's corrections
+  are per cell row's product sums, the HOG quarters' init and store per cell's accumulators,
+  the nibble emptying per cell -- so only the rays' copies, the responses' two halo rows and
+  the loop setups would be shared, about 1.5% of the instructions, for a restructuring of
+  `cell_row` that the log's lessons 6 and 13 say to expect spills from. Not worth it.
+* **The per-cell stages** (derive 4%, summary 3%, roll-up 2%, `flush4` 1.3%): the derive is
+  two instructions a feature with seven distinct divides and three roots per four cells;
+  the summary is a min, max, sum and sum of squares per lane in double; a cell-major level-1
+  layout would make the roll-up cheaper but the derive reads four cells a vector. Each a
+  refactor for under 1%.
+* **Issue rate.** The frame runs at 2.9 instructions a cycle; the kernel loops at
+  2.5–3 vector µops a cycle, which the log's microbenchmarks put as this core's practical
+  ceiling for an accumulate loop. Nothing portable changes that.
+
+What would reach 2×, each outside the contract: the band-independent summary (measured
+after step 27: −10% at two threads, −12% at four, +2% at one; with steps 28–34 on top it
+would put four threads near 1.93×, still short, and the float64 summaries move in their
+last bits and differ by thread count); the Σ|grad|⁴ feature dropped (five of the HOG loop's
+34 instructions, about 3% of the frame); fewer HOG bins (each ray pair about 3%); the
+conversion done once upstream if the host already has HSV (10%). None alone, and only the
+last two together with the first, reach 2× at one thread; the contract decides.
+
 Where the target stands after step 34 (pinned to cores 4–7 of one complex, A/B/B/A, six
 rounds, minima): against the branch's start (step 27) 5.88 → 5.68 ms at one thread (−3.4%),
 3.03 → 2.93 at two (−3.5%), 1.60 → 1.52 at four (−5.2%); against the original build in the
