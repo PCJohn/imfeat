@@ -225,12 +225,11 @@ constexpr DU64 du64;
 //   HOG:  the ray tests, one int32 lane per column, per quarter block. The bin-boundary rays
 //         come in mirror pairs (i, HB-i) across the vertical, and a gradient left of it
 //         passes ray HB-i exactly when its reflection fails ray i, so block() tests every
-//         gradient's reflection against the HRAYS low rays only: per low ray i, S_i = sum of
-//         |grad|^2 by the test's sign, D_i = the same by the test's sign times the side (+1
-//         right of the vertical), and once E = the energy by the side alone. With the total
-//         energy T = SXX + SYY, the energy past ray i is (S_i + D_i + 3T - E) / 4 and past
-//         ray HB-i is (T - E - S_i + D_i) / 4 (hog_cum4), and the ray tests are nested, so
-//         bin b = cum[b-1] - cum[b].
+//         gradient's reflection against the HRAYS low rays only: per low ray i, N_i = sum of
+//         |grad|^2 over the gradients whose reflection fails it, D_i = the same by the side
+//         (+1 right of the vertical). With the total energy T = SXX + SYY, the energy past
+//         ray i is T - (N_i + D_i) / 2 and past ray HB-i is (N_i - D_i) / 2 (hog_cum4), and
+//         the ray tests are nested, so bin b = cum[b-1] - cum[b].
 //   U8:   counts, one uint8 lane per column over the whole block.
 //   BARD: the bar detector's gated maps, one uint16 lane per two columns over the whole block.
 // clang-format off
@@ -239,7 +238,7 @@ enum
   K_SXX, K_SYY, K_T2, K_LAP2, K_LAWS, K_NUNSIGNED = K_LAWS + NLAWS, // squares first,
   K_SXY = K_NUNSIGNED, K_T1, K_T3, K_LAP1, K_NPAIR,                 // then what can go negative
   K_T4 = K_NPAIR, K_SG4, K_HOG,
-  K_NHOG = 2 * HRAYS + 1, K_U8 = K_HOG + K_NHOG, K_MAX = K_U8, K_MIN, K_LBP, // LBP bins 0..LBPB-2; the last is the rest
+  K_NHOG = 2 * HRAYS, K_U8 = K_HOG + K_NHOG, K_MAX = K_U8, K_MIN, K_LBP, // LBP bins 0..LBPB-2; the last is the rest
   K_BARD = K_LBP + LBPB - 1,
   K_N = K_BARD + BARD_NMAP,
   K_NU8 = K_BARD - K_U8
@@ -751,18 +750,17 @@ HWY_INLINE void block(const Chunk &C, const uint8_t *IF_RESTRICT mask,
         sg4 = hn::Add(sg4, hn::BitCast(d64, hn::Add(hn::MulEven(g2, g2), hn::MulOdd(g2, g2))));
         // A gradient left of the vertical passes every low ray, and passes a low ray's mirror
         // image exactly when its reflection (|gx|, |gy|) fails the low ray. So the low rays are
-        // tested against the reflection, with + |grad|^2 past the ray (t > 0) and - |grad|^2
-        // short of it (t < 0), one sign flip, into S; the same by the side into D; and the
-        // energy by the side alone into E, from which the flush has the energy past every ray
-        // (see K_HOG). A test is 0 only for a zero gradient (set_config checks), where
-        // |grad|^2 is 0 whatever the flip makes of it.
+        // tested against the reflection, and the |grad|^2 of the gradients short of each
+        // (t < 0) goes into N, the same by the side into D, from which the flush has the
+        // energy past every ray (see K_HOG). The test's sign bit is the mask: a shift and an
+        // AND rather than a sign flip, which shares the multiplies' pipe on some cores. A test
+        // is 0 only for a zero gradient (set_config checks), where |grad|^2 is 0 either way.
         const V32 g2s = hn::IfNegativeThenNegOrUndefIfZero(zl, g2);
-        hog[2 * HRAYS] = hn::Add(hog[2 * HRAYS], g2s);
         for (int j = 0; j < HRAYS; ++j)
         {
-          const V32 t = hn::WidenMulPairwiseAdd(d32, za, rays[j]);
-          hog[j] = hn::Add(hog[j], hn::IfNegativeThenNegOrUndefIfZero(t, g2));
-          hog[HRAYS + j] = hn::Add(hog[HRAYS + j], hn::IfNegativeThenNegOrUndefIfZero(t, g2s));
+          const V32 m = hn::BroadcastSignBit(hn::WidenMulPairwiseAdd(d32, za, rays[j]));
+          hog[j] = hn::Add(hog[j], hn::And(g2, m));
+          hog[HRAYS + j] = hn::Add(hog[HRAYS + j], hn::And(g2s, m));
         }
       }
       if (MERGED && k < 3) continue;
@@ -819,25 +817,25 @@ HWY_NOINLINE void bard_phase(const Chunk &C, int64_t tm, V8 mesh1, const uint8_t
 template <class T, class F>
 HWY_INLINE void hog_cum4(F sum, T tot, T *IF_RESTRICT cum4)
 {
-  const T e = sum(K_HOG + 2 * HRAYS);
   if constexpr (std::is_same_v<T, int64_t>)
   {
-    const T t3e = 3 * tot - e, te = tot - e;
+    const T t4 = 4 * tot;
     for (int i = 0; i < HRAYS; ++i)
     {
-      const T s = sum(K_HOG + i), d = sum(K_HOG + HRAYS + i);
-      cum4[i] = s + d + t3e;                // past low ray i
-      cum4[2 * HRAYS - 1 - i] = d - s + te; // past its mirror image
+      const T n = sum(K_HOG + i), d = sum(K_HOG + HRAYS + i);
+      cum4[i] = t4 - 2 * (n + d);            // past low ray i
+      cum4[2 * HRAYS - 1 - i] = 2 * (n - d); // past its mirror image
     }
   }
   else
   {
-    const T t3e = hn::Sub(hn::Add(tot, hn::Add(tot, tot)), e), te = hn::Sub(tot, e);
+    const T t2 = hn::Add(tot, tot), t4 = hn::Add(t2, t2);
     for (int i = 0; i < HRAYS; ++i)
     {
-      const T s = sum(K_HOG + i), d = sum(K_HOG + HRAYS + i);
-      cum4[i] = hn::Add(hn::Add(s, d), t3e);
-      cum4[2 * HRAYS - 1 - i] = hn::Add(hn::Sub(d, s), te);
+      const T n = sum(K_HOG + i), d = sum(K_HOG + HRAYS + i);
+      const T s = hn::Add(n, d), m = hn::Sub(n, d);
+      cum4[i] = hn::Sub(t4, hn::Add(s, s));
+      cum4[2 * HRAYS - 1 - i] = hn::Add(m, m);
     }
   }
 }

@@ -1,6 +1,9 @@
 // HOG row body variants on an L1 buffer. mode: 0 as is; 1 sg4 last; 2 two rows interleaved;
 // 3 software-pipelined (next row's za/g2 before this row's rays); 4 sg4 via double FMA;
-// 5 no sg4 at all; 6 rays only (no E, no sg4)
+// 5 no sg4 at all; 6 rays only (no E, no sg4); 7 signd -> add; 8 madd -> add; 9 the energy
+// short of each ray by mask (shift + and) with E by signd; 10 masks throughout (E as the
+// left side's energy); 11 masks, no E, the left side's share of each short sum (what the flush
+// needs: the kernel after step 36); 12 as 11 with the side sum by signd
 #include <immintrin.h>
 #include <chrono>
 #include <cstdio>
@@ -23,13 +26,27 @@ int main(int argc, char **argv)
   for (int r = 0; r < reps; ++r)
   {
     auto R = [&](int j) { return _mm256_load_si256((const __m256i *)(rt + j * 16)); };
-    if (mode == 0 || mode == 1 || mode == 4 || mode == 5 || mode == 6 || mode == 7 || mode == 8)
+    if (mode == 0 || mode == 1 || mode == 4 || mode == 5 || mode == 6 || mode == 7 || mode == 8 || mode >= 9)
       for (int q = 0; q < rows; ++q)
       {
         const __m256i zl = _mm256_load_si256((const __m256i *)(hb + q * 64));
         const __m256i za = _mm256_abs_epi16(zl);
         const __m256i g2 = _mm256_madd_epi16(zl, zl);
-        if (mode == 0) sg4 = _mm256_add_epi64(sg4, sq64(g2));
+        if (mode == 0 || mode >= 9) sg4 = _mm256_add_epi64(sg4, sq64(g2));
+        if (mode >= 9)
+        {
+          const __m256i ms = _mm256_srai_epi32(zl, 31);
+          const __m256i g2s = mode == 10 ? _mm256_and_si256(g2, ms) : sgn(zl, g2);
+          if (mode < 11) hog[8] = _mm256_add_epi32(hog[8], g2s);
+          for (int j = 0; j < 4; ++j)
+          {
+            const __m256i m = _mm256_srai_epi32(_mm256_madd_epi16(za, R(j)), 31);
+            const __m256i gm = _mm256_and_si256(g2, m);
+            hog[j] = _mm256_add_epi32(hog[j], gm);
+            hog[4 + j] = _mm256_add_epi32(hog[4 + j], mode == 10 || mode == 11 ? _mm256_and_si256(gm, ms) : _mm256_and_si256(g2s, m));
+          }
+          continue;
+        }
         const __m256i g2s = sgn(zl, g2);
         if (mode < 6) hog[8] = _mm256_add_epi32(hog[8], g2s);
         for (int j = 0; j < 4; ++j)
