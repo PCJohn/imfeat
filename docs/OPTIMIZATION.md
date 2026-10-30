@@ -1656,6 +1656,11 @@ discusses). The HSV row loop 7270 → 8516 samples (+17%: twelve more multiplies
 and 1, which carry as much as pipe 3 does) and the target +4.5% / +4.1% at one thread. Not
 kept: the division is cheaper, as the comment says, and on this core for this reason.
 
+Tried after step 35 and reverted: `-falign-loops=64`, to see whether aligning every loop to
+a line would take the placement noise (lesson 13) out of the comparisons. The target +1.6% /
++0.9% at one thread (the HSV row loop grew three instructions of padding and lost nothing;
+the rest moved). Not kept; alignment is one of the things that move, not a fix for it.
+
 Where the target stands after step 35 (pinned to cores 4–7 of one complex, A/B/B/A, six
 rounds, minima): against the branch's start (step 27) 5.88 → 5.60 ms at one thread (−4.7%),
 3.03 → 2.87 at two (−5.4%), 1.60 → 1.50 at four (−6.0%); against the original build in the
