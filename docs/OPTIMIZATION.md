@@ -1803,6 +1803,18 @@ without inline asm, which the portability rule excludes (the clang and SSE4 buil
 ISAs). Lesson 15 holds a third time. What this leaves is the floors themselves: the HOG loop
 at 1.5× its four-pipe floor, the moments loop at 1.4×, the ring at 1.25×, by the dispatcher.
 
+Tried after step 36 and reverted: the LBP ring's eight neighbour tests pinned one after
+another, an empty asm that reads and writes the three running sums after each neighbour
+(an `IF_PIN3` macro, no instruction), so that GCC does not hoist all eight loads and tests
+to the top of the row with nine temporaries live and then keep the five bin counters and
+four of the five vote tables in memory around every row (14 stack references a row). On an
+L1 buffer the row body ran 22.9 cycles from 25.2 (`micro/lbp_row.cpp` modes 6 and 0). In the
+kernel GCC kept the counters in memory regardless, spilled the centre row's bytes instead
+and copied the previous test each neighbour: 85–87 instructions from 79, 15 stack
+references, the loop +13% of its samples (3743 → 4226, 3567 → 4083), the target +1.7% /
++2.3% at one thread, +1.6% at four. Not kept. Bit-identical on the three builds and across
+1–6 threads, for the record.
+
 Where the target stands after step 36 (pinned to cores 4–7 of one complex, A/B/B/A,
 minima): against the branch's start (step 27) 5.88 → 5.58 ms at one thread (−5.1%),
 3.03 → 2.85 at two (−5.9%), 1.60 → 1.485 at four (−7.2%); against the original build in
