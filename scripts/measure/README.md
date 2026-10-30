@@ -25,3 +25,10 @@ relative to the repository. They are conveniences, not a dependency of the build
   job, the hashes), printing the 10th percentile and median of each per frame at exit; build
   it with `build.sh` and run `prof_target.py` against it. How the multi-thread tail was
   split up (steps 33 and 34).
+* `annot.py perf.data lib.so START-END [min]`: the cycle samples per instruction of one loop
+  of a build (addresses as `perf_sig.py` prints them), to see where inside a loop they land.
+* `micro/pipes.cpp`: throughput and pipe assignment of one 256-bit instruction on the host
+  core (16 independent chains under `perf stat` with the AMD `fpu_pipe_assignment` events);
+  `micro/hog_row.cpp` and `micro/responses_row.cpp`: the HOG quarter loop's and the
+  responses loop's row bodies on an L1-resident buffer, in variants, to measure a loop's
+  cost apart from the kernel around it. Build with `g++ -O3 -march=native`.

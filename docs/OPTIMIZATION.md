@@ -1545,6 +1545,71 @@ placement and allocation around an unchanged instruction mix: lesson 13's noise 
 size of what is left here, and a change inside `block()` is now as likely to lose as to
 win on it.
 
+Looked at after step 35, at the request to look where the profile had not: the target path
+outside `block()`, each part measured and closed. The entry: a 32×32 one-level frame takes
+26.7 µs through `features()` and 25.2 µs through the binding alone (the Python wrapper is
+1.5 µs; the 24 views, the capsule and the call are inside the 25 with the frame's own 3K
+pixels), the same at four threads: under 0.5% of the target at one thread and under 2% at
+four. The output block is reused (`Blocks`), so a frame allocates nothing and faults no
+page: the frame's DRAM traffic is 4.8K lines (300 KB), the image's 3 MB comes from L3 (40K
+lines) and the rest from L2. The phase-timed frame at four threads (`mktprof.py`): the band
+job 1352 µs of 1463, the derive job 28, the summary job 75, everything else under 2 µs each
+(the roll-up after the join 1.7, the serial levels 1.5, the summary's write 2.0); at one
+thread the band job 5410 of 5542, the derive 121, the hashes 8. Three dispatches a frame
+are inside that 111 µs tail; the log's "under 1%" for the wake-ups stands. The data TLB:
+42K misses a frame, 86% of them second-level hits of about seven cycles, and 73% of them
+outside the module (the interpreter and the kernel), so the module's share is 0.3% of the
+frame; the planes and the row buffers of a band fit the second-level TLB at 4 KB pages, and
+transparent huge pages (this host: `madvise` mode) would have nothing to give. The hardware
+prefetcher fills L1 with about 0.9 M lines a frame against 62K load misses and 120K store
+misses, most of it the stride prefetcher running past the chunk's last rows on every pass
+down the planes (useless lines, L2 bandwidth only; no loop waits on L1, see the responses
+loop below). Two counters to distrust on this core: `ls_misal_accesses` counts 1.6 M a frame,
+80% of them in the HOG quarter loop whose every load is a 32-byte-aligned vector (the
+pattern is the event counting loads at the upper half of a line, not line crossings; moving
+the rays and the HOG inputs between the two halves of their lines changed nothing); and
+`ls_stlf` (1.5 M a frame) is the LBP ring's own spill slots forwarding to their reloads.
+Nothing outside `block()` is above 0.5%; the kernel loops are, as before, the frame.
+
+The kernel loops by pipe. The core's four vector pipes are not alike, and which pipes an
+instruction may use decides a loop's floor more than its instruction count does. Measured
+here (`scripts/measure/micro/pipes.cpp`: 16 independent chains of one 256-bit instruction
+under the AMD `fpu_pipe_assignment` counters, this host's Zen 2): the 16-bit and 32-bit
+multiplies (`vpmaddwd`, `vpmullw`, `vpmuludq`, `vpmuldq`), `vpsadbw` and `vpblendvb` issue
+on pipe 0 alone, one a cycle (`vpmulld` one per two); `vpsignd`, the saturating byte and
+word subtracts, `vpavgb` and `vpabsw` on pipes 0 and 3, two a cycle; the adds, subtracts,
+compares, min and max of every integer width and `vpblendw` on pipes 0, 1 and 3, three a
+cycle; the logical ops on all four; the shuffles (`vpunpck*`, `vpshufb`, `vpshufd`,
+`vpack*`, `vpalignr`) on pipes 1 and 2, two a cycle, `vextracti128` on pipe 2 alone and
+`vpermq` and `vpmovzxbw` at 0.8–0.9 a cycle on those two; every shift by an immediate on
+pipe 2 alone, one a cycle; `vcvtdq2ps`, `vcvttps2dq` and `vroundps` on pipe 3 alone, one a
+cycle; `vdivps` on pipe 3, one per 3.6 cycles; `vrcpps`, `vmulps`, `vmaxps` and the FMAs on
+pipes 0 and 1; `vaddps`, `vsubps` and `vaddpd` on pipes 2 and 3. So in an integer loop with
+no shuffles and no shifts pipe 2 does nothing, and the loop runs on three pipes with every
+multiply on one of them. Set against the loops: the HOG quarter loop is 29 vector ops a row,
+seven of them pipe-0 multiplies and none for pipe 2, at 13.7 cycles a row (a copy of its
+body on an L1 buffer, `micro/hog_row.cpp`, takes the same 13.7–14.1; the three-pipe floor
+is 9.7 and the dispatcher's assignment does not reach it: in the copy, dropping the two
+64-bit multiplies saves 2.2 cycles, replacing every `vpsignd` by an add 1.1, the same body
+over two rows interleaved, software-pipelined, or with its `|grad|⁴` moved to double FMAs
+nothing). The energy loop's ten multiplies a row-half are its floor (11.6 cycles measured).
+The LBP ring (62 ops, 24 cycles a row) and the bar detector (18 cycles) sit 25–30% above
+their three-pipe floors, the moments loop (10 pipe-0 ops per two rows) at 30 cycles per two
+rows, both on dispatch and dependence rather than a pipe. The HSV row loop is pipe 3's: its
+12 `vcvtdq2ps`, 8 `vcvttps2dq`, 8 `vroundps` and 4 divisions (14 cycles of occupancy) are 42
+of its 65–70 cycles per 32 pixels, and its 35 three-pipe integer ops land a third of
+themselves on pipe 3 too. The responses loop alone is the one with a gap not of this kind:
+its body on an L1 buffer (`micro/responses_row.cpp`) takes 8.9 cycles a row, 7.1 without
+its eight stores, against 16–18 in the kernel, warm (run twice per sub-chunk, the second
+pass costs the same) and with the store sweep worth only two of those cycles (every row's
+stores sent to one row's slots: −13%); about five cycles a row, 2.5% of the frame, remain
+unexplained and were not found by store-queue, forwarding, L1-miss or TLB counters. The
+exact items this account suggests — move the multiplies off pipe 0, the converts and the
+division off pipe 3, or the loops' adds onto pipe 2 — each cost more ops than they free
+(below, tried), and the two-pipe loops are not reachable from the source. On a core with two
+multiply pipes (Zen 3 and later, recent Intel) the HOG loop's floor is 7.25 cycles a row and
+the picture differs; the tool is the way to redraw it there.
+
 Where the target stands after step 35 (pinned to cores 4–7 of one complex, A/B/B/A, six
 rounds, minima): against the branch's start (step 27) 5.88 → 5.60 ms at one thread (−4.7%),
 3.03 → 2.87 at two (−5.4%), 1.60 → 1.50 at four (−6.0%); against the original build in the
@@ -1689,6 +1754,13 @@ this build do the frame in 0.29× the original's single-thread time.
 12. **Symmetries of the constants are algebra too.** The HOG rays' mirror symmetry halved
    the kernel's largest loop's multiplies (step 15); it had been in the table since step 1.
 
+14. **Measure a loop's body apart from the kernel before blaming the kernel.** A copy of
+    the loop body on an L1-resident buffer (`scripts/measure/micro/`) says in a minute what
+    the body costs on its own; the HOG quarter loop's 13.7 cycles a row are all its own (the
+    pipes), the responses loop's 16 are half its own (8.9) and half its surroundings, and the
+    two want different remedies. The per-instruction pipe table from the same directory is
+    what turns an instruction count into a floor.
+
 13. **Below two percent, judge a change by its own loop's cycles.** Code placement alone
     moved the wall clock of this host by ±1.5% (a padding of 24 bytes in a function, nothing
     else); items of that size were accepted and rejected on that noise until the judge
@@ -1734,6 +1806,10 @@ this build do the frame in 0.29× the original's single-thread time.
   nanosecond against the clock. It is the only way to know, without `perf`, that every
   vector multiply shares one pipe on this core and the kernel's largest phase is within 20%
   of that pipe's floor. Run it on the target core before trading instructions for anything.
+  The full per-instruction table of this host (which pipes each integer and float op may
+  use, with throughputs) is in the entry "The kernel loops by pipe" after step 35, made with
+  `scripts/measure/micro/pipes.cpp` under the AMD pipe-assignment counters; the shifts,
+  converts, rounds and divisions each have one pipe here, and the integer adds three.
 * **Instructions per frame**: `valgrind --tool=cachegrind` on a run of 4 frames and a run of
   24, differenced. `callgrind` with a few functions marked `noinline` gives the split by
   stage. For a fused pass driven from Python, `callgrind` on 2 and 12 frames with the self
