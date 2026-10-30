@@ -1617,6 +1617,11 @@ is free). The loop became 75 instructions with nine spills and took 15,247 sampl
 +1.9% at one thread. Bit-identical. Not kept; the same body on an L1 buffer gains nothing
 from the interleave, so the loop is not window-bound but pipe-bound (the entry above).
 
+Tried after step 35 and reverted: the responses loop's invariants (`C.rdn[sub]`, `C.base`,
+`C.resp`) as locals of its lambda, to take its four stack reloads a row out. It did (38 →
+33 instructions, 3716 → 3370 samples, −9% on the loop); the placement around it lost more,
+the target +1.2% / +1.2% at one thread over eight rounds. Bit-identical. Not kept.
+
 Where the target stands after step 35 (pinned to cores 4–7 of one complex, A/B/B/A, six
 rounds, minima): against the branch's start (step 27) 5.88 → 5.60 ms at one thread (−4.7%),
 3.03 → 2.87 at two (−5.4%), 1.60 → 1.50 at four (−6.0%); against the original build in the
