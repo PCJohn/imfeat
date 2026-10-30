@@ -1610,6 +1610,13 @@ division off pipe 3, or the loops' adds onto pipe 2 — each cost more ops than 
 multiply pipes (Zen 3 and later, recent Intel) the HOG loop's floor is 7.25 cycles a row and
 the picture differs; the tool is the way to redraw it there.
 
+Tried after step 35 and reverted: the HOG quarter loop over two rows an iteration, the two
+rows' terms paired before they join the sums (int32 and int64 sums wrap, so the association
+is free). The loop became 75 instructions with nine spills and took 15,247 samples against
+15,821 (−3.6%), the LBP ring and the fold's loop moved the other way, the target +1.7% /
++1.9% at one thread. Bit-identical. Not kept; the same body on an L1 buffer gains nothing
+from the interleave, so the loop is not window-bound but pipe-bound (the entry above).
+
 Where the target stands after step 35 (pinned to cores 4–7 of one complex, A/B/B/A, six
 rounds, minima): against the branch's start (step 27) 5.88 → 5.60 ms at one thread (−4.7%),
 3.03 → 2.87 at two (−5.4%), 1.60 → 1.50 at four (−6.0%); against the original build in the
