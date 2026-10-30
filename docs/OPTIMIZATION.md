@@ -1661,6 +1661,25 @@ a line would take the placement noise (lesson 13) out of the comparisons. The ta
 +0.9% at one thread (the HSV row loop grew three instructions of padding and lost nothing;
 the rest moved). Not kept; alignment is one of the things that move, not a fix for it.
 
+**Step 36, the HOG ray sums by mask, without the side sum (October 30, 2026).** The quarter
+loop flipped the sign of |grad|² by each ray test's sign into a signed sum S per low ray,
+the same by the side into D, and the energy by the side alone into E: nine sign flips a row
+on the two pipes that carry the multiplies here (the table after step 35), nine
+accumulators. The flush needs only the energy of the gradients short of each ray, N, and
+the same by the side, D, with the test's sign bit as the mask -- a shift and an AND, on
+pipes the multiplies leave free: the energy past ray i is T − (Nᵢ + Dᵢ) / 2 and past its
+mirror image (Nᵢ − Dᵢ) / 2 (K_HOG, `hog_cum4`), and E cancels out of both. Eight
+accumulators, one sign flip a row (the side-signed energy), 32 instructions in the row loop
+from 34. The row body alone on an L1 buffer (`micro/hog_row.cpp` modes 9–12: masks with
+E, masks throughout, masks without E by the left side's share, and this form) 14.5 → 13.1
+cycles a row, this form the fastest of the four. In the target the HOG row loop −14% and
+−12% of its samples (7938 → 6808, 7663 → 6776), a multi-cell fold loop +25% (1077 → 1286,
+1014 → 1332: 421 instructions from 435, the new placement), and the target 5.595 → 5.581
+and 5.594 → 5.582 ms at one thread (−0.3%, −0.2%; medians −0.3%, −0.6%), 1.495 → 1.485 at
+four (−0.7%; median −0.4%), pinned, A/B/B/A, twelve rounds. Kept for the loop: a small,
+consistent gain whose mechanism is the pipe table's. Bit-identical on the GCC/AVX2, clang
+and SSE4 builds (40,164 arrays) and across 1–6 threads.
+
 Where the target stands after step 35 (pinned to cores 4–7 of one complex, A/B/B/A, six
 rounds, minima): against the branch's start (step 27) 5.88 → 5.60 ms at one thread (−4.7%),
 3.03 → 2.87 at two (−5.4%), 1.60 → 1.50 at four (−6.0%); against the original build in the
