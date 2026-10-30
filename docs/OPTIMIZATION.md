@@ -125,6 +125,11 @@ Chronologically. Times are single-thread `features()`; instruction counts are pe
 | 24 | Cells derived and rolled up in groups of two vectors (eight) instead of one, with the group's kind stride a whole cache line: the roll-up writes a whole vector of parents per kind and touches each kind's line of the level-1 row (larger than L1 at the gate's sizes) half as often (details below) | By loop cycles: the roll-up loops 553 → 370 samples of 22,472 (−0.8% of the module), the folds unchanged once the stride was even (at the odd stride of 9 they had gained 100); the module's instructions per two gate frames 137.8 M → 136.6 M (−0.9%). Wall clock, pinned A/B/B/A: the gate −1.7%, 16 px cells −1.7%, the headline −0.6%. Bit-identical on the three builds |
 | 25 | The resize's rounding functions store through the saturating pack alone: the explicit clamp to [0, 255] before `DemoteTo` was the pack's own saturation done twice | By loop cycles, two runs each: the finish loop 1605 → 1351 and 1562 → 1353 samples (−0.65% of the module), the module's instructions per two gate frames 136.6 M → 135.7 M (−0.65%); the gate −1.7% pinned A/B/B/A. Byte-identical to cv2 on the three builds |
 | 26 | The resize's periodicity inside the window kernel: where the ratio's period divides the group width, every group's shuffle pattern, weights and window step are the same, which the plan checks byte for byte, and those groups run with the slot tables in registers and the slot count a compile-time constant (details below) | Gate (1920 → 1024, period 8 = one group): the horizontal pass's loops 2565 → 1737 cycle samples of 21,850 in two runs (−3.7% of the module); the module's instructions per two gate frames 135.7 M → 124.5 M (−8.3%); the gate 5.10 → 4.94 ms at one thread (−3.2%) and 2.68 → 2.58 at two (−3.7%), pinned A/B/B/A. Byte-identical to cv2 on the three builds |
+| 28 | Two-cell blocks (16 px cells with 32 lanes) widen their row responses in-lane, as one-cell blocks do, and their int32 kinds fold from the 128-bit halves of the vectors, each half one cell whichever half block or quarter the vector is (details below) | Target scenario, pinned A/B/B/A: −3.3% at one thread, −4.6% at two, −3.0% at four; the responses loop 4059 → 2127 cycle samples. Bit-identical on the three builds and across 1–6 threads |
+| 29 | HSV row: OpenCV's (x + 2¹¹) >> 12 as floor(x 2⁻¹² + ½) in the float path, the odd lanes 2¹⁶ higher so that their integer lands in the high half of the lane and the merge into 16-bit lanes is one blend (details below) | 176 instructions per 32 pixels from 181, 17 shifts from 31; the HSV loop 3735 → 3558 and 3739 → 3553 samples in two runs (−5%); the target −0.7% / −0.9% at one thread. Exact on all 2²⁴ colours on the three builds |
+| 30 | Per-block bookkeeping: `cell % group` (an integer divide per block, group a power of two) as a mask; the bar detector's run bounds found once per chunk instead of once per block and channel | 2,048 `divq` a frame gone: the samples outside loops 8.6% and 8.8% → 8.45% and 8.4% of the module in two runs each; 122 K instructions a frame fewer for the bounds; the wall clock unresolved either way. Bit-identical on the harness |
+| 31 | HSV row: the shared reciprocal taken as HNUM / (v diff), so hdiv's guess is one multiply and sdiv's multiplier is 8.5 diff (8.5 HNUM = SNUM, exact) | 172 instructions per 32 pixels, 132 K a frame fewer; the HSV loop 9.77% and 9.83% → 9.47% and 9.44% of the module in two runs. Exact on all 2²⁴ colours on the three builds |
+| 32 | LBP phase: one loop down the chunk's rows with the nibble counts emptied every 15 rows on the way, instead of an outer pass per 15 rows whose body ran twice for a 16-row chunk | 225 K instructions a frame fewer; the target −1.1% / −1.0% at one thread; the pass loop gone from the profile and the moments loop an instruction shorter beside it (2618 → 2351, 2648 → 2500 samples). Bit-identical on the three builds |
 | 27 | The LBP ring's eight neighbour tests as a saturating subtract compared with zero instead of a max compared with the neighbour: the same mask, the same instruction count, off the two pipes the ring's minima and shuffles queue on (details below) | Headline, by loop cycles, two runs: the LBP loop 3331 → 2966 and 3301 → 2975 samples (−11%, −10%), the module −1.3% and −0.8%. Bit-identical on the three builds |
 | 19 | The level-1 roll-up two kinds per even/odd lane add (a group's one vector of children, both kinds' parents in one vector), and the finest level's summary folded once per cell row instead of once per group of four cells, the same cells in the same order (details below) | The gate's pass (1024×576, six levels from 16×9 px cells), pinned A/B/B/A, 16 rounds: 4.09 → 3.87 ms (−5.4%); 16 px cells at 1024², −3.2%; the headline, −0.2% (its roll-up and summary are under 2% of it). Instructions per two gate frames 124.0 M → 117.6 M; the roll-up loops 6.2 M → 2.7 M, the summary's 6.3 M → 4.3 M. Bit-identical on the three builds |
 | 18 | The resize's finish in one pass: with three resampled rows cached, a destination row's (up to three) tap rows are summed in tap order, rounded and stored as bytes in one sweep instead of a scaled copy, a read-modify-write pass per tap row and a rounding pass (details below, after step 17's) | 1080p → 1024×576, the resize 1.98 → 1.66 ms (−16.5%); 720p → 512×320, −4.6%; the gate's 1080p frame 6.59 → 6.16 ms (−6.6%). Bit-identical on the three builds |
@@ -1262,6 +1267,101 @@ one shift-and-convert pipe), some 4% together, 1.69× at one thread. The contrac
 available from this instruction mix; lesson 1 of LEARNINGS.md holds at the target as at the
 headline. The per-loop table, the scripts and the ablation builds are in `scripts/measure/`
 and the session's notes.
+
+**Step 28, two-cell blocks in-lane (October 30, 2026).** The target's cells are 16 px wide,
+two to a 32-lane block, and such blocks widened their row responses to 16 bits by promotion
+(six `pmovzx` and three extracts a row, on the one pipe this core gives them) because every
+fold took each half block as one cell. In-lane widening (an interleave with zero, two
+pipes) was step 12's largest item and was confined to one-cell blocks, whose folds reduce
+every lane. For two cells the interleave's lane order is just as usable: each 128-bit half of
+every int32 vector -- the pair sums of either half block, the HOG sums of any quarter, the
+fourth powers -- is then one cell, so a kind's vectors add first and a cell's four lanes
+reduce through one interleave level, both cells stored at once (`fold_pair_inlane`,
+`fold_hog_inlane`; the pair kinds' lanes sum four at a time within 32 bits as the batched
+fold did, the HOG's four quarters add first and reduce as int64). The byte kinds are per
+column and unchanged. Target scenario, pinned A/B/B/A: 5.84 → 5.65 ms at one thread
+(−3.3%), −4.6% at two, −3.0% at four; the responses loop 4059 → 2127 cycle samples. The
+fold itself did not get cheaper: its 1,200 straight-line samples (3.3% of the module,
+shuffle-bound) are what the old fold loops cost, and the energy phase's per-chunk epilogue
+grew by twelve register copies from the new allocation in `cell_row` (0.2% of the frame's
+instructions; the fold in a function of its own, tried as the bar detector's phase was, did
+not take them back: −0.4% on the wall clock against the mask alone, within noise, the loop
+unchanged; not kept). Bit-identical on the GCC/AVX2, clang and SSE4 builds (40,164 arrays)
+and across 1–6 threads.
+
+**Steps 29 and 31, the HSV row's shifts and multiplies (October 30, 2026).** The conversion
+is 12% of the target frame, 0.57 ms by ablation, a loop of 181 instructions per 32 pixels of
+which 51 (31 shifts, 20 converts) sat on one pipe, and it runs four chains of some fifty
+cycles' latency per 32 pixels, so every instruction removed is worth about 0.4 cycles of its
+70. OpenCV's `(x + 2^11) >> 12` is `floor(x 2^-12 + 1/2)`, and in the float path that is
+free of shifts: the table's multiplier (diff or h6) is scaled by 2^-12 while the reciprocal
+is still in flight, the half rides in the fused multiply-add's addend, and a truncating
+convert of the non-negative result (h carries a bias of 32, taken off in 16-bit lanes) is
+the floor -- every intermediate has at most 22 significant bits, so every step is exact. The
+odd lanes are scaled by 2^16 more, which puts their integer in the high 16 bits of the lane
+with the fraction's bits below it, and the merge into 16-bit lanes is then one blend
+(`OddEven`, a `vpblendw`) instead of a mask, a shift and an or; the sign fix of h becomes a
+compare. The first form scaled the table value after its rounding, one dependent multiply
+on each chain where the shift had sat after the convert, and measured nothing (the HSV
+loop 5060 → 4687 then 3648 → 3624 samples): with the scaling on the multiplier instead,
+ready before the division, the loop went 3735 → 3558 and 3739 → 3553 samples in two runs at
+176 instructions and 17 shifts, the target −0.7% / −0.9% at one thread. Then the
+reciprocal: taken as HNUM / (v diff) instead of 1 / (v diff), hdiv's guess is v times it
+and sdiv's is 8.5 diff times it (8.5 diff exact, 8.5 HNUM = SNUM, a `static_assert`), each
+guess still within the two roundings `hsv_table` allows: four multiplies per 32 pixels
+fewer, 172 instructions, the loop's share 9.77% and 9.83% → 9.47% and 9.44% of the module in
+two runs, the wall clock unresolved. Both exact on all 2^24 colours against cv2 on the three
+builds and bit-identical on the harness. The loop's rest is the lane split and the h6
+selects, each at its count; the deinterleave of the packed BGR costs nothing (above).
+
+**Step 30, bookkeeping (October 30, 2026).** A count of the divider instructions a frame
+executes (callgrind's per-instruction counts against the symbol build's listing, the
+method of lesson 5): 132 K `vdivps` (the HSV row's, four per 32 pixels), 29 K `vdivpd` and
+12 K `vsqrtpd` (seven divides and three roots per call of `derive_lanes`, distinct in
+numerator and denominator, so nothing to share), and 2,048 `divq` from `cell % group` in
+`cell_row`'s block loop, `group` being always a power of two (GROUP, or the cells a block
+spans): a mask now, worth 0.3% by the samples outside loops (8.6% and 8.8% → 8.45% and 8.4%
+of the module, two runs each; the wall clock read +0.5% on one run, placement). And
+`bard_phase` found the run of rows whose lags all fit the image by scanning the chunk's
+row table on every call, once per block and channel: found once per chunk in `cell_row`
+and carried in `Chunk`, 122 K instructions a frame fewer, the wall clock +0.1%, unresolved.
+Both kept on their counts: strictly fewer instructions outside every hot loop.
+
+**Step 32, the LBP phase in one pass (October 30, 2026).** The nibble-counted bins were
+emptied by an outer loop of LBP_NIB (15) rows around the ring loop, and at the target's
+16-row chunks its body ran twice, the second time for one row: 135 instructions a pass (the
+nine byte accumulators and the tables spilled and reloaded around the ring, the nibbles
+zeroed, the emptying). The ring loop now walks all the chunk's rows once and empties the
+nibbles every LBP_NIB rows on the way, once more at the end for the rest: the same byte adds
+in the same order. 225 K instructions a frame fewer; the target 5.85 → 5.78 ms at one thread
+(−1.1%, −1.0% on the median); the pass loop is gone from the profile and the moments loop
+came out an instruction shorter beside it (46 → 45; 2618 → 2351 and 2648 → 2500 samples),
+the ring loop itself unchanged (3930 → 3850, 4081 → 4193). Bit-identical on the three builds.
+
+Tried after step 32 and reverted: `flush4`'s 44 slot vectors go to the stack and come back
+for the 4×4 transposes (its loop at 2.9 cycles per instruction share); emitting each group
+of four slots as soon as it is complete, in slot order, took ten register copies out of the
+loop (381 → 371 instructions, 8 K a frame) and its samples went 313 → 233 in one run and 225
+→ 360 in the next, so nothing resolved and nothing kept; GCC keeps the array in memory
+either way.
+
+Two traps of this host, for the record. Three builds of some twenty died in the compiler
+(an internal error in GCC on nanobind's `nb_enum.cpp`, twice, and a clang crash on
+Highway's `per_target.cc`), each on a file that compiles every other time: the memory, as
+with the large-array tests; rebuild. And when a package named by `PYTHONPATH` has no
+module, Python imports the installed `imfeat` and times that one (the original, 9.9 ms on
+the target) without a word; the measurement scripts now refuse to run on a module outside
+`PYTHONPATH`.
+
+Where the target stands after step 32 (pinned to cores 4–7 of one complex, A/B/B/A, six
+rounds, minima): against the branch's start (step 27) 5.88 → 5.66 ms at one thread (−3.8%),
+3.00 → 2.92 at two (−2.6%), 1.57 → 1.54 at four (−2.0%); against the original build in the
+same session 9.78 → 5.64, 5.05 → 2.91 and 2.68 → 1.53 ms, 1.73× / 1.74× / 1.75×. The
+instruction count of the target frame went 72.5 M → 69.6 M (−4.0%). Of the five steps, one
+(28) was above the wall clock's resolution and four were taken on their loop samples and
+instruction counts; together they are the 4% the profile had put as the ceiling of the
+exact items, and the six kernel loops are where they were: 2× remains out of reach within
+the contract, for the reasons in that entry.
 
 Where the single thread stands after step 15: 1.75× the original at the headline
 configuration (7.51 → 4.28 ms pinned on a quiet core), 1.88× at 128 px cells, 1.72× with one

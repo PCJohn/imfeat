@@ -2,7 +2,7 @@
 # pinned to N idle physical cores, A/B/B/A over R rounds: abba_nc.sh N R pkgA pkgB script args...
 S=$(dirname $(readlink -f $0))
 N=$1; R=$2; A=$3; B=$4; shift 4
-cores=$(python3 $S/idle_cores.py $N)
+cores=${ABBA_CORES:-$(python3 $S/idle_cores.py $N)}
 ta=""; tb=""
 for rnd in $(seq 1 $R); do
   for p in A B B A; do
