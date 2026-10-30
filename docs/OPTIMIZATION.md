@@ -1726,6 +1726,16 @@ micro-benchmarks' bodies are not the kernel's allocation (lesson 14 again), and 
 loads' addresses come through a table the micro-benchmark strides past. Bit-identical on the
 three builds and across 1–6 threads, for the record.
 
+Tried after step 36 and reverted: the LBP ring's neighbour test (nb ≥ c, a saturating
+subtract and a compare against zero) as a signed compare of the bytes with their top bit
+flipped, the flip on any pipe where the saturating subtract queues on the two the ring's
+minima and sums fill; the complemented masks sum to −8 − popcount and the transitions are
+the same xors. On an L1 buffer the row body ran 27.8 cycles from 28.7 (`micro/lbp_row.cpp`
+modes 1 and 0; the bin's select as an OR of the sign bit, mode 2, 28.2). In the target the
+loop's samples −0.6% then +1.9% (3703 → 3681, 3576 → 3644), the target +0.4% / +0.3% at one
+thread, +0.3% at four. Not kept. Bit-identical on the three builds and across 1–6 threads,
+for the record.
+
 Where the target stands after step 35 (pinned to cores 4–7 of one complex, A/B/B/A, six
 rounds, minima): against the branch's start (step 27) 5.88 → 5.60 ms at one thread (−4.7%),
 3.03 → 2.87 at two (−5.4%), 1.60 → 1.50 at four (−6.0%); against the original build in the
