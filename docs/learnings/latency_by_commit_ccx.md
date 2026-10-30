@@ -32,3 +32,5 @@
 | 29 | 9544713 | 5.693 | 2.915 | 1.557 |  | Per-block bookkeeping: the group modulo as a mask; the bar detector's run bounds once per chunk |
 | 30 | dfe62b0 | 5.705 | 2.980 | 1.562 |  | HSV row: one reciprocal carries HNUM, so hdiv's guess is one multiply |
 | 31 | b4e65e4 | 5.643 | 2.907 | 1.538 |  | LBP phase: one loop down the rows, the nibbles emptied on the way |
+| 32 | a25107e | 5.689 | 2.911 | 1.524 |  | The coarser levels rolled up in the bands, a vector of the stripe at a time |
+| 33 | ba4a003 | 5.698 | 2.930 | 1.521 |  | The hashes derived on the summary job's least-loaded thread |

@@ -20,3 +20,8 @@ relative to the repository. They are conveniences, not a dependency of the build
   symbol build); `loopid.py sym.asm a-b ...` names a loop by its size, opcode mix and the
   source lines inside it; `perf_sig.py` and `loopdiff.py` the same on stripped builds,
   loops matched between two builds by signature.
+* `mktprof.py SRC DST`: a copy of the source tree with steady-clock stamps around every job
+  and serial stretch of a frame (`accumulate`, the derive job, the serial levels, the summary
+  job, the hashes), printing the 10th percentile and median of each per frame at exit; build
+  it with `build.sh` and run `prof_target.py` against it. How the multi-thread tail was
+  split up (steps 33 and 34).

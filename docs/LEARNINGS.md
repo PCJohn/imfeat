@@ -15,7 +15,7 @@ measured timeline and the summary of lessons. Read this one first, that one for 
 | start | `3957392` | 2026-10-28 | `main` at *Add AGENTS.md*: the code before this branch. Steps 1–9 of the engineering log are already in it. Every "original" or "base" number below is this commit |
 | last code change | `cf40d37` | 2026-10-29 | step 27, *LBP ring: the neighbour test as a saturating subtract compared with zero* |
 | checkpoint | `b6f55fb` | 2026-10-29 | this report's first version, the benchmark it adds and the measurement script; no change to the core |
-| continued | `bde5b6c`..`b4e65e4` | 2026-10-30 | steps 28–32 of the log, from a per-loop profile of the target scenario itself (branch `claude/toward-2x-f3c09d`): five small exact items, 1.73× / 1.74× / 1.75× the base at 1 / 2 / 4 threads |
+| continued | `bde5b6c`..`ba4a003` | 2026-10-30 | steps 28–34 of the log, from a per-loop profile of the target scenario itself and a phase-timed four-thread frame (branch `claude/toward-2x-f3c09d`): seven small exact items |
 
 Between them: 26 commits that change `src/imfeat/core.cpp` (the engineering log's steps
 10–27; some steps took two or three commits) and 25 commits that change only the log and the
@@ -80,9 +80,11 @@ Minimum latency in ms of the target scenario at 1, 2 and 4 threads, and of the s
 and after every code commit, oldest first. Index 0 is the base. Each number is the minimum
 over the three runs of section 2; the runs on their own are
 [run 1](learnings/latency_by_commit_run1.md), [run 2](learnings/latency_by_commit_run2.md)
-and the [single-complex target run](learnings/latency_by_commit_ccx.md). Rows 27–31
+and the [single-complex target run](learnings/latency_by_commit_ccx.md). Rows 27–33
 (October 30) were added by the same three runs resumed over the new commits alone, on a
-busier day: their numbers are one run each, not the quiet minimum of several sessions. The 2- and 4-thread
+busier day (another job on the box for rows 32–33): their numbers are one run each, not
+the quiet minimum of several sessions; the log's A/B/B/A numbers are the judge of those
+steps. The 2- and 4-thread
 rows come almost entirely from the last (25 and 27 of the 27 entries), the only run whose
 threads never crossed the core complexes; the 1-thread row and the headline, which the
 target run does not include, come mostly from run 2 (23 and 24 of 27), the quieter of the
@@ -122,6 +124,8 @@ two full runs.
 | 29 | `9544713` | 5.614 | 2.915 | 1.557 | 5.091 | Per-block bookkeeping: the group modulo as a mask; the bar detector's run bounds once per chunk |
 | 30 | `dfe62b0` | 5.681 | 2.980 | 1.562 | 5.172 | HSV row: one reciprocal carries HNUM, so hdiv's guess is one multiply |
 | 31 | `b4e65e4` | 5.619 | 2.907 | 1.538 | 5.119 | LBP phase: one loop down the rows, the nibbles emptied on the way |
+| 32 | `a25107e` | 5.644 | 2.911 | 1.524 | 5.193 | The coarser levels rolled up in the bands, a vector of the stripe at a time |
+| 33 | `ba4a003` | 5.698 | 2.927 | 1.521 | 5.146 | The hashes derived on the summary job's least-loaded thread |
 
 The same, as speed-ups against the base:
 
@@ -159,6 +163,8 @@ The same, as speed-ups against the base:
 | 29 | `9544713` | 1.68× | 1.72× | 1.71× | 1.69× | Per-block bookkeeping: the group modulo as a mask; the bar detector's run bounds once per chunk |
 | 30 | `dfe62b0` | 1.66× | 1.68× | 1.71× | 1.66× | HSV row: one reciprocal carries HNUM, so hdiv's guess is one multiply |
 | 31 | `b4e65e4` | 1.68× | 1.72× | 1.73× | 1.68× | LBP phase: one loop down the rows, the nibbles emptied on the way |
+| 32 | `a25107e` | 1.67× | 1.72× | 1.75× | 1.65× | The coarser levels rolled up in the bands, a vector of the stripe at a time |
+| 33 | `ba4a003` | 1.66× | 1.71× | 1.75× | 1.67× | The hashes derived on the summary job's least-loaded thread |
 
 ## 4. What worked: the committed changes
 
@@ -202,6 +208,8 @@ this column is the log's: 1024×1024×3 at a 32×32 finest grid, stride 1, one t
 | 29 | `9544713` | 30 | `cell % group` (an integer divide per block) as a mask; the bar detector's run bounds once per chunk | 2,048 `divq` a frame gone, 0.3% by the samples outside loops; 122 K instructions a frame fewer |
 | 30 | `dfe62b0` | 31 | HSV row: the shared reciprocal carries HNUM, so hdiv's guess is one multiply | 172 instructions per 32 pixels; the HSV loop's share 9.8% → 9.45% of the module in two runs |
 | 31 | `b4e65e4` | 32 | LBP phase as one loop down the rows, the nibbles emptied every 15 rows on the way instead of a second pass for a 16-row chunk's last row | 225 K instructions a frame fewer; the target −1.1% / −1.0% at one thread |
+| 32 | `a25107e` | 33 | The coarser levels rolled up inside the derive job by the bands (every level whose rows split evenly across them), the rest serially after | 35 µs of serial roll-up spread over the bands: −1.2% at four threads, neutral at two and one |
+| 33 | `ba4a003` | 34 | The hashes derived by the summary job's least-loaded thread while the others fold | with step 33: −2.3% / −2.1% at four threads, −0.6% / −1.0% at two, +0.4% (placement) at one |
 
 Where the time went at the target after step 32 (the log's "Profiled after step 27" entry
 has the table): the six kernel loops 66% of the frame, the HSV row 12%, the per-chunk

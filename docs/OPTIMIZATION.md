@@ -129,6 +129,8 @@ Chronologically. Times are single-thread `features()`; instruction counts are pe
 | 29 | HSV row: OpenCV's (x + 2¹¹) >> 12 as floor(x 2⁻¹² + ½) in the float path, the odd lanes 2¹⁶ higher so that their integer lands in the high half of the lane and the merge into 16-bit lanes is one blend (details below) | 176 instructions per 32 pixels from 181, 17 shifts from 31; the HSV loop 3735 → 3558 and 3739 → 3553 samples in two runs (−5%); the target −0.7% / −0.9% at one thread. Exact on all 2²⁴ colours on the three builds |
 | 30 | Per-block bookkeeping: `cell % group` (an integer divide per block, group a power of two) as a mask; the bar detector's run bounds found once per chunk instead of once per block and channel | 2,048 `divq` a frame gone: the samples outside loops 8.6% and 8.8% → 8.45% and 8.4% of the module in two runs each; 122 K instructions a frame fewer for the bounds; the wall clock unresolved either way. Bit-identical on the harness |
 | 31 | HSV row: the shared reciprocal taken as HNUM / (v diff), so hdiv's guess is one multiply and sdiv's multiplier is 8.5 diff (8.5 HNUM = SNUM, exact) | 172 instructions per 32 pixels, 132 K a frame fewer; the HSV loop 9.77% and 9.83% → 9.47% and 9.44% of the module in two runs. Exact on all 2²⁴ colours on the three builds |
+| 33 | The coarser levels rolled up inside the derive job by the bands, each its own rows from its own rows of the level below, for every level whose rows split evenly across the bands; the rest, and the global sums, serially after; the children added in registers and the parent stored once (details below) | 35 µs of serial roll-up a frame spread over the bands: the target −1.2% at four threads, neutral at two and one (the single-thread roll-up is bound by the level-1 slots' memory traffic). Bit-identical on the three builds and across 1–6 threads |
+| 34 | The hashes (the mean grid's DCT, 9–11 µs, serial after the summary) derived by the summary job's least-loaded thread while the others fold | With step 33: the target −2.3% / −2.1% at four threads, −0.6% / −1.0% at two, +0.4% at one (placement: the phases are unchanged there) |
 | 32 | LBP phase: one loop down the chunk's rows with the nibble counts emptied every 15 rows on the way, instead of an outer pass per 15 rows whose body ran twice for a 16-row chunk | 225 K instructions a frame fewer; the target −1.1% / −1.0% at one thread; the pass loop gone from the profile and the moments loop an instruction shorter beside it (2618 → 2351, 2648 → 2500 samples). Bit-identical on the three builds |
 | 27 | The LBP ring's eight neighbour tests as a saturating subtract compared with zero instead of a max compared with the neighbour: the same mask, the same instruction count, off the two pipes the ring's minima and shuffles queue on (details below) | Headline, by loop cycles, two runs: the LBP loop 3331 → 2966 and 3301 → 2975 samples (−11%, −10%), the module −1.3% and −0.8%. Bit-identical on the three builds |
 | 19 | The level-1 roll-up two kinds per even/odd lane add (a group's one vector of children, both kinds' parents in one vector), and the finest level's summary folded once per cell row instead of once per group of four cells, the same cells in the same order (details below) | The gate's pass (1024×576, six levels from 16×9 px cells), pinned A/B/B/A, 16 rounds: 4.09 → 3.87 ms (−5.4%); 16 px cells at 1024², −3.2%; the headline, −0.2% (its roll-up and summary are under 2% of it). Instructions per two gate frames 124.0 M → 117.6 M; the roll-up loops 6.2 M → 2.7 M, the summary's 6.3 M → 4.3 M. Bit-identical on the three builds |
@@ -1353,8 +1355,56 @@ module, Python imports the installed `imfeat` and times that one (the original, 
 the target) without a word; the measurement scripts now refuse to run on a module outside
 `PYTHONPATH`.
 
-Where the target stands after step 32 (pinned to cores 4–7 of one complex, A/B/B/A, six
-rounds, minima): against the branch's start (step 27) 5.88 → 5.66 ms at one thread (−3.8%),
+**Steps 33 and 34, the tail at several threads (October 30, 2026).** The 4-thread target
+(1.54 ms) against a quarter of the single-thread frame (1.41 ms) leaves 0.13 ms, and a
+phase-timed build (`scripts/measure/mktprof.py`: steady-clock stamps around every job
+and serial stretch, the 10th percentile and median per phase over 300 frames) put it as:
+the summary job 85–100 µs at four threads and 109 at two (about 43 µs of arithmetic; the
+rest is reading records other cores wrote, as step 21 found), the coarser levels' roll-up
+35 µs serial at every thread count, the hash DCT 9–11 µs serial, the derive job 36 µs at
+four threads, the rest under 3 µs each. Two of those are exact to move. The roll-up: level
+2 and up were summed from their children after the join on the main thread (a scalar copy
+and three read-modify-write passes per parent over the 132-int64 stripe); every level whose
+rows split evenly across the bands is now rolled up and derived inside the derive job,
+each band its own rows from its own rows of the level below -- level 1 is complete at the
+join, and a band's share of level l's children is exactly its share of level l − 1 when
+level l's rows divide by the band count -- and the first level that does not split (at
+four bands the two-row and one-row levels) and those above it follow serially before the
+global sums; the children add in registers and the parent is stored once. The same integer
+sums and the same derive per cell. At one thread the roll-up costs what it did (the derive
+job with it 124.6 µs against 89 + 35 before: it is bound by the level-1 slots' memory
+traffic, 1 MB read from L3), so the gain is the spread: −1.2% at four threads, neutral at
+two and one. Then the hashes: their grid sums are complete after the accumulation, so with
+several bands the summary job's least-loaded thread (by the dealt run sizes) derives them
+while the others fold; a lone band derives them after the summary as before. With both,
+pinned inside one complex, A/B/B/A: the target −2.3% / −2.1% at four threads, −0.6% /
+−1.0% at two, and +0.4% twice at one thread, where no phase changed (placement). Bit-identical
+on the GCC/AVX2, clang and SSE4 builds, across 1–6 threads, the 740 tests passing. A first
+cut of step 33 looped `derive_cells` to a level past the end for a one-level pyramid (the
+first level the bands cannot share is the second, which a one-level pyramid lacks): a
+SIGFPE in the harness's first configuration, caught before anything was timed.
+
+Looked at with the same build and left alone. The summary job's reads: each thread's
+lanes are a contiguous window of every record (adjacent runs of one channel are merged), so
+it already touches about one line per record per thread; what it pays is the fetch of lines
+other cores wrote, which only folding in-band would avoid, and that reassociates the sums
+(step 21, the band-independent summary). The derive job's levels are split by cells, which
+coincides with the roll-up's split by rows. A newer compiler: this host has `gcc-12` but no
+C++ front end for it (no `cc1plus`), so GCC 11 is the only GCC here; clang 14 was slower
+(after step 22). The per-chunk fixed costs at 16-row chunks, re-examined per loop: the
+energy phase's corrections (386 instructions a block and channel) are what the product-sum
+form costs at 16 rows, where the log found the plain loop neutral; the responses' two halo
+rows (2 of 18) would need the responses kept per block across cell rows for 0.3%; the HOG
+quarters' prologue copies the rays between stack slots (0.3%), where two earlier attempts
+lost; none built.
+
+Where the target stands after step 34 (pinned to cores 4–7 of one complex, A/B/B/A, six
+rounds, minima): against the branch's start (step 27) 5.88 → 5.68 ms at one thread (−3.4%),
+3.03 → 2.93 at two (−3.5%), 1.60 → 1.52 at four (−5.2%); against the original build in the
+same session 9.84 → 5.69, 5.06 → 2.92 and 2.70 → 1.51 ms, 1.73× / 1.74× / 1.79×. The
+four-thread tail is now the summary job (about 90 µs, two thirds of it reading records
+other cores wrote), the derive job and two wake-ups; within the contract that is where it
+ends. After step 32 it was: against the branch's start (step 27) 5.88 → 5.66 ms at one thread (−3.8%),
 3.00 → 2.92 at two (−2.6%), 1.57 → 1.54 at four (−2.0%); against the original build in the
 same session 9.78 → 5.64, 5.05 → 2.91 and 2.68 → 1.53 ms, 1.73× / 1.74× / 1.75×. The
 instruction count of the target frame went 72.5 M → 69.6 M (−4.0%). Of the five steps, one
