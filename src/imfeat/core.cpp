@@ -1326,6 +1326,7 @@ constexpr int32_t HSV_SNUM = 255 << HSV_SHIFT;
 constexpr int32_t HSV_HNUM = (180 << HSV_SHIFT) / 6;
 constexpr int32_t HSV_HALF = 1 << (HSV_SHIFT - 1);
 constexpr int32_t HSV_HRANGE = 180;
+constexpr int32_t HSV_HBIAS = 32; // hsv_lanes keeps h (in [-30, 150]) non-negative by this much
 
 struct HsvTables
 {
@@ -1353,17 +1354,14 @@ inline void hsv_pixel(int b, int g, int r, uint8_t *IF_RESTRICT hsv)
 
 // Even and odd lanes of a vector as the next wider type, and back. The even lanes are the low
 // halves and the odd ones the high halves, so a split is a mask or a shift and a merge a shift
-// and an or: no shuffles, whose port is the scarce one on Intel cores, and the order of the
-// lanes takes care of itself. A merge of signed lanes masks the even ones' sign extension.
+// and an or (or, where the odd lanes' values already sit in the high halves, one blend: see
+// hsv_block): no shuffles, whose port is the scarce one on Intel cores, and the order of the
+// lanes takes care of itself.
 HWY_INLINE V16 even8(V8 v) { return hn::And(hn::BitCast(d16, v), hn::Set(d16, 0x00FF)); }
 HWY_INLINE V16 odd8(V8 v) { return hn::BitCast(d16, hn::ShiftRight<8>(hn::BitCast(du16, v))); }
 HWY_INLINE V32 even16u(V16 v) { return hn::And(hn::BitCast(d32, v), hn::Set(d32, 0xFFFF)); }
 HWY_INLINE V32 even16(V16 v) { return hn::ShiftRight<16>(hn::ShiftLeft<16>(hn::BitCast(d32, v))); }
 HWY_INLINE V32 odd16(V16 v) { return hn::ShiftRight<16>(hn::BitCast(d32, v)); }
-HWY_INLINE V16 merge16(V32 even, V32 odd)
-{
-  return hn::BitCast(d16, hn::Or(hn::And(even, hn::Set(d32, 0xFFFF)), hn::ShiftLeft<16>(odd)));
-}
 HWY_INLINE V8 merge8(V16 even, V16 odd) // lanes in [0, 255]
 {
   return hn::BitCast(d8, hn::Or(even, hn::ShiftLeft<8>(odd)));
@@ -1408,32 +1406,42 @@ HWY_INLINE VF hsv_table(VF g)
 
 // Eight (or more) pixels' s and h -- OpenCV's integers, in float arithmetic that is exact at
 // every step where it has to be: v, diff and h6 are small integers; sdiv[v] and hdiv[diff] come
-// out of hsv_table exactly; each fixed-point product is below 2^21, so it and its + 2^11 are
-// exact; and the final >> 12 is the integer shift, which floors like OpenCV's. Both table
-// values share one reciprocal, 1 / (v * diff): sdiv = SNUM * diff * r, hdiv = HNUM * v * r,
-// where SNUM * diff and HNUM * v are exact (they are 2^12 * 255 * diff and 2^13 * 15 * v), so
-// each guess carries the reciprocal's rounding and one of its own: within 2^-23 relative,
-// which is what hsv_table needs. When diff is 0 (v too, or a grey)
-// the products that use the tables are 0, so the tables may be anything finite: the
-// reciprocal is taken of max(v * diff, 1).
-template <bool kH, bool kS>
+// out of hsv_table exactly; each fixed-point product is below 2^20, so it is exact, and
+// OpenCV's (x + 2^11) >> 12 is floor(x 2^-12 + 1/2): the table's multiplier (diff or h6) is
+// scaled by 2^-12 (a power of two: exact) while the reciprocal is still in flight, the half
+// rides in the fused multiply-add's addend (the sum has at most 21 significant bits: exact),
+// and a truncating convert of the non-negative result is its floor. The result goes to the low 16 bits of each lane or, kODD, to the high 16 bits:
+// then everything is scaled by 2^16 more (still exact: the sum has the same significant bits
+// an exponent higher), so the integer lands in the high half with the fraction's bits below
+// it, which the caller's blend into 16-bit lanes drops. No shift either way, and the two
+// become one blend. h is in [-30, 150], so it carries a bias of HSV_HBIAS that keeps it
+// non-negative for the truncation; the caller takes it off. Both table values share one
+// reciprocal, 1 / (v * diff): sdiv = SNUM * diff * r, hdiv = HNUM * v * r, where SNUM * diff
+// and HNUM * v are exact (they are 2^12 * 255 * diff and 2^13 * 15 * v), so each guess
+// carries the reciprocal's rounding and one of its own: within 2^-23 relative, which is
+// what hsv_table needs. When diff is 0 (v too, or a grey) the products that use the tables
+// are 0, so the tables may be anything finite: the reciprocal is taken of max(v * diff, 1).
+template <bool kH, bool kS, bool kODD>
 HWY_INLINE void hsv_lanes(V32 v, V32 diff, V32 h6, V32 &s, V32 &h)
 {
   IF_STRICT_BODY
   const DF df;
+  constexpr float kUnit = kODD ? 65536.0f : 1.0f;             // where 1 lands in the lane
+  constexpr float kScale = kUnit / (float)(1 << HSV_SHIFT); // the table value's 2^-12
   const VF vf = hn::ConvertTo(df, v), dfv = hn::ConvertTo(df, diff);
-  const VF half_ = hn::Set(df, (float)HSV_HALF);
+  const VF scale = hn::Set(df, kScale), dfs = hn::Mul(dfv, scale); // (off the chain)
   const VF r = hsv_recip(hn::Max(hn::Mul(vf, dfv), hn::Set(df, 1.0f)));
   if (kS)
   {
     const VF sdiv = hsv_table<HSV_SNUM>(hn::Mul(hn::Mul(hn::Set(df, (float)HSV_SNUM), dfv), r));
-    s = hn::ShiftRight<HSV_SHIFT>(hn::ConvertInRangeTo(d32, hn::MulAdd(dfv, sdiv, half_)));
+    s = hn::ConvertInRangeTo(d32, hn::MulAdd(dfs, sdiv, hn::Set(df, 0.5f * kUnit)));
   }
   if (kH)
   {
     const VF hdiv = hsv_table<HSV_HNUM>(hn::Mul(hn::Mul(hn::Set(df, (float)HSV_HNUM), vf), r));
-    const VF t = hn::MulAdd(hn::ConvertTo(df, h6), hdiv, half_);
-    h = hn::ShiftRight<HSV_SHIFT>(hn::ConvertInRangeTo(d32, t));
+    const VF t = hn::MulAdd(hn::Mul(hn::ConvertTo(df, h6), scale), hdiv,
+                            hn::Set(df, ((float)HSV_HBIAS + 0.5f) * kUnit));
+    h = hn::ConvertInRangeTo(d32, t);
   }
 }
 
@@ -1465,13 +1473,18 @@ HWY_INLINE void hsv_block(V8 b, V8 g, V8 r, V8 &h, V8 &s, V8 &v)
     {
       const V32 v2 = q ? odd16(v1) : even16u(v1), d2 = q ? odd16(d1) : even16u(d1);
       const V32 h2 = kH ? (q ? odd16(h6) : even16(h6)) : hn::Zero(d32);
-      hsv_lanes<kH, kS>(v2, d2, h2, s32[q], h32[q]);
+      q ? hsv_lanes<kH, kS, true>(v2, d2, h2, s32[q], h32[q])
+        : hsv_lanes<kH, kS, false>(v2, d2, h2, s32[q], h32[q]);
     }
-    if (kS) s16[half] = merge16(s32[0], s32[1]);
-    if (kH) // h is in [-30, 150]: + 180 where negative
+    // the even lanes' results sit in their lanes' low 16 bits and the odd lanes' in the high
+    // 16 (hsv_lanes): one blend merges them
+    auto merge = [&](V32 even, V32 odd) { return hn::OddEven(hn::BitCast(d16, odd), hn::BitCast(d16, even)); };
+    if (kS) s16[half] = merge(s32[0], s32[1]);
+    if (kH) // h + HSV_HBIAS; h is in [-30, 150]: + 180 where negative
     {
-      const V16 hh = merge16(h32[0], h32[1]);
-      h16[half] = hn::Add(hh, hn::And(hn::BroadcastSignBit(hh), hn::Set(d16, HSV_HRANGE)));
+      const V16 hb = merge(h32[0], h32[1]), bias = hn::Set(d16, HSV_HBIAS);
+      const V16 wrap = hn::And(hn::VecFromMask(d16, hn::Lt(hb, bias)), hn::Set(d16, HSV_HRANGE));
+      h16[half] = hn::Add(hn::Sub(hb, bias), wrap);
     }
   }
   if (kS) s = merge8(s16[0], s16[1]);
