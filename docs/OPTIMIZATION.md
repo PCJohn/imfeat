@@ -1736,6 +1736,32 @@ loop's samples −0.6% then +1.9% (3703 → 3681, 3576 → 3644), the target +0.
 thread, +0.3% at four. Not kept. Bit-identical on the three builds and across 1–6 threads,
 for the record.
 
+Looked at after step 36, at the request to keep looking: the loops' speeds settled by
+phase timers rather than samples. A copy of the source with `__rdtsc()` around each phase
+of `block()` (the scratch `src_tprof`; the TSC runs at 3.6 GHz against the core's 4.2)
+gives, per sampled row of the target at one thread, 143 ticks in `block()`: the LBP ring
+24, the bar detector 19, the responses 10 (over 18 distinct rows for 16 sampled: 10.7 core
+cycles each, 8.9 alone), the energies 29 (both halves, with their once-per-chunk
+corrections), the moments 14 (8.3 a row-half, 8.8 alone), the HOG quarters 43 (12.5 a
+quarter-row, 13.1 alone), the code between phases 4. Every loop runs at the speed its body
+runs on an L1 buffer, give or take its prologue and exit, so the "unexplained" cycles of the
+fifth round were the sampled-row/distinct-row accounting. Also closed with numbers: the
+store-to-load interlocks (`ls_bad_status2.stli_other`, 71K a frame, in the LBP ring's spill
+slots and the HOG loop, a quarter-percent); the responses' stores hit L1 (`ls_mab_alloc.
+stores` 1.7K a frame in that loop against 139K lines written); branch mispredicts 25K a
+frame, spread over the loop exits (every block is 16 rows, the finest level's cell height);
+the op cache (a quarter of the ops from the decoder, `cell_row` 36 KB of code: the `-O2`
+entry above); the bar detector's six `pmaddubsw` (byte-valued maps, so no byte
+accumulation; any split puts more on the three busy pipes than it takes off). What is left
+in the kernel is the pipe assignment itself: the HOG loop after step 36 puts 11 ops a row
+on pipe 0 for 7 forced and 7.8 on pipe 1 (`fpu_pipe_assignment`), the LBP ring runs 1.6×
+its three-pipe floor in isolation, and no ordering or op substitution tried moves either.
+
+Where the target stands after step 36 (pinned to cores 4–7 of one complex, A/B/B/A,
+minima): against the branch's start (step 27) 5.88 → 5.58 ms at one thread (−5.1%),
+3.03 → 2.85 at two (−5.9%), 1.60 → 1.485 at four (−7.2%); against the original build in
+the same session 9.82 → 5.58, 5.07 → 2.85 and 2.70 → 1.485 ms, 1.76× / 1.78× / 1.82×.
+
 Where the target stands after step 35 (pinned to cores 4–7 of one complex, A/B/B/A, six
 rounds, minima): against the branch's start (step 27) 5.88 → 5.60 ms at one thread (−4.7%),
 3.03 → 2.87 at two (−5.4%), 1.60 → 1.50 at four (−6.0%); against the original build in the
@@ -1886,6 +1912,14 @@ this build do the frame in 0.29× the original's single-thread time.
     pipes), the responses loop's 16 are half its own (8.9) and half its surroundings, and the
     two want different remedies. The per-instruction pipe table from the same directory is
     what turns an instruction count into a floor.
+15. **Settle where the time goes with timers before samples.** Cycle samples per loop,
+    divided by the wrong row count, made the responses loop look twice as slow in the
+    kernel as alone, and a round went after surroundings that were not there. A `__rdtsc()`
+    around each phase of a scratch copy (`src_tprof` in the sixth round) costs one build
+    and an hour, and gives each phase's cycles per row directly; the micro-benchmark's
+    number then either matches it or names a real gap. And the micro-benchmark's body is
+    not the kernel's allocation: two of this round's three kernel variants lost to spills
+    and reloads their L1 copies did not have (lesson 14's other half).
 
 13. **Below two percent, judge a change by its own loop's cycles.** Code placement alone
     moved the wall clock of this host by ±1.5% (a padding of 24 bytes in a function, nothing
