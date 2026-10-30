@@ -358,6 +358,7 @@ struct Chunk
   int64_t rowstep = 0, rs = 0;      // from a sampled row to the next, from a row to the next
   const int *vok = nullptr;         // [q]: bard lags whose rows are inside the image
   bool allok = false;               // every lag fits the image (hok is all ones)
+  size_t q0 = 0, q1 = 0;            // the rows [q0, q1) whose lags' rows are all inside
   size_t rstep = 0;                 // elements of `resp` from a sampled row's slots to the next's
   const int64_t *rdist = nullptr;   // [sub * rdstride + slot]: a distinct row's plane offset
   const int *rdn = nullptr;         // [sub]: distinct rows of the sub-chunk
@@ -773,16 +774,9 @@ HWY_NOINLINE void bard_phase(const Chunk &C, int64_t tm, V8 mesh1, const uint8_t
   };
   BardSums acc;
   for (int j = 0; j < BARD_NMAP; ++j) acc.b[j] = hn::Zero(d16);
-  // The rows whose lags all fit the image are one run (vok is monotone in from each image
-  // edge), walked without a test per lag; the rest, at the image's top and bottom, with the tests
-  size_t q0 = 0, q1 = C.nr;
-  if (C.allok)
-  {
-    while (q0 < q1 && C.vok[q0] != hok) ++q0;
-    while (q1 > q0 && C.vok[q1 - 1] != hok) --q1;
-  }
-  else
-    q1 = q0; // no run without a test
+  // the rows whose lags all fit the image are one run, walked without a test per lag; the
+  // rest, at the image's top and bottom, go with the tests (the bounds are the chunk's)
+  const size_t q0 = C.q0, q1 = C.q1;
   if (valid)
   {
     acc = run(std::true_type(), std::false_type(), 0, q0, acc);
@@ -2949,6 +2943,17 @@ class FeatureComputer
       C.hbuf = aligned64(s.hbuf);
       C.inlane = block_cells_ == 1 || (FOLDH && block_cells_ == 2); // (see the fold below)
       C.rows1 = rslots_ == 1;
+      // The bar detector's rows whose lags all fit the image are one run, walked without a
+      // test per lag (vok is monotone in from each image edge); the rest, at the image's top
+      // and bottom, go with the tests. Found here, once per chunk, not once per block
+      C.q0 = 0, C.q1 = nr;
+      if (C.allok)
+      {
+        while (C.q0 < C.q1 && s.vok[C.q0] != bard_lagmask_) ++C.q0;
+        while (C.q1 > C.q0 && s.vok[C.q1 - 1] != bard_lagmask_) --C.q1;
+      }
+      else
+        C.q1 = 0; // no run without a test
       for (size_t sub = 0, qs = 0; qs < nr; ++sub, qs += sub_rows_)
       {
         int64_t *IF_RESTRICT dist = &s.rdist[sub * rd_stride_];
@@ -2965,7 +2970,8 @@ class FeatureComputer
              x0 += multi_ ? N : (size_t)cw_, cell += block_cells_)
           for (size_t xv = 0; xv < (multi_ ? N : (size_t)cw_); xv += N)
           {
-            const size_t x = x0 + xv, e0 = local ? cell % group : cell; // cell == x0 / cw_
+            // (group is a power of two: GROUP, or the cells a block spans)
+            const size_t x = x0 + xv, e0 = local ? cell & (group - 1) : cell; // cell == x0 / cw_
             // Blocks that span cells can overrun the row: the surplus lanes are masked off too.
             const bool tail = multi_ && x + N > lanes, msk = masked_ || tail;
             const uint8_t *IF_RESTRICT mask = tail ? ktail_.data() : kmask_.data() + xv;
