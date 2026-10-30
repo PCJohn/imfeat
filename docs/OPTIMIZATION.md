@@ -1756,6 +1756,52 @@ accumulation; any split puts more on the three busy pipes than it takes off). Wh
 in the kernel is the pipe assignment itself: the HOG loop after step 36 puts 11 ops a row
 on pipe 0 for 7 forced and 7.8 on pipe 1 (`fpu_pipe_assignment`), the LBP ring runs 1.6×
 its three-pipe floor in isolation, and no ordering or op substitution tried moves either.
+(Looked into next, below: it is the dispatcher's order-dependent choice, and the three
+source-level steerings tried did not survive GCC's allocation of `block()`.)
+
+Looked at after step 36, at the request to look into the pipe assignment. Three things
+settled, with the tools in `scripts/measure/micro` (`pipe_probe.cpp`, `hog_order.py`,
+`lbp_row.cpp`).
+
+First, where each loop stands against its pipes, from row bodies that match the kernel's
+(the timers above put every loop within 5% of its copy). The `fpu_pipe_assignment` counters
+count the register loads as pipe uops, so a body's uops are its vector instructions plus its
+loads. The HOG quarter loop: 13.7 cycles a quarter-row for 37.6 uops, 11.9 on pipe 0 (seven
+of them forced: the five `pmaddwd`, two `pmuldq`), 6.9 on pipe 1, 10.0 on pipe 2 (six forced
+shifts), 8.8 on pipe 3; the four-pipe floor is 9.4. The LBP ring: 25.2 cycles a row for 80
+uops, 21.5 / 18.7 / 20.0 / 20.1 by pipe, none forced but the one `pblendvb` and five
+shuffles; the floor is 20. The moments loop: 8.4 cycles a row-half for 24 uops, 7.7 on
+pipe 0 (five forced: four `pmaddwd`, one `pmullw`), 6.0 / 4.3 / 5.9 on the others; the floor
+is 6. Over the whole frame the four pipes take 15.0 / 13.6 / 13.1 / 14.4 M uops against the
+30 M cycles of the same run: pipe 0 is busy half the frame, so no pipe binds the frame,
+only these loops.
+
+Second, how the assignment is made. Synthetic streams of independent chains under the same
+counters (`pipe_probe.cpp`): adds alone (pipes 0, 1 and 3 eligible) go 50% to pipe 0;
+interleaved one multiply to two adds the adds take 37% of pipe 0, one to three 33%, one to
+four 29%, after a burst of four multiplies 11%, after a burst of two 0%. The choice is made
+at dispatch, from the pipes' recent load, so the same operations in another order land on
+other pipes. The HOG body as inline asm in four hand orders of the same 28 instructions
+(without the fourth power) runs 9.8, 10.0, 10.4 and 11.1 cycles a row, each equal to its
+pipe-0 count. Then a search (`hog_order.py`: the body with the fourth power, under the
+kernel's register budget, the kernel's own instruction order and 150 random topological
+orders, each run twice): the kernel's order 12.0 cycles a row, the best found 11.1, the
+worst 19.9, with pipe 0's count between 9.5 and 11 throughout, uncorrelated with the cycles.
+So the "11 on pipe 0 for 7 forced" of the paragraph above is not itself the loss: the
+cycles depend on whether the 36-entry scheduler holds work for pipe 0 while the chain
+through `|grad|²` (four cycles) is pending, which the order decides, and the kernel's order
+is within 8% of the best the search found. The LBP ring's gap (25 cycles for a floor of 20)
+is the same thing without a dominant pipe: trees for its three serial sums change nothing
+(modes 1 and 2), two rows an iteration −1% (mode 3).
+
+Third, the three steerings tried in the kernel, each logged below and reverted: the ring
+serialized by barriers (−9% on the L1 copy, +13% in the kernel), the ring's vote tables as
+byte shifts of one (the counters stay in memory, +2%), the HOG fourth power after the ray
+tests (−1% on the loop, noise). GCC's allocation of `block()` is what decides a loop's
+instruction order and spills, and the source cannot pick the order the dispatcher wants
+without inline asm, which the portability rule excludes (the clang and SSE4 builds, other
+ISAs). Lesson 15 holds a third time. What this leaves is the floors themselves: the HOG loop
+at 1.5× its four-pipe floor, the moments loop at 1.4×, the ring at 1.25×, by the dispatcher.
 
 Where the target stands after step 36 (pinned to cores 4–7 of one complex, A/B/B/A,
 minima): against the branch's start (step 27) 5.88 → 5.58 ms at one thread (−5.1%),
