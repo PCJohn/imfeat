@@ -217,7 +217,7 @@ TARGET_GRID = [(k, k) for k in range(6, -1, -1)]  # 64x64 cells down to 1x1: sev
 def test_target_pyramid(threads):
     """The target use: 1024x1024x3 at stride 1 through the full seven-level pyramid, a
     64x64 finest grid and every coarser level down to 1x1, on 1, 2 and 4 threads. The
-    checkpoint report (docs/LEARNINGS.md) tracks this number across commits."""
+    bundle reports (docs/oct-*-optimization-bundle.md) tracks this number across commits."""
     n = 1024
     img = frame((n, n, 3))
     fc = imfeat.FeatureComputer(

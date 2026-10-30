@@ -1,13 +1,15 @@
 """Latency of every code commit of a branch: build each, run the benchmark suite on it, keep
-the logs, then tabulate and chart the numbers. The checkpoint report (docs/LEARNINGS.md) was
-made with it.
+the logs, then tabulate and chart the numbers. The bundle reports (docs/oct-28-2026-
+optimization-bundle.md, docs/oct-30-2026-optimization-bundle.md) were made with it.
 
     python scripts/latency_by_commit.py sweep  [--base REV] [--head REV] [--out DIR] \
-                                               [--cores 1,2,3,4] [--k EXPR] [--tag SUFFIX]
+                                               [--include REV ...] [--cores 1,2,3,4] \
+                                               [--k EXPR] [--tag SUFFIX]
     python scripts/latency_by_commit.py report [--out DIR] [--tag SUFFIX[,SUFFIX...]]
 
 `sweep` lists the commits base..head that touch src/ or CMakeLists.txt (the base itself
-first), exports each with `git archive`, builds it with CMake into one reused build
+first, after any `--include` commits, which are timed as given: the original base of an
+earlier bundle, say), exports each with `git archive`, builds it with CMake into one reused build
 directory (only core.cpp recompiles between commits), assembles an importable package and
 runs `pytest -m bench -s tests/test_bench.py` of the CURRENT checkout against it, pinned to
 `--cores` when given (taskset; pick idle physical cores). One log per commit lands in
@@ -43,9 +45,11 @@ def git(*args: str) -> str:
     return subprocess.check_output(["git", *args], cwd=ROOT, text=True).strip()
 
 
-def code_commits(base: str, head: str) -> list[tuple[str, str]]:
-    """(hash, subject) of base, then every commit base..head that changes code, oldest first."""
-    out = [(git("rev-parse", "--short", base), git("log", "-1", "--format=%s", base))]
+def code_commits(base: str, head: str, include: list[str] = ()) -> list[tuple[str, str]]:
+    """(hash, subject) of the included commits, base, then every commit base..head that
+    changes code, oldest first."""
+    out = [(git("rev-parse", "--short", c), git("log", "-1", "--format=%s", c)) for c in include]
+    out.append((git("rev-parse", "--short", base), git("log", "-1", "--format=%s", base)))
     for line in git("log", "--reverse", "--format=%h %s", f"{base}..{head}").splitlines():
         h, subject = line.split(" ", 1)
         files = git("show", "--format=", "--name-only", h).split()
@@ -101,7 +105,7 @@ def sweep(args: argparse.Namespace) -> None:
     out = Path(args.out)
     (out / "logs").mkdir(parents=True, exist_ok=True)
     work = out / "work"
-    commits = code_commits(args.base, args.head)
+    commits = code_commits(args.base, args.head, args.include)
     with open(out / "commits.txt", "w") as f:
         for i, (h, s) in enumerate(commits):
             f.write(f"{i:02d} {h} {s}\n")
@@ -283,13 +287,15 @@ def main() -> None:
     s = sub.add_parser("sweep")
     s.add_argument("--base", default=None, help="base commit (default: merge-base with main)")
     s.add_argument("--head", default="HEAD")
-    s.add_argument("--out", default="docs/learnings")
+    s.add_argument("--include", action="append", default=[],
+                   help="a commit timed before the base, as given (repeatable)")
+    s.add_argument("--out", default="docs/oct-28-2026-optimization-bundle")
     s.add_argument("--cores", default=None, help="taskset core list, e.g. 1,2,3,4")
     s.add_argument("--resume", action="store_true", help="skip commits whose log exists")
     s.add_argument("--k", default=None, help="pytest -k expression: a subset of the bench")
     s.add_argument("--tag", default="", help="suffix of the log names, e.g. _run2")
     r = sub.add_parser("report")
-    r.add_argument("--out", default="docs/learnings")
+    r.add_argument("--out", default="docs/oct-28-2026-optimization-bundle")
     r.add_argument("--tag", default="",
                    help="which logs to report (their name suffix); several, comma-separated, "
                         "report the minimum per number over those runs")

@@ -8,7 +8,7 @@ The constraints throughout: no approximations; every integer sum bit-exact; no f
 tolerance loosened; nothing tuned to one machine (no "more threads", no per-CPU parameters).
 
 The branch of October 28–29, 2026 (steps 10–27) has a companion checkpoint report,
-[LEARNINGS.md](LEARNINGS.md): its starting and ending commits, the benchmark suite's
+[oct-28-2026-optimization-bundle.md](oct-28-2026-optimization-bundle.md): its starting and ending commits, the benchmark suite's
 latencies at every code commit (with the chart and the CSV), the ideas that did not
 work grouped by what they assumed, and the trends to steer further work by. This log has
 each step's mechanism; that report has the measured timeline.
@@ -1267,7 +1267,7 @@ thread is 4.72 ms, some 59 M instructions at this rate, −18%; and the items le
 1.6% (above), about 1% (the two-cell folds' `sum4x4` with two zero inputs) and about 1% (the
 HSV row's `>> 12` shifts folded into its float path: eight of the 31 shifts on the loop's
 one shift-and-convert pipe), some 4% together, 1.69× at one thread. The contract's 2× is not
-available from this instruction mix; lesson 1 of LEARNINGS.md holds at the target as at the
+available from this instruction mix; lesson 1 of oct-28-2026-optimization-bundle.md holds at the target as at the
 headline. The per-loop table, the scripts and the ablation builds are in `scripts/measure/`
 and the session's notes.
 

@@ -41,9 +41,11 @@ p = fc.features(frame)                     # thumbnailed to 1024x1024 inside the
 More detail lives in two companion documents:
 [docs/FEATURES.md](docs/FEATURES.md) (every feature: definition, formula, invariances, uses)
 and [docs/OPTIMIZATION.md](docs/OPTIMIZATION.md) (how the core got fast: what worked, what did
-not, how it was measured and verified), with [docs/LEARNINGS.md](docs/LEARNINGS.md) the
-checkpoint report of the October 2026 branch: the benchmark suite's latency at every one of
-its commits, and the trends to steer further work by.
+not, how it was measured and verified), with the bundle reports
+[docs/oct-28-2026-optimization-bundle.md](docs/oct-28-2026-optimization-bundle.md) and
+[docs/oct-30-2026-optimization-bundle.md](docs/oct-30-2026-optimization-bundle.md): the
+benchmark suite's latency at every code commit of the October 2026 branches, and the trends
+to steer further work by.
 
 ---
 
