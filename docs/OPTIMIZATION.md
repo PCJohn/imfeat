@@ -1815,6 +1815,17 @@ references, the loop +13% of its samples (3743 → 4226, 3567 → 4083), the tar
 +2.3% at one thread, +1.6% at four. Not kept. Bit-identical on the three builds and across
 1–6 threads, for the record.
 
+Tried after step 36 and reverted: the ring's five vote tables as byte shifts of the first
+(one register and four `pslldq` instead of five registers or four reloads a row) and the
+local-minimum count as a subtract of a compare mask instead of a min with a constant one, to
+free registers for the bin counters, without the barriers above. GCC kept the counters in
+memory still (87 instructions, 16 stack references a row); the loop +2% of its samples
+(3813 → 3888, 3811 → 3897), the target +1.1% / +0.9% at one thread, +0.8% at four. Not
+kept. For the record, the harness caught the variant's count comparing against the wrong
+value (the mask of "no neighbour below" rather than its complement: 8,678 of 40,164 arrays
+differ, all through the local-minimum count); the same instructions on the same pipes, so
+the timing stands as the allocation's, not the variant's.
+
 Where the target stands after step 36 (pinned to cores 4–7 of one complex, A/B/B/A,
 minima): against the branch's start (step 27) 5.88 → 5.58 ms at one thread (−5.1%),
 3.03 → 2.85 at two (−5.9%), 1.60 → 1.485 at four (−7.2%); against the original build in
