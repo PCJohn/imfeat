@@ -1622,6 +1622,11 @@ Tried after step 35 and reverted: the responses loop's invariants (`C.rdn[sub]`,
 33 instructions, 3716 → 3370 samples, −9% on the loop); the placement around it lost more,
 the target +1.2% / +1.2% at one thread over eight rounds. Bit-identical. Not kept.
 
+Tried after step 35 and reverted: the responses loop two rows an iteration (six loads,
+sixteen stores, half the loop overhead). The loop −5% (3716 → 3535 samples) and the LBP
+ring and the energy loop +8% each from the allocation, the frame slower. Bit-identical.
+Not kept.
+
 Where the target stands after step 35 (pinned to cores 4–7 of one complex, A/B/B/A, six
 rounds, minima): against the branch's start (step 27) 5.88 → 5.60 ms at one thread (−4.7%),
 3.03 → 2.87 at two (−5.4%), 1.60 → 1.50 at four (−6.0%); against the original build in the
