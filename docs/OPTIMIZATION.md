@@ -1471,6 +1471,14 @@ threads; the roll-up's loops 545 → 542 and 590 → 564 cycle samples in two ru
 module within ±0.3%: the level-1 row's lines were already touched once per vector of
 parents, and the rest is the L2 traffic of the row itself. Not kept.
 
+Tried after step 34 and reverted: the derive job's in-band work (the coarser levels' roll-up
+and derive of step 33) done at the end of each band's accumulation instead, for bands whose
+cell rows are whole level-1 rows (every band at the target), so that the job and its
+dispatch go and the work overlaps the other bands' tails. Bit-identical, identical across
+1–6 threads; −0.7% / −0.1% at four threads, +0.8% / +0.4% at two, +0.6% / +1.0% at one,
+where its path is untouched: a dispatch is about 3 µs (above), and what moved is placement.
+Not kept.
+
 Where the target stands after step 34 (pinned to cores 4–7 of one complex, A/B/B/A, six
 rounds, minima): against the branch's start (step 27) 5.88 → 5.68 ms at one thread (−3.4%),
 3.03 → 2.93 at two (−3.5%), 1.60 → 1.52 at four (−5.2%); against the original build in the
