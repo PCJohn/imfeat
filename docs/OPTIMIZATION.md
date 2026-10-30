@@ -1449,6 +1449,21 @@ last bits and differ by thread count); the Σ|grad|⁴ feature dropped (five of 
 conversion done once upstream if the host already has HSV (10%). None alone, and only the
 last two together with the first, reach 2× at one thread; the contract decides.
 
+**Looked at after step 34, outside the loops (October 30, 2026).** The fixed cost of a
+`features()` call, measured on a 32×32 frame: 27 µs at any thread count (the binding, the
+24 output views at under a microsecond each, the hash DCT), 0.5% of a one-thread target
+frame and 1.8% of a four-thread one; a job dispatch about 3 µs (a 64×64 two-level frame:
+53 µs on one thread, 63 on four, three dispatches), so the two wake-ups a frame are under
+1% at four threads and the bounded spin the log rejected after step 20 would have at most
+that to gain. Compiler knobs never tried, each built on the step-34 source, bit-identical
+on the harness and timed pinned A/B/B/A at one thread: link-time optimisation +0.5% /
++0.9% (one translation unit; nothing to inline across, and the layout moved);
+`-fno-plt -fno-semantic-interposition` +0.1% / 0.0%; `-fomit-frame-pointer` the
+byte-identical module (already the default: the 6,092 `rbp` references in the object are
+the stack realignment every function with 256-bit locals does, not a frame pointer, and no
+flag removes it short of assuming a 32-byte-aligned incoming stack, which the Python entry
+cannot promise). GCC 12 on this host has no C++ front end. None kept.
+
 Where the target stands after step 34 (pinned to cores 4–7 of one complex, A/B/B/A, six
 rounds, minima): against the branch's start (step 27) 5.88 → 5.68 ms at one thread (−3.4%),
 3.03 → 2.93 at two (−3.5%), 1.60 → 1.52 at four (−5.2%); against the original build in the
