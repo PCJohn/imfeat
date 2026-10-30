@@ -1516,6 +1516,15 @@ on the critical path between the row loops), the moments loop −11% (2399 → 2
 The first form of this step merged the 16-bit phases' halves too, and lost (above).
 Bit-identical on the GCC/AVX2, clang and SSE4 builds (40,164 arrays) and across 1–6 threads.
 
+Tried after step 35 and reverted: the HOG phase as a function of its own (`hog_phase`,
+one call per block, channel and sub-chunk), as the bar detector's phase is since step 15,
+to give the 16-bit phases' loops their registers back after step 35's allocation. The HOG
+row loop lost its three stack references and the quarter loop one instruction, and the
+rest got worse: the energy row loop 44 → 46 instructions and +10% samples twice, the
+straight-line code +400, the target +3.2% / +3.0% at one thread and +3.4% at four. Bit-
+identical on the three builds. Not kept; what the bar detector's loop needed (step 15: its
+spilled lag loads), the HOG's did not have.
+
 Where the target stands after step 35 (pinned to cores 4–7 of one complex, A/B/B/A, six
 rounds, minima): against the branch's start (step 27) 5.88 → 5.60 ms at one thread (−4.7%),
 3.03 → 2.87 at two (−5.4%), 1.60 → 1.50 at four (−6.0%); against the original build in the
