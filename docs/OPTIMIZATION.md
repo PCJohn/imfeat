@@ -129,6 +129,7 @@ Chronologically. Times are single-thread `features()`; instruction counts are pe
 | 29 | HSV row: OpenCV's (x + 2¹¹) >> 12 as floor(x 2⁻¹² + ½) in the float path, the odd lanes 2¹⁶ higher so that their integer lands in the high half of the lane and the merge into 16-bit lanes is one blend (details below) | 176 instructions per 32 pixels from 181, 17 shifts from 31; the HSV loop 3735 → 3558 and 3739 → 3553 samples in two runs (−5%); the target −0.7% / −0.9% at one thread. Exact on all 2²⁴ colours on the three builds |
 | 30 | Per-block bookkeeping: `cell % group` (an integer divide per block, group a power of two) as a mask; the bar detector's run bounds found once per chunk instead of once per block and channel | 2,048 `divq` a frame gone: the samples outside loops 8.6% and 8.8% → 8.45% and 8.4% of the module in two runs each; 122 K instructions a frame fewer for the bounds; the wall clock unresolved either way. Bit-identical on the harness |
 | 31 | HSV row: the shared reciprocal taken as HNUM / (v diff), so hdiv's guess is one multiply and sdiv's multiplier is 8.5 diff (8.5 HNUM = SNUM, exact) | 172 instructions per 32 pixels, 132 K a frame fewer; the HSV loop 9.77% and 9.83% → 9.47% and 9.44% of the module in two runs. Exact on all 2²⁴ colours on the three builds |
+| 35 | HOG: one set of accumulators through a sub-chunk's four quarters where every lane of a vector is the same cell whichever quarter it is (one- and two-cell blocks), in registers between them, the Acc holding it in its first quarter; the folds read that one set (details below) | Target, pinned inside one complex, A/B/B/A, two runs: −1.2% and −1.2% at one thread (medians −1.6%, −1.0%), −1.0% / −1.3% at four; the samples outside loops −1,685 and −1,548, the moments loop −11%, the energy and responses loops +7% and +16%; the module's instructions +1%. Bit-identical on the three builds and across 1–6 threads |
 | 33 | The coarser levels rolled up inside the derive job by the bands, each its own rows from its own rows of the level below, for every level whose rows split evenly across the bands; the rest, and the global sums, serially after; the children added in registers and the parent stored once (details below) | 35 µs of serial roll-up a frame spread over the bands: the target −1.2% at four threads, neutral at two and one (the single-thread roll-up is bound by the level-1 slots' memory traffic). Bit-identical on the three builds and across 1–6 threads |
 | 34 | The hashes (the mean grid's DCT, 9–11 µs, serial after the summary) derived by the summary job's least-loaded thread while the others fold | With step 33: the target −2.3% / −2.1% at four threads, −0.6% / −1.0% at two, +0.4% at one (placement: the phases are unchanged there) |
 | 32 | LBP phase: one loop down the chunk's rows with the nibble counts emptied every 15 rows on the way, instead of an outer pass per 15 rows whose body ran twice for a 16-row chunk | 225 K instructions a frame fewer; the target −1.1% / −1.0% at one thread; the pass loop gone from the profile and the moments loop an instruction shorter beside it (2618 → 2351, 2648 → 2500 samples). Bit-identical on the three builds |
@@ -1478,6 +1479,42 @@ dispatch go and the work overlaps the other bands' tails. Bit-identical, identic
 1–6 threads; −0.7% / −0.1% at four threads, +0.8% / +0.4% at two, +0.6% / +1.0% at one,
 where its path is untouched: a dispatch is about 3 µs (above), and what moved is placement.
 Not kept.
+
+Tried after step 34 and reverted: one set of accumulators through both halves of the energy
+and moment phases and all four quarters of the HOG, for the layouts where every lane of a
+vector is the same cell whichever half or quarter it is (one-cell blocks, and two-cell
+blocks since step 28), so that the per-half and per-quarter prologues and epilogues, the
+Acc's stores and reloads and the folds' cross-half and cross-quarter adds go: about 590
+instructions per block, channel and chunk by count, 5% of the frame's. Bit-identical on the
+three builds and across 1–6 threads, and +1.5% / +1.3% on the wall clock with the module's
+instructions +2%: the 16-bit phases' accumulators then live across the sub-chunk loop and
+so across the responses pass, and every row loop paid for it in registers -- the LBP ring
+79 → 82 instructions (3599 → 3992 samples), the energy loop 43 → 46 (3595 → 4013), the
+moments 45 → 46 (2387 → 2594), the responses 33 → 38 (1580 → 1807) -- more than the
+prologues saved (the samples outside loops −1,385). Lesson 6 again. The HOG quarters alone,
+whose accumulators live only inside the quarter loop, are the next entry.
+
+**Step 35, the HOG quarters as one accumulation (October 30, 2026).** The quarter loop
+loaded its nine ray sums and |grad|⁴ from the Acc (or zeroed them), ran the rows and stored
+them back, four times a sub-chunk, and the fold added the four quarters' vectors: 81
+instructions around each 34-instruction row loop, and 27 adds in the fold, per block,
+channel and sub-chunk. Where every lane of a vector is the same cell whichever quarter the
+vector is -- a one-cell block, or a two-cell block in the in-lane layout of step 28, i.e.
+`Chunk::inlane` -- the quarters can share one set: `block<.., MERGED>` carries the
+accumulators across the four quarters in registers, stores them once into the Acc's first
+quarter, and `fold_cell` and `fold_hog_inlane` read that one set (a HOG lane is below 2²⁸
+per quarter, so four add within 2³⁰, as the folds added them before). Multi-cell blocks
+keep their per-quarter sets, which their folds map to cells. The same integer sums.
+Target, pinned inside one complex, A/B/B/A: 5.663 → 5.593 and 5.668 → 5.602 ms at one thread
+(−1.2% twice; medians −1.6%, −1.0%), 1.512 → 1.497 at four (−1.0%, −1.3%). The module's
+instructions rose 1% (208.7 M → 210.8 M per three frames: the merged instantiation's
+energy row loop is 44 instructions from 43 and its responses loop 38 from 33, placement
+and allocation again) and the time fell anyway: by loop samples, twice, the straight-line
+code −1,685 and −1,548 (the quarters' loads and stores and the fold's cross-quarter adds,
+on the critical path between the row loops), the moments loop −11% (2399 → 2145, 2485 →
+2223), the HOG row loop within ±1%, against the energy loop +7% and the responses +16%.
+The first form of this step merged the 16-bit phases' halves too, and lost (above).
+Bit-identical on the GCC/AVX2, clang and SSE4 builds (40,164 arrays) and across 1–6 threads.
 
 Where the target stands after step 34 (pinned to cores 4–7 of one complex, A/B/B/A, six
 rounds, minima): against the branch's start (step 27) 5.88 → 5.68 ms at one thread (−3.4%),
