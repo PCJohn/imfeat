@@ -404,7 +404,15 @@ T *aligned64(std::vector<T> &v)
 // `resp`, the Laws energies and the tensor (which also write the HOG inputs to `hbuf`), the
 // Laplacian and the moments, and the HOG ray tests a quarter block at a time. Every sum is an
 // integer, so the order of the additions changes nothing.
-template <bool MASKED, bool UNIT>
+//
+// MERGED (Chunk::inlane: every lane of a vector is the same cell whichever quarter the vector
+// is): the HOG's one set of accumulators runs through all four quarters of a sub-chunk,
+// staying in registers between them, and the Acc holds it in its first quarter (hog[0],
+// sg4[0]) for the folds that serve those layouts; the per-quarter sets, which the multi-cell
+// folds map to cells, are kept otherwise. (Four quarters' lanes add within 2^30, as the folds
+// added them anyway.) The 16-bit phases keep their per-half sets: their accumulators would
+// live across the responses pass, which costs every row loop registers.
+template <bool MASKED, bool UNIT, bool MERGED>
 HWY_INLINE void block(const Chunk &C, const uint8_t *IF_RESTRICT mask,
                       const uint8_t *IF_RESTRICT valid, size_t vstride, int hok,
                       const V16 *IF_RESTRICT rays, Acc &A)
@@ -726,12 +734,15 @@ HWY_INLINE void block(const Chunk &C, const uint8_t *IF_RESTRICT mask,
       P[K_LAP1] = lap1, P[K_LAP2] = lap2, P[K_T1] = t1, P[K_T2] = t2, P[K_T3] = t3;
       A.t4[h] = t4;
     }
+    V32 hog[K_NHOG];
+    V64 sg4;
     for (int k = 0; k < 4; ++k) // the int32 quarter blocks: |grad|^4 and the HOG ray tests
     {
-      V32 hog[K_NHOG];
-      V64 sg4;
-      for (int j = 0; j < K_NHOG; ++j) init(hog[j], A.hog[k][j]);
-      init(sg4, A.sg4[k]);
+      if (!MERGED || k == 0)
+      {
+        for (int j = 0; j < K_NHOG; ++j) init(hog[j], A.hog[MERGED ? 0 : k][j]);
+        init(sg4, A.sg4[MERGED ? 0 : k]);
+      }
       for (size_t q = qs; q < qe; ++q)
       {
         const V32 zl = hn::LoadU(d32, hin(q - qs, k >> 1, k & 1)); // negative: left of the vertical
@@ -754,8 +765,9 @@ HWY_INLINE void block(const Chunk &C, const uint8_t *IF_RESTRICT mask,
           hog[HRAYS + j] = hn::Add(hog[HRAYS + j], hn::IfNegativeThenNegOrUndefIfZero(t, g2s));
         }
       }
-      for (int j = 0; j < K_NHOG; ++j) A.hog[k][j] = hog[j];
-      A.sg4[k] = sg4;
+      if (MERGED && k < 3) continue;
+      for (int j = 0; j < K_NHOG; ++j) A.hog[MERGED ? 0 : k][j] = hog[j];
+      A.sg4[MERGED ? 0 : k] = sg4;
     }
   }
 }
@@ -912,11 +924,10 @@ HWY_INLINE void fold_cell(const Acc &A, bool msk, V8 mv, bool add, int64_t *IF_R
       return hn::Add(hn::PromoteLowerTo(d64, v), hn::PromoteUpperTo(d64, v));
     }
     if (t == K_T4) return hn::Add(A.t4[0], A.t4[1]);
-    if (t == K_SG4) return hn::Add(hn::Add(A.sg4[0], A.sg4[1]), hn::Add(A.sg4[2], A.sg4[3]));
+    if (t == K_SG4) return A.sg4[0]; // (a one-cell block takes block()'s MERGED path)
     if (t < K_U8)
     {
-      const int j = t - K_HOG;
-      const V32 v = hn::Add(hn::Add(A.hog[0][j], A.hog[1][j]), hn::Add(A.hog[2][j], A.hog[3][j]));
+      const V32 v = A.hog[0][t - K_HOG];
       return hn::Add(hn::PromoteLowerTo(d64, v), hn::PromoteUpperTo(d64, v));
     }
     if (t < K_BARD)
@@ -1068,8 +1079,8 @@ HWY_INLINE void fold_hog_multi(const Acc &A, size_t g, const bool *IF_RESTRICT a
 // (Chunk::inlane, see block()): each 128-bit half of every int32 vector is then one cell,
 // whichever half block or quarter the vector is, so the vectors of a kind add first and a
 // cell's lanes reduce through one interleave level. The pair kinds' lanes sum four at a time
-// within 32 bits as before; the HOG's four quarters (each lane below 2^28) add first and
-// their lanes reduce as int64. Two cells are stored at once.
+// within 32 bits as before; the HOG's four quarters are already one set (block()'s MERGED
+// path) whose lanes reduce as int64. Two cells are stored at once.
 template <bool SIGNED>
 HWY_INLINE void fold_pair_inlane(V32 v0, V32 v1, bool add, int64_t *IF_RESTRICT dst)
 {
@@ -1095,8 +1106,7 @@ HWY_INLINE void fold_hog_inlane(const Acc &A, bool add, int64_t *IF_RESTRICT cb,
   const hn::Half<D64x4> dw2;
   for (int j = 0; j < K_NHOG; ++j)
   {
-    const V32 w =
-        hn::Add(hn::Add(A.hog[0][j], A.hog[1][j]), hn::Add(A.hog[2][j], A.hog[3][j]));
+    const V32 w = A.hog[0][j];
     const auto lo = hn::PromoteLowerTo(dw, w), hi = hn::PromoteUpperTo(dw, w); // the cells
     const auto s = hn::Add(hn::InterleaveLower(dw, lo, hi), hn::InterleaveUpper(dw, lo, hi));
     const auto c = hn::Add(hn::LowerHalf(dw2, s), hn::UpperHalf(dw2, s));
@@ -3009,14 +3019,18 @@ class FeatureComputer
               Acc &A = s.acc;
               C.base = s.pl + (size_t)(k0 + k) * pstride + x;
               const uint8_t *IF_RESTRICT vx = valid ? valid + x : nullptr;
+              auto run = [&](auto kMasked, auto kUnit)
+              {
+                constexpr bool kM = decltype(kMasked)::value, kU = decltype(kUnit)::value;
+                C.inlane ? block<kM, kU, true>(C, mask, vx, bvalid_stride_, bard_lagmask_, rays, A)
+                         : block<kM, kU, false>(C, mask, vx, bvalid_stride_, bard_lagmask_, rays, A);
+              };
               if (msk)
-                phases_ == 1
-                    ? block<true, true>(C, mask, vx, bvalid_stride_, bard_lagmask_, rays, A)
-                    : block<true, false>(C, mask, vx, bvalid_stride_, bard_lagmask_, rays, A);
+                phases_ == 1 ? run(std::true_type(), std::true_type())
+                             : run(std::true_type(), std::false_type());
               else
-                phases_ == 1
-                    ? block<false, true>(C, mask, vx, bvalid_stride_, bard_lagmask_, rays, A)
-                    : block<false, false>(C, mask, vx, bvalid_stride_, bard_lagmask_, rays, A);
+                phases_ == 1 ? run(std::false_type(), std::true_type())
+                             : run(std::false_type(), std::false_type());
               int64_t *IF_RESTRICT cb = s.cells.data() + (size_t)(k0 + k) * K_N * nxs;
               if (!multi_) // one cell (at[] all the same): its kinds kst apart
               {
@@ -3067,8 +3081,7 @@ class FeatureComputer
                 for (int t = K_NUNSIGNED; t < K_NPAIR; ++t)
                   fold_pair_inlane<true>(A.pair[0][t], A.pair[1][t], adds[0], c0 + t * kst);
                 fold(d64, hn::Add(A.t4[0], A.t4[1]), 2, adds[0], c0 + K_T4 * kst);
-                fold(d64, hn::Add(hn::Add(A.sg4[0], A.sg4[1]), hn::Add(A.sg4[2], A.sg4[3])), 2,
-                     adds[0], c0 + K_SG4 * kst);
+                fold(d64, A.sg4[0], 2, adds[0], c0 + K_SG4 * kst);
                 fold_hog_inlane(A, adds[0], c0, kst);
                 continue;
               }
