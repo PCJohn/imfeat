@@ -1637,6 +1637,19 @@ Tried after step 35 and reverted: the moments loop's two rows loaded and squared
 before either row's sums (the sums in the same order). 4512 → 4632 samples: no change
 (the loop's 30 cycles per two rows are not the order of its ops). Bit-identical. Not kept.
 
+Tried after step 35 and reverted: the HSV conversion's four lane groups (each half's even
+and odd lanes) through the float stages in step (`hsv_lanes4`: the four conversions, then
+the four divisions, then the four tables), so that the four divisions and the chains behind
+them are in flight together where one group at a time waited on each. Every lane sees the
+same operations in the same order: bit-identical on the harness and on all 2²⁴ colours.
+The HSV row loop 7270 → 6728 samples (−7.5%; two groups at a time −8%), and the frame
++0.1% / +0.5% at one thread and +0.5% / +0.2% at four over twelve rounds: neutral at the
+wall, the placement around it taking what the loop gave. Not kept. On top of it, the three
+integer-to-float conversions by the exponent trick (`x | 2²³`'s bits as a float, minus 2²³;
+the signed hue numerator through 1.5·2²³), to take 12 of the loop's 32 pipe-3 ops off that
+pipe: the loop only −3% (more spills, and the subtracts' half on pipe 3 anyway). Not kept.
+The loop is pipe 3's (the entry above), and what moves off it costs as much elsewhere.
+
 Where the target stands after step 35 (pinned to cores 4–7 of one complex, A/B/B/A, six
 rounds, minima): against the branch's start (step 27) 5.88 → 5.60 ms at one thread (−4.7%),
 3.03 → 2.87 at two (−5.4%), 1.60 → 1.50 at four (−6.0%); against the original build in the
