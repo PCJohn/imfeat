@@ -3,7 +3,8 @@
 // 5 no sg4 at all; 6 rays only (no E, no sg4); 7 signd -> add; 8 madd -> add; 9 the energy
 // short of each ray by mask (shift + and) with E by signd; 10 masks throughout (E as the
 // left side's energy); 11 masks, no E, the left side's share of each short sum (what the flush
-// needs: the kernel after step 36); 12 as 11 with the side sum by signd
+// needs: the kernel after step 36); 12 as 11 with the side sum by signd (the kernel after step
+// 36); 13 as 12 without sg4; 14 as 12 two rows interleaved; 15 as 14 without sg4
 #include <immintrin.h>
 #include <chrono>
 #include <cstdio>
@@ -26,13 +27,13 @@ int main(int argc, char **argv)
   for (int r = 0; r < reps; ++r)
   {
     auto R = [&](int j) { return _mm256_load_si256((const __m256i *)(rt + j * 16)); };
-    if (mode == 0 || mode == 1 || mode == 4 || mode == 5 || mode == 6 || mode == 7 || mode == 8 || mode >= 9)
+    if (mode == 0 || mode == 1 || mode == 4 || mode == 5 || mode == 6 || mode == 7 || mode == 8 || (mode >= 9 && mode <= 13))
       for (int q = 0; q < rows; ++q)
       {
         const __m256i zl = _mm256_load_si256((const __m256i *)(hb + q * 64));
         const __m256i za = _mm256_abs_epi16(zl);
         const __m256i g2 = _mm256_madd_epi16(zl, zl);
-        if (mode == 0 || mode >= 9) sg4 = _mm256_add_epi64(sg4, sq64(g2));
+        if (mode == 0 || (mode >= 9 && mode != 13)) sg4 = _mm256_add_epi64(sg4, sq64(g2));
         if (mode >= 9)
         {
           const __m256i ms = _mm256_srai_epi32(zl, 31);
@@ -60,6 +61,21 @@ int main(int argc, char **argv)
         {
           const __m256d lo = _mm256_cvtepi32_pd(_mm256_castsi256_si128(g2)), hi = _mm256_cvtepi32_pd(_mm256_extracti128_si256(g2, 1));
           sd0 = _mm256_fmadd_pd(lo, lo, sd0); sd1 = _mm256_fmadd_pd(hi, hi, sd1);
+        }
+      }
+    else if (mode == 14 || mode == 15)
+      for (int q = 0; q < rows; q += 2)
+      {
+        const __m256i zla = _mm256_load_si256((const __m256i *)(hb + q * 64)), zlb = _mm256_load_si256((const __m256i *)(hb + (q + 1) * 64));
+        const __m256i zaa = _mm256_abs_epi16(zla), zab = _mm256_abs_epi16(zlb);
+        const __m256i g2a = _mm256_madd_epi16(zla, zla), g2b = _mm256_madd_epi16(zlb, zlb);
+        if (mode == 14) sg4 = _mm256_add_epi64(sg4, _mm256_add_epi64(sq64(g2a), sq64(g2b)));
+        const __m256i g2sa = sgn(zla, g2a), g2sb = sgn(zlb, g2b);
+        for (int j = 0; j < 4; ++j)
+        {
+          const __m256i ma = _mm256_srai_epi32(_mm256_madd_epi16(zaa, R(j)), 31), mb = _mm256_srai_epi32(_mm256_madd_epi16(zab, R(j)), 31);
+          hog[j] = _mm256_add_epi32(hog[j], _mm256_add_epi32(_mm256_and_si256(g2a, ma), _mm256_and_si256(g2b, mb)));
+          hog[4 + j] = _mm256_add_epi32(hog[4 + j], _mm256_add_epi32(_mm256_and_si256(g2sa, ma), _mm256_and_si256(g2sb, mb)));
         }
       }
     else if (mode == 2)

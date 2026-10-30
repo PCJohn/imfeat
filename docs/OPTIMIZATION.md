@@ -1690,6 +1690,30 @@ samples rose 10% (2138 → 2351), the target 5.612 → 5.573 and 5.539 → 5.565
 differs from the micro-benchmark's, and the loop was at its isolated speed already (the
 phase timers below). Bit-identical on GCC, for the record.
 
+Tried after step 36 and reverted: the fourth-power sum of the HOG loop as two double FMAs
+(a sub-chunk's lanes stay below 2⁵³, so the sum is exact and one conversion per sub-chunk
+would make it an integer again) in place of the two 64-bit multiplies, their shuffle and
+adds, to take two more operations off the multiplies' pipe. On an L1 buffer the row body
+ran 14.9 cycles from 14.5 (`micro/hog_row.cpp` mode 4): the two int32 → double conversions
+and the extract between them cost more than the multiplies did. Not built into the kernel.
+
+Tried after step 36 and reverted: the module at `-O2` in place of `-O3` (GCC 11), on the
+finding that a quarter of the frame's ops come from the legacy decoder, not the op cache
+(18.5 M of 76 M a frame, `de_dis_uops_from_decoder`), the decoder-fed samples sitting in
+the LBP ring, the bar detector and the energy, responses and moments loops, with
+`cell_row` at 36 KB of code and the sampled hot code 32 KB (522 lines; 95% of samples in
+12 KB) against a 4K-op cache. `-O2` cut `cell_row` to 19 KB and the module's text by 20%,
+bit-identical on GCC, and ran +29% at one and four threads: GCC 11's `-O2` no longer unrolls
+the small constant loops (the four ray tests became a 12-instruction loop, 8,306 samples
+on its own), the instructions rose 41% (77 M → 109 M a frame), and the decoder's share
+barely moved (16.9 M). Not kept. The phase timers that followed (`src_tprof`, `__rdtsc`
+around each phase of `block()`: 143 TSC ticks a sampled row, the LBP ring 24, the bar
+detector 19, the responses 10, the energies 29, the moments 14, the HOG 43, the code
+between phases 4) put every loop at the speed its body alone runs on an L1 buffer, give or
+take a loop's prologue and exit; so the decoder-fed ops are not costing the loops cycles
+the backend would not cost anyway, and the responses loop's "16 cycles a row" of the fifth
+round was 12 per sampled row over 18 distinct rows: 10.7 each, against 8.9 alone. Closed.
+
 Where the target stands after step 35 (pinned to cores 4–7 of one complex, A/B/B/A, six
 rounds, minima): against the branch's start (step 27) 5.88 → 5.60 ms at one thread (−4.7%),
 3.03 → 2.87 at two (−5.4%), 1.60 → 1.50 at four (−6.0%); against the original build in the
