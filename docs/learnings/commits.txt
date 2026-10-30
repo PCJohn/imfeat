@@ -1,0 +1,27 @@
+00 3957392 Add AGENTS.md
+01 4715561 Kernel as register-resident phases; cheaper folds; signed HOG sums
+02 3fdcbc4 Extrema from the LBP ring, nibble-counted LBP bins, two shared sums
+03 0497dc3 Sliding plane window: every kernel tap a constant offset from the row
+04 a69e7bd A batch of small kernel items, kept by pinned A/B timing: -10% at stride 1
+05 455e92f Batched fold for one-cell blocks: four kinds reduced together
+06 6c166f2 Vector hash row sums; batched multi-cell folds for the HOG and pair kinds
+07 3ffd3cc Level 1 derived in its band from the rolled-up sums; a vector flush
+08 a3a86d2 Split the two phases of a raw row as it is gathered
+09 d29e6b1 Derive and roll up cells in groups of four, whatever the block width
+10 1a381c0 Halve the HOG ray tests by the rays' mirror symmetry; bar detector sums in registers
+11 20c7d4b Give the bar detector phase a function of its own
+12 b510004 Energy phase at stride 1 as three chunk-wide product sums per response column
+13 875d14e HSV conversion: the table step as one rounding of the float guess
+14 c9c0c1c Resize: the horizontal pass over all of a row's planes at once
+15 cd2a2ea Resize: the float taps' shuffle lands each byte in its int32 lane
+16 8301afe Resize: a destination row finished in one pass from its cached tap rows
+17 502fe49 Resize: the shuffle table's window by a broadcast-128 load
+18 dff0dbb Roll up two kinds per lane add; fold the summary once per cell row
+19 69db70a Summary across threads from three bands, every fold in its cell order
+20 7189851 Summary after the join split by lane across the threads
+21 c874e2d Prefetch where the frame is first read; the finish converts in range; the kinds loop decides the block width once
+22 2e23b8e Records prefetched ahead of the derive's stores; the resize's store bound tested once per group
+23 c80dbfb Cells derived and rolled up eight at a time, the group's kind stride a whole line
+24 858fe52 Resize rounding: the saturating pack is the clamp
+25 bac2b23 Resize: the periodic groups of the horizontal pass with their slot tables in registers
+26 cf40d37 LBP ring: the neighbour test as a saturating subtract compared with zero

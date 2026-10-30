@@ -210,6 +210,27 @@ def test_latency(n, k, c, stride):
     assert st["p50"] < 6.0 * (n / 256) ** 2
 
 
+TARGET_GRID = [(k, k) for k in range(6, -1, -1)]  # 64x64 cells down to 1x1: seven levels
+
+
+@pytest.mark.parametrize("threads", [1, 2, 4])
+def test_target_pyramid(threads):
+    """The target use: 1024x1024x3 at stride 1 through the full seven-level pyramid, a
+    64x64 finest grid and every coarser level down to 1x1, on 1, 2 and 4 threads. The
+    checkpoint report (docs/LEARNINGS.md) tracks this number across commits."""
+    n = 1024
+    img = frame((n, n, 3))
+    fc = imfeat.FeatureComputer(
+        img.shape, grid=TARGET_GRID, stride=1, threads=threads, feature_space="hsv"
+    )
+    st = latency(lambda: fc.features(img))
+    print(
+        f"\n  target: {n}x{n}x3 finest-64 to 1x1 ({len(TARGET_GRID)} levels) stride=1"
+        f" threads={fc.threads}\n  ms: {STATS_HEAD}\n      {stats_row(st)}"
+    )
+    assert st["p50"] < 6.0 * (n / 256) ** 2
+
+
 def interleaved(fns, reps=100, warm=10):
     """Per-call ms stats for several callables, timed round-robin so that a change of clock
     or load during the run hits all of them alike: rows of one table can be compared."""

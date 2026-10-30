@@ -7,6 +7,12 @@ and how every change was measured and verified.
 The constraints throughout: no approximations; every integer sum bit-exact; no float
 tolerance loosened; nothing tuned to one machine (no "more threads", no per-CPU parameters).
 
+The branch of October 28–29, 2026 (steps 10–27) has a companion checkpoint report,
+[LEARNINGS.md](LEARNINGS.md): its starting and ending commits, the benchmark suite's
+latencies at every code commit (with the chart and the CSV), the ideas that did not
+work grouped by what they assumed, and the trends to steer further work by. This log has
+each step's mechanism; that report has the measured timeline.
+
 ## Starting point
 
 "The original" below means the implementation at commit `1c35817`, the last one before this
