@@ -1680,6 +1680,16 @@ four (−0.7%; median −0.4%), pinned, A/B/B/A, twelve rounds. Kept for the loo
 consistent gain whose mechanism is the pipe table's. Bit-identical on the GCC/AVX2, clang
 and SSE4 builds (40,164 arrays) and across 1–6 threads.
 
+Tried after step 36 and reverted: the moments loop one row an iteration, each row's fourth-
+power pair sums widened at once (the loop took two rows, added their pair sums in 32 bits and
+widened the sum, with the second row's `Mb` loaded three times for want of registers). On an
+L1 buffer the body alone ran 7.7 cycles a row-half from 8.8 (`micro/moments_row.cpp` modes
+1 and 0); in the target the loop grew to 26 instructions a row from 45 per two and its
+samples rose 10% (2138 → 2351), the target 5.612 → 5.573 and 5.539 → 5.565 ms at one thread
+(−0.7%, +0.5%), 1.478 → 1.481 at four. Not kept: the compiler's allocation in the kernel
+differs from the micro-benchmark's, and the loop was at its isolated speed already (the
+phase timers below). Bit-identical on GCC, for the record.
+
 Where the target stands after step 35 (pinned to cores 4–7 of one complex, A/B/B/A, six
 rounds, minima): against the branch's start (step 27) 5.88 → 5.60 ms at one thread (−4.7%),
 3.03 → 2.87 at two (−5.4%), 1.60 → 1.50 at four (−6.0%); against the original build in the
