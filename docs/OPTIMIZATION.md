@@ -1650,6 +1650,12 @@ the signed hue numerator through 1.5·2²³), to take 12 of the loop's 32 pipe-3
 pipe: the loop only −3% (more spills, and the subtracts' half on pipe 3 anyway). Not kept.
 The loop is pipe 3's (the entry above), and what moves off it costs as much elsewhere.
 
+Tried after step 35 and reverted: GCC's `-mrecip=vec-div` in place of `-mno-recip` (the
+reciprocal estimate and a Newton step for the conversion's division, as the CMake comment
+discusses). The HSV row loop 7270 → 8516 samples (+17%: twelve more multiplies on pipes 0
+and 1, which carry as much as pipe 3 does) and the target +4.5% / +4.1% at one thread. Not
+kept: the division is cheaper, as the comment says, and on this core for this reason.
+
 Where the target stands after step 35 (pinned to cores 4–7 of one complex, A/B/B/A, six
 rounds, minima): against the branch's start (step 27) 5.88 → 5.60 ms at one thread (−4.7%),
 3.03 → 2.87 at two (−5.4%), 1.60 → 1.50 at four (−6.0%); against the original build in the
