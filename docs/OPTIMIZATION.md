@@ -1464,6 +1464,13 @@ the stack realignment every function with 256-bit locals does, not a frame point
 flag removes it short of assuming a 32-byte-aligned incoming stack, which the Python entry
 cannot promise). GCC 12 on this host has no C++ front end. None kept.
 
+Tried after step 34 and reverted: the derive group of sixteen cells (four vectors; step 24
+chose eight so that a kind's cells fill one line of the level-1 row), so that the roll-up
+touches each kind's lines half as often again. Bit-identical; −0.1% at one and four
+threads; the roll-up's loops 545 → 542 and 590 → 564 cycle samples in two runs and the
+module within ±0.3%: the level-1 row's lines were already touched once per vector of
+parents, and the rest is the L2 traffic of the row itself. Not kept.
+
 Where the target stands after step 34 (pinned to cores 4–7 of one complex, A/B/B/A, six
 rounds, minima): against the branch's start (step 27) 5.88 → 5.68 ms at one thread (−3.4%),
 3.03 → 2.93 at two (−3.5%), 1.60 → 1.52 at four (−5.2%); against the original build in the
