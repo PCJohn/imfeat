@@ -1,6 +1,7 @@
 // The responses row body: 3 loads at taps -1/0/+1, in-lane widening, 8 stores to a resp buffer.
 // mode 0: as the kernel (planes rows 1088 B apart, resp 512 B per row); 1: resp stores at
-// a fixed row (no sweep); 2: no stores (sum into registers); 3: aligned taps
+// a fixed row (no sweep); 2: no stores (sum into registers); 3: aligned taps; 4: without the
+// M response's store (the moments loop widening the pixel rows itself)
 #include <immintrin.h>
 #include <chrono>
 #include <cstdio>
@@ -38,7 +39,7 @@ int main(int argc, char **argv)
           _mm256_storeu_si256((__m256i *)o, _mm256_sub_epi16(wr, wl));
           _mm256_storeu_si256((__m256i *)(o + 32), _mm256_sub_epi16(lr, m2));
           _mm256_storeu_si256((__m256i *)(o + 64), _mm256_add_epi16(lr, m2));
-          _mm256_storeu_si256((__m256i *)(o + 96), wm);
+          if (mode != 4) _mm256_storeu_si256((__m256i *)(o + 96), wm);
         }
       }
     }

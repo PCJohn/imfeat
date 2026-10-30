@@ -1714,6 +1714,18 @@ take a loop's prologue and exit; so the decoder-fed ops are not costing the loop
 the backend would not cost anyway, and the responses loop's "16 cycles a row" of the fifth
 round was 12 per sampled row over 18 distinct rows: 10.7 each, against 8.9 alone. Closed.
 
+Tried after step 36 and reverted: the responses pass without its fourth response, the plain
+pixel row M (two of its eight stores a distinct row), the moments loop widening the three
+pixel rows itself from the distinct-row table (`rdist`), on the shuffle pipes it leaves
+idle. On L1 buffers the responses body ran 8.6 cycles a row from 10.7 (`micro/
+responses_row.cpp` mode 4) and the moments body 8.5 from 8.7 (`micro/moments_row.cpp` mode
+6). In the target, +5.0% / +5.2% at one thread and +5.0% at four: the moments loop, now
+instantiated for both lane orders, +40% of its samples (2162 → 1893 + 1135), the LBP ring
+86 instructions from 79 with seven more spills (+15%), the responses loop unchanged. The
+micro-benchmarks' bodies are not the kernel's allocation (lesson 14 again), and the byte
+loads' addresses come through a table the micro-benchmark strides past. Bit-identical on the
+three builds and across 1–6 threads, for the record.
+
 Where the target stands after step 35 (pinned to cores 4–7 of one complex, A/B/B/A, six
 rounds, minima): against the branch's start (step 27) 5.88 → 5.60 ms at one thread (−4.7%),
 3.03 → 2.87 at two (−5.4%), 1.60 → 1.50 at four (−6.0%); against the original build in the
