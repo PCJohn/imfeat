@@ -3663,33 +3663,58 @@ class FeatureComputer
     for (const Scratch &sc : scr_) // the rows whose parents another band had to write first
       for (size_t r = 0; r < sc.held_cy.size(); ++r)
         roll_row(sc.held_cy[r], sc.held.data() + r * levels_[0].nx * stripe);
-    for (size_t lvl = stream_ ? 2 : 1; lvl < levels_.size(); ++lvl) // stream_row() fed level 1
+    // features() rolls the coarser levels up in derive(), by the bands where their rows split
+    // evenly across them (stream_row() fed level 1); compute() does every level here
+    if (!stream_)
     {
-      const Level &p = levels_[lvl - 1];
-      Level &lv = levels_[lvl];
-      for (int i = 0; i < lv.ny; ++i) // a parent is written as its first child, then added to
-        for (int j = 0; j < lv.nx; ++j)
-        {
-          const size_t dst = (size_t)i * lv.nx + j;
-          int64_t *IF_RESTRICT dc = lv.buf.data() + dst * stripe;
-          for (int ky = 0, first = 1; ky < lv.fy; ++ky)
-            for (int kx = 0; kx < lv.fx; ++kx, first = 0)
-            {
-              const size_t src = (size_t)(i * lv.fy + ky) * p.nx + (size_t)(j * lv.fx + kx);
-              const int64_t *IF_RESTRICT sc = p.buf.data() + src * stripe;
-              if (first)
-              {
-                std::copy(sc, sc + stripe, dc);
-                continue;
-              }
-              for (int t = 0; t < stripe; ++t) dc[t] += sc[t];
-            }
-        }
+      for (size_t lvl = 1; lvl < levels_.size(); ++lvl) roll_up_rows(lvl, 0, levels_[lvl].ny);
+      global_sums();
     }
+    else if (levels_.size() == 1)
+      global_sums();
+  }
 
+  // Level lvl's parents of rows [r0, r1) from level lvl - 1's children: the stripe of int64
+  // sums a vector at a time, the children added in registers and the parent stored once.
+  void roll_up_rows(size_t lvl, int r0, int r1)
+  {
+    const Level &p = levels_[lvl - 1];
+    Level &lv = levels_[lvl];
+    const int stripe = c_ * NSUM, N = (int)hn::Lanes(d64);
+    for (int i = r0; i < r1; ++i)
+      for (int j = 0; j < lv.nx; ++j)
+      {
+        int64_t *IF_RESTRICT dc = lv.buf.data() + ((size_t)i * lv.nx + j) * stripe;
+        const int64_t *IF_RESTRICT c0 =
+            p.buf.data() + ((size_t)(i * lv.fy) * p.nx + (size_t)(j * lv.fx)) * stripe;
+        auto child = [&](int ky, int kx) { return c0 + ((size_t)ky * p.nx + (size_t)kx) * stripe; };
+        int t = 0;
+        for (; t + N <= stripe; t += N)
+        {
+          V64 acc = hn::LoadU(d64, c0 + t);
+          for (int ky = 0; ky < lv.fy; ++ky)
+            for (int kx = 0; kx < lv.fx; ++kx)
+              if (ky | kx) acc = hn::Add(acc, hn::LoadU(d64, child(ky, kx) + t));
+          hn::StoreU(acc, d64, dc + t);
+        }
+        for (; t < stripe; ++t)
+        {
+          int64_t acc = c0[t];
+          for (int ky = 0; ky < lv.fy; ++ky)
+            for (int kx = 0; kx < lv.fx; ++kx)
+              if (ky | kx) acc += child(ky, kx)[t];
+          dc[t] = acc;
+        }
+      }
+  }
+  // The global (one-cell) sums: of the last level's cells, or, when the only level was never
+  // stored, of what the bands summed.
+  void global_sums()
+  {
+    const int stripe = c_ * NSUM;
     const Level &last = levels_.back();
     std::fill(graw_.begin(), graw_.end(), (int64_t)0);
-    if (stream_ && levels_.size() == 1) // the only level was never stored: the bands summed it
+    if (stream_ && levels_.size() == 1)
     {
       for (const Scratch &sc : scr_)
         for (int t = 0; t < stripe; ++t) graw_[t] += sc.graw[t];
@@ -3700,6 +3725,16 @@ class FeatureComputer
       const int64_t *IF_RESTRICT s = last.buf.data() + cell * stripe;
       for (int t = 0; t < stripe; ++t) graw_[t] += s[t];
     }
+  }
+  // features(): the first coarser level whose rows do not split evenly across the bands. The
+  // levels below it are rolled up and derived in the bands (derive_cells), each band's rows
+  // from its own rows of the level below; it and the levels above it after the join.
+  size_t first_serial_level() const
+  {
+    const size_t nb = bands_.size();
+    size_t lvl = std::min<size_t>(2, levels_.size());
+    while (lvl < levels_.size() && (size_t)levels_[lvl].ny % nb == 0) ++lvl;
+    return lvl;
   }
 
   // Reduce one just-derived per-cell vector (v[0..n)) into running summary
@@ -4001,12 +4036,14 @@ class FeatureComputer
   }
   void derive_cells(int bi)
   {
-    const size_t nb = bands_.size();
-    for (size_t lvl = stream_ ? 1 : 0; lvl < levels_.size(); ++lvl) // stream_row() derived level 0
+    const size_t nb = bands_.size(), serial = stream_ ? first_serial_level() : levels_.size();
+    for (size_t lvl = stream_ ? 1 : 0; lvl < serial; ++lvl) // stream_row() derived level 0
     {
       const Level &L = levels_[lvl];
       const size_t nc = (size_t)L.ny * L.nx, c0 = nc * (size_t)bi / nb,
                    c1 = nc * (size_t)(bi + 1) / nb;
+      if (lvl >= 2 && stream_) // this band's rows of the level, from its rows of the one below
+        roll_up_rows(lvl, (int)((size_t)L.ny * bi / nb), (int)((size_t)L.ny * (bi + 1) / nb));
       if (lvl == 1 && stream_) // rows flush_up() derived in their band are done: the rest
       {                        // from their slots, then the summary over all of them
         for (size_t r = c0 / L.nx; r * L.nx < c1; ++r)
@@ -4027,6 +4064,17 @@ class FeatureComputer
   void derive()
   {
     run_job(JOB_DERIVE);
+    if (stream_ && levels_.size() > 1) // the levels the bands could not share, then the global
+    {
+      for (size_t lvl = first_serial_level(); lvl < levels_.size(); ++lvl)
+      {
+        const Level &L = levels_[lvl];
+        roll_up_rows(lvl, 0, L.ny);
+        derive_run(L, 0, (size_t)L.ny * L.nx, L.buf.data(), bands_.size() == 1);
+        if (bands_.size() == 1) summary_write(L);
+      }
+      global_sums();
+    }
     if (parallel_summary())
     {
       run_job(JOB_SUMMARY);
