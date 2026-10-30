@@ -2627,6 +2627,7 @@ class FeatureComputer
     bool mom;
   };
   std::vector<SumRun> sruns_;
+  int hash_bi_ = 0; // the summary job's least-loaded thread, which takes the hashes too
   bool parallel_summary() const { return bands_.size() >= 2; }
   Job job_ = JOB_ACC;
   bool stream_ = false; // features(): the finest level is derived row by row and never stored
@@ -3979,9 +3980,12 @@ class FeatureComputer
     }
   }
   // The summary after the join, with more than one band: thread bi folds its runs (sruns_),
-  // each a level's cells in order over a range of lanes, as a lone thread folds them all.
+  // each a level's cells in order over a range of lanes, as a lone thread folds them all. The
+  // least-loaded thread derives the hashes meanwhile (their grid sums are complete after the
+  // accumulation; a lone band derives them after the summary).
   void summary_job(int bi)
   {
+    if (bi == hash_bi_) derive_hashes();
     for (const SumRun &u : sruns_)
     {
       if (u.t != bi) continue;
@@ -4408,11 +4412,13 @@ public:
       const size_t total = std::accumulate(wt.begin(), wt.end(), (size_t)0);
       size_t acc = 0;
       const size_t nbnd = bands_.size();
+      std::vector<size_t> load(nbnd, 0);
       for (size_t i = 0; i < units.size(); ++i)
       {
         SumRun u = units[i];
         u.t = total ? (int)std::min(nbnd - 1, (acc + wt[i] / 2) * nbnd / total) : 0;
         acc += wt[i];
+        load[(size_t)u.t] += wt[i];
         if (!sruns_.empty() && !u.mom && !sruns_.back().mom && sruns_.back().t == u.t &&
             sruns_.back().lvl == u.lvl && sruns_.back().k == u.k &&
             sruns_.back().j0 + sruns_.back().n == u.j0)
@@ -4420,6 +4426,7 @@ public:
         else
           sruns_.push_back(u);
       }
+      hash_bi_ = (int)(std::min_element(load.begin(), load.end()) - load.begin());
     }
     for (size_t b = 1; b < bands_.size(); ++b) workers_.emplace_back([this, b] { worker((int)b); });
     if (blocks_) blocks_->retire(); // arrays of the old configuration keep their blocks
@@ -4470,7 +4477,7 @@ public:
     stream_ = true;
     accumulate(img, rs, cs, chs, thumb_out);
     derive();
-    derive_hashes();
+    if (!parallel_summary()) derive_hashes(); // (else the summary job did)
     auto view = [&](auto *data, const std::vector<size_t> &shape)
     {
       using T = std::remove_pointer_t<decltype(data)>;
