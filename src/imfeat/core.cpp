@@ -1062,6 +1062,46 @@ HWY_INLINE void fold_hog_multi(const Acc &A, size_t g, const bool *IF_RESTRICT a
     }
   }
 }
+// The sums of a two-cell block whose 16-bit halves hold the pixels in interleave order
+// (Chunk::inlane, see block()): each 128-bit half of every int32 vector is then one cell,
+// whichever half block or quarter the vector is, so the vectors of a kind add first and a
+// cell's lanes reduce through one interleave level. The pair kinds' lanes sum four at a time
+// within 32 bits as before; the HOG's four quarters (each lane below 2^28) add first and
+// their lanes reduce as int64. Two cells are stored at once.
+template <bool SIGNED>
+HWY_INLINE void fold_pair_inlane(V32 v0, V32 v1, bool add, int64_t *IF_RESTRICT dst)
+{
+  const D32x4 d4;
+  const hn::Half<D64x4> dw2;
+  const V32 w = hn::Add(v0, v1); // two lanes a lane
+  const auto lo = hn::LowerHalf(d4, w), hi = hn::UpperHalf(d4, w);
+  const auto r = hn::Add(hn::InterleaveLower(d4, lo, hi), hn::InterleaveUpper(d4, lo, hi));
+  hn::VFromD<hn::Half<D64x4>> c; // r: [cell 0, cell 1, cell 0, cell 1], four lanes each
+  if constexpr (SIGNED)
+    c = hn::Add(hn::PromoteLowerTo(dw2, r), hn::PromoteUpperTo(dw2, r));
+  else
+  {
+    const hn::RebindToUnsigned<hn::Half<D64x4>> du2;
+    const auto ru = hn::BitCast(hn::RebindToUnsigned<D32x4>(), r);
+    c = hn::BitCast(dw2, hn::Add(hn::PromoteLowerTo(du2, ru), hn::PromoteUpperTo(du2, ru)));
+  }
+  hn::StoreU(add ? hn::Add(c, hn::LoadU(dw2, dst)) : c, dw2, dst);
+}
+HWY_INLINE void fold_hog_inlane(const Acc &A, bool add, int64_t *IF_RESTRICT cb, size_t kst)
+{
+  const D64x4 dw;
+  const hn::Half<D64x4> dw2;
+  for (int j = 0; j < K_NHOG; ++j)
+  {
+    const V32 w =
+        hn::Add(hn::Add(A.hog[0][j], A.hog[1][j]), hn::Add(A.hog[2][j], A.hog[3][j]));
+    const auto lo = hn::PromoteLowerTo(dw, w), hi = hn::PromoteUpperTo(dw, w); // the cells
+    const auto s = hn::Add(hn::InterleaveLower(dw, lo, hi), hn::InterleaveUpper(dw, lo, hi));
+    const auto c = hn::Add(hn::LowerHalf(dw2, s), hn::UpperHalf(dw2, s));
+    int64_t *IF_RESTRICT dst = cb + (K_HOG + j) * kst;
+    hn::StoreU(add ? hn::Add(c, hn::LoadU(dw2, dst)) : c, dw2, dst);
+  }
+}
 #endif
 
 // derive, for LD cell-channels in lockstep: four a vector where vectors hold four doubles.
@@ -2894,7 +2934,7 @@ class FeatureComputer
       C.tapcol = tapcol_;
       C.resp = aligned64(s.resp);
       C.hbuf = aligned64(s.hbuf);
-      C.inlane = block_cells_ == 1;
+      C.inlane = block_cells_ == 1 || (FOLDH && block_cells_ == 2); // (see the fold below)
       C.rows1 = rslots_ == 1;
       for (size_t sub = 0, qs = 0; qs < nr; ++sub, qs += sub_rows_)
       {
@@ -2988,6 +3028,19 @@ class FeatureComputer
                                 cb + t * kst + at[2] * cst);
                 }
 #if HWY_MAX_BYTES >= 32 && !HWY_HAVE_SCALABLE
+              if (FOLDH && C.inlane) // two cells, the halves in interleave order: every
+              {                      // int32 kind's cells are its vectors' 128-bit halves
+                int64_t *IF_RESTRICT c0 = cb + at[0] * cst;
+                for (int t = 0; t < K_NUNSIGNED; ++t)
+                  fold_pair_inlane<false>(A.pair[0][t], A.pair[1][t], adds[0], c0 + t * kst);
+                for (int t = K_NUNSIGNED; t < K_NPAIR; ++t)
+                  fold_pair_inlane<true>(A.pair[0][t], A.pair[1][t], adds[0], c0 + t * kst);
+                fold(d64, hn::Add(A.t4[0], A.t4[1]), 2, adds[0], c0 + K_T4 * kst);
+                fold(d64, hn::Add(hn::Add(A.sg4[0], A.sg4[1]), hn::Add(A.sg4[2], A.sg4[3])), 2,
+                     adds[0], c0 + K_SG4 * kst);
+                fold_hog_inlane(A, adds[0], c0, kst);
+                continue;
+              }
               if (FOLDH)
               {
                 for (int t = 0; t < K_NUNSIGNED; ++t)
