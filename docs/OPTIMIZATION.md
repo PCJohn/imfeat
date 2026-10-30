@@ -1627,6 +1627,12 @@ sixteen stores, half the loop overhead). The loop −5% (3716 → 3535 samples) 
 ring and the energy loop +8% each from the allocation, the frame slower. Bit-identical.
 Not kept.
 
+Tried after step 35 and reverted: the bar detector's phase moved between the responses
+pass and the energies (its 1100 cycles a block would let the responses' stores commit before
+the energies' loads want them, instead of forwarding from the store queue). The responses
+loop did not move, the straight-line code +1088 samples, the frame +2–4%. Bit-identical.
+Not kept; the forwarding was not what the responses loop waits on.
+
 Where the target stands after step 35 (pinned to cores 4–7 of one complex, A/B/B/A, six
 rounds, minima): against the branch's start (step 27) 5.88 → 5.60 ms at one thread (−4.7%),
 3.03 → 2.87 at two (−5.4%), 1.60 → 1.50 at four (−6.0%); against the original build in the
