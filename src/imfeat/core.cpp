@@ -1369,7 +1369,7 @@ using VF = hn::VFromD<DF>;
 #if defined(_MSC_VER) && !defined(__clang__)
 #pragma float_control(precise, on, push)
 #endif
-// 1 / p for p in [1, 2^16]. A division: one instruction, correctly rounded, and the divider
+// HNUM / p for p in [1, 2^16]. A division: one instruction, correctly rounded, and the divider
 // it occupies for a few cycles runs beside the arithmetic ports that are the busy ones here.
 // GCC and clang both replace a vector division by a hardware estimate plus one Newton step
 // under -ffast-math, whatever the function's own options say; CMakeLists.txt turns that off
@@ -1379,7 +1379,7 @@ HWY_INLINE VF hsv_recip(VF p)
 {
   IF_STRICT_BODY
   const DF df;
-  return hn::Div(hn::Set(df, 1.0f), p);
+  return hn::Div(hn::Set(df, (float)HSV_HNUM), p);
 }
 
 // (NUM / x) rounded half up, for x in [1, 255], from a float guess g of the quotient within
@@ -1413,8 +1413,10 @@ HWY_INLINE VF hsv_table(VF g)
 // reciprocal, 1 / (v * diff): sdiv = SNUM * diff * r, hdiv = HNUM * v * r, where SNUM * diff
 // and HNUM * v are exact (they are 2^12 * 255 * diff and 2^13 * 15 * v), so each guess
 // carries the reciprocal's rounding and one of its own: within 2^-23 relative, which is
-// what hsv_table needs. When diff is 0 (v too, or a grey) the products that use the tables
-// are 0, so the tables may be anything finite: the reciprocal is taken of max(v * diff, 1).
+// what hsv_table needs. The reciprocal carries HNUM, so hdiv's guess is one multiply, and
+// sdiv's multiplier is 8.5 diff, exact, since SNUM = 8.5 HNUM. When diff is 0 (v too, or a
+// grey) the products that use the tables are 0, so the tables may be anything finite: the
+// reciprocal is taken of max(v * diff, 1).
 template <bool kH, bool kS, bool kODD>
 HWY_INLINE void hsv_lanes(V32 v, V32 diff, V32 h6, V32 &s, V32 &h)
 {
@@ -1424,15 +1426,16 @@ HWY_INLINE void hsv_lanes(V32 v, V32 diff, V32 h6, V32 &s, V32 &h)
   constexpr float kScale = kUnit / (float)(1 << HSV_SHIFT); // the table value's 2^-12
   const VF vf = hn::ConvertTo(df, v), dfv = hn::ConvertTo(df, diff);
   const VF scale = hn::Set(df, kScale), dfs = hn::Mul(dfv, scale); // (off the chain)
-  const VF r = hsv_recip(hn::Max(hn::Mul(vf, dfv), hn::Set(df, 1.0f)));
+  static_assert(2 * HSV_SNUM == 17 * HSV_HNUM, "SNUM / HNUM = 8.5");
+  const VF r = hsv_recip(hn::Max(hn::Mul(vf, dfv), hn::Set(df, 1.0f))); // HNUM / (v diff)
   if (kS)
   {
-    const VF sdiv = hsv_table<HSV_SNUM>(hn::Mul(hn::Mul(hn::Set(df, (float)HSV_SNUM), dfv), r));
+    const VF sdiv = hsv_table<HSV_SNUM>(hn::Mul(hn::Mul(hn::Set(df, 8.5f), dfv), r));
     s = hn::ConvertInRangeTo(d32, hn::MulAdd(dfs, sdiv, hn::Set(df, 0.5f * kUnit)));
   }
   if (kH)
   {
-    const VF hdiv = hsv_table<HSV_HNUM>(hn::Mul(hn::Mul(hn::Set(df, (float)HSV_HNUM), vf), r));
+    const VF hdiv = hsv_table<HSV_HNUM>(hn::Mul(vf, r));
     const VF t = hn::MulAdd(hn::Mul(hn::ConvertTo(df, h6), scale), hdiv,
                             hn::Set(df, ((float)HSV_HBIAS + 0.5f) * kUnit));
     h = hn::ConvertInRangeTo(d32, t);
