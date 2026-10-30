@@ -1826,6 +1826,13 @@ value (the mask of "no neighbour below" rather than its complement: 8,678 of 40,
 differ, all through the local-minimum count); the same instructions on the same pipes, so
 the timing stands as the allocation's, not the variant's.
 
+Tried after step 36 and reverted: the HOG loop's fourth power (two `pmuldq` that wait four
+cycles on `|grad|²`) after the four ray tests in the source, whose multiplies need only the
+absolute pair, as the best orders of the search put them. GCC's order followed the source;
+the loop −1% of its samples (7149 → 7084, 7190 → 7118), the target +0.9% / +1.0% at one
+thread, +1.1% at four (other loops moved: the placement noise of lesson 13). Not kept.
+Bit-identical on the GCC build, for the record.
+
 Where the target stands after step 36 (pinned to cores 4–7 of one complex, A/B/B/A,
 minima): against the branch's start (step 27) 5.88 → 5.58 ms at one thread (−5.1%),
 3.03 → 2.85 at two (−5.9%), 1.60 → 1.485 at four (−7.2%); against the original build in
