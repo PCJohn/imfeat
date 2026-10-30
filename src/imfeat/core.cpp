@@ -439,11 +439,23 @@ HWY_INLINE void block(const Chunk &C, const uint8_t *IF_RESTRICT mask,
                                        t[9], t[10], t[11], t[12], t[13], t[14], t[15]);
     }
     const uint8_t *IF_RESTRICT rb = C.base + C.row0;
-    for (size_t q0 = 0; q0 < C.nr; q0 += LBP_NIB)
+    V8 nib[NPAIR];
+    for (int k = 0; k < NPAIR; ++k) nib[k] = hn::Zero(d8);
+    auto empty = [&]() // the nibble counts into the byte counts, and cleared
     {
-      V8 nib[NPAIR];
-      for (int k = 0; k < NPAIR; ++k) nib[k] = hn::Zero(d8);
-      for (size_t q = q0; q < std::min(C.nr, q0 + LBP_NIB); ++q, rb += C.rowstep)
+      for (int k = 0; k < NPAIR; ++k)
+      {
+        lbp[2 * k] = hn::Add(lbp[2 * k], hn::And(nib[k], hn::Set(d8, 0x0F)));
+        if (2 * k + 1 < LBPB - 1)
+          lbp[2 * k + 1] = hn::Add(lbp[2 * k + 1], hn::ShiftRight<4>(nib[k]));
+        nib[k] = hn::Zero(d8);
+      }
+    };
+    // one loop down the rows, the nibbles emptied every LBP_NIB rows on the way (a second
+    // pass of the loop for the rows past the first LBP_NIB cost its prologue and epilogue)
+    size_t left = LBP_NIB;
+    {
+      for (size_t q = 0; q < C.nr; ++q, rb += C.rowstep)
       {
         const uint8_t *IF_RESTRICT ra = rb - rs, *IF_RESTRICT re = rb + rs;
         const V8 c = hn::LoadU(d8, rb + tm);
@@ -470,13 +482,9 @@ HWY_INLINE void block(const Chunk &C, const uint8_t *IF_RESTRICT mask,
         const V8 bin = hn::IfThenElse(hn::RebindMask(d8, uniform), hn::Sub(hn::Zero(d8), npc),
                                       hn::Set(d8, (uint8_t)(LBPB - 1)));
         for (int k = 0; k < NPAIR; ++k) nib[k] = hn::Add(nib[k], hn::TableLookupBytes(tbl[k], bin));
+        if (--left == 0) empty(), left = LBP_NIB;
       }
-      for (int k = 0; k < NPAIR; ++k)
-      {
-        lbp[2 * k] = hn::Add(lbp[2 * k], hn::And(nib[k], hn::Set(d8, 0x0F)));
-        if (2 * k + 1 < LBPB - 1)
-          lbp[2 * k + 1] = hn::Add(lbp[2 * k + 1], hn::ShiftRight<4>(nib[k]));
-      }
+      if (left != LBP_NIB) empty();
     }
     for (int j = 0; j < LBPB - 1; ++j) A.u8[K_LBP - K_U8 + j] = lbp[j];
     A.u8[K_MAX - K_U8] = lbp[0];
