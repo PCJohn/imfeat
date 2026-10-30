@@ -29,6 +29,12 @@ relative to the repository. They are conveniences, not a dependency of the build
   of a build (addresses as `perf_sig.py` prints them), to see where inside a loop they land.
 * `micro/pipes.cpp`: throughput and pipe assignment of one 256-bit instruction on the host
   core (16 independent chains under `perf stat` with the AMD `fpu_pipe_assignment` events);
-  `micro/hog_row.cpp` and `micro/responses_row.cpp`: the HOG quarter loop's and the
-  responses loop's row bodies on an L1-resident buffer, in variants, to measure a loop's
-  cost apart from the kernel around it. Build with `g++ -O3 -march=native`.
+  `micro/hog_row.cpp`, `micro/responses_row.cpp`, `micro/moments_row.cpp` and
+  `micro/lbp_row.cpp` (`-DMODE=n`): the HOG quarter loop's, the responses loop's, the
+  moments loop's and the LBP ring's row bodies on an L1-resident buffer, in variants, to
+  measure a loop's cost apart from the kernel around it. Build with `g++ -O3 -march=native`.
+* `micro/pipe_probe.cpp`: how the core's FP dispatcher assigns multi-pipe uops next to
+  pipe-0 multiplies (synthetic streams under the pipe counters); `micro/hog_order.py N core`:
+  the HOG row body as an asm loop in the kernel's order and N random orders under the
+  kernel's register budget, cycles and pipe-0 uops a row of each (the order search of the
+  pipe-assignment account after step 36).
