@@ -1534,6 +1534,17 @@ every phase of `block()` but the bar detector's has now been tried out of line a
 the allocation inside `block()` after step 35 is what it is, and the responses loop's five
 extra scalar instructions since that step (33 → 38) are the one visible cost left of it.
 
+Tried after step 35 and reverted: the responses loop with one running pointer per table
+instead of its index arithmetic, to take back the five scalar instructions it gained in
+step 35's instantiation. It did (38 → 33 instructions, 1826 → 1755 and 1798 → 1809 samples,
+the module's instructions −0.8%), and the layout around it moved the other way: the fold's
+loop +206 and +212 samples, the HOG row loop +253 in one run, the target +1.3% / +1.5% at
+one thread and +0.9% / +1.0% at four. Not kept. Three forms of the same lever after step 35
+(the HOG phase out of line, the energy corrections out of line, this) each lost 1–4% to
+placement and allocation around an unchanged instruction mix: lesson 13's noise is the
+size of what is left here, and a change inside `block()` is now as likely to lose as to
+win on it.
+
 Where the target stands after step 35 (pinned to cores 4–7 of one complex, A/B/B/A, six
 rounds, minima): against the branch's start (step 27) 5.88 → 5.60 ms at one thread (−4.7%),
 3.03 → 2.87 at two (−5.4%), 1.60 → 1.50 at four (−6.0%); against the original build in the
