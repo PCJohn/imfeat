@@ -32,3 +32,4 @@
 31 b4e65e4 LBP phase: one loop down the rows, the nibbles emptied on the way
 32 a25107e The coarser levels rolled up in the bands, a vector of the stripe at a time
 33 ba4a003 The hashes derived on the summary job's least-loaded thread
+34 77d5a97 HOG: one set of accumulators through a sub-chunk's four quarters where the lanes allow it

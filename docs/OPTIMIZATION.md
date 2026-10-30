@@ -1516,6 +1516,11 @@ on the critical path between the row loops), the moments loop −11% (2399 → 2
 The first form of this step merged the 16-bit phases' halves too, and lost (above).
 Bit-identical on the GCC/AVX2, clang and SSE4 builds (40,164 arrays) and across 1–6 threads.
 
+Where the target stands after step 35 (pinned to cores 4–7 of one complex, A/B/B/A, six
+rounds, minima): against the branch's start (step 27) 5.88 → 5.60 ms at one thread (−4.7%),
+3.03 → 2.87 at two (−5.4%), 1.60 → 1.50 at four (−6.0%); against the original build in the
+same session 9.82 → 5.60, 5.07 → 2.88 and 2.70 → 1.50 ms, 1.75× / 1.76× / 1.80×.
+
 Where the target stands after step 34 (pinned to cores 4–7 of one complex, A/B/B/A, six
 rounds, minima): against the branch's start (step 27) 5.88 → 5.68 ms at one thread (−3.4%),
 3.03 → 2.93 at two (−3.5%), 1.60 → 1.52 at four (−5.2%); against the original build in the
