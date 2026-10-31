@@ -408,6 +408,22 @@ bar-detector corner cases that were bugs. The short version, with the full log i
   instructions and −3.2% of its time. The log says what each stage costs now, why
   the kernel is at the practical floor of this core, and how to measure on a machine that is
   not quiet.
+* **October 30, 2026, the target scenario** (steps 28–36 of the log; the second bundle
+  report): a per-loop profile of the host's own use, a 1024×1024×3 BGR frame through the
+  fused HSV conversion at stride 1 into a seven-level pyramid from 64×64 cells, found what
+  the headline's profiles had not: two-cell blocks widening their row responses in-lane and
+  folding from the vectors' halves (−3.3%), the HSV row's shifts and lane merges folded
+  into its float path, an integer divide per block gone, the LBP pass in one loop, the
+  coarser levels rolled up inside the threads' bands with the hashes on the least-loaded
+  one (−2.3% at four threads), the HOG's four quarters through one accumulator set, and
+  its ray sums taken by mask (−13% on that loop). Nine exact steps, each bit-identical on
+  three builds: the original, the bundle's start and every commit rebuilt and timed in one
+  sitting put the target at 9.86 → 5.94 → 5.62 ms on one thread, 5.14 → 3.05 → 2.90 on
+  two and 2.71 → 1.61 → 1.51 on four, the bundle −5.4% / −5.0% / −6.2% and the whole
+  1.75× / 1.77× / 1.79× the original. Some 30 further ideas were built, measured and
+  reverted; the kernel's loops sit at 1.25–1.5× their four-pipe floors by the core's own
+  dispatch, which portable source cannot steer, and that is where the single thread ends
+  within the bit-exact contract.
 
 ---
 

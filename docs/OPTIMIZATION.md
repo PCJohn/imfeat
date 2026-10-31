@@ -1839,6 +1839,12 @@ Where the target stands after step 36 (pinned to cores 4–7 of one complex, A/B
 minima): against the branch's start (step 27) 5.88 → 5.58 ms at one thread (−5.1%),
 3.03 → 2.85 at two (−5.9%), 1.60 → 1.485 at four (−7.2%); against the original build in
 the same session 9.82 → 5.58, 5.07 → 2.85 and 2.70 → 1.485 ms, 1.76× / 1.78× / 1.82×.
+The bundle report's sweep (oct-30-2026-optimization-bundle.md: the original, step 27 and
+every commit since rebuilt and run through the benchmark suite in one sitting, three runs,
+minima) reads 9.855 → 5.939 → 5.616 ms at one thread, 5.135 → 3.049 → 2.898 at two and
+2.708 → 1.614 → 1.514 at four: the bundle −5.4% / −5.0% / −6.2%, the whole 1.75× / 1.77× /
+1.79×. The original's reading moves 4–5% between sittings with the machine's load, the
+optimised builds' 2–3%, so the ratio to quote is the sweep's, with its day (its lesson 6).
 
 Where the target stands after step 35 (pinned to cores 4–7 of one complex, A/B/B/A, six
 rounds, minima): against the branch's start (step 27) 5.88 → 5.60 ms at one thread (−4.7%),
