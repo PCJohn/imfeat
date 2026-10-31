@@ -1,0 +1,11 @@
+00 3957392 Add AGENTS.md
+01 cf40d37 LBP ring: the neighbour test as a saturating subtract compared with zero
+02 bde5b6c Two-cell blocks widen in-lane; their int32 kinds fold from the 128-bit halves
+03 fc5afd0 HSV row: the >> 12 and the lane merges folded into the float path
+04 9544713 Per-block bookkeeping: the group modulo as a mask; the bar detector's run bounds once per chunk
+05 dfe62b0 HSV row: one reciprocal carries HNUM, so hdiv's guess is one multiply
+06 b4e65e4 LBP phase: one loop down the rows, the nibbles emptied on the way
+07 a25107e The coarser levels rolled up in the bands, a vector of the stripe at a time
+08 ba4a003 The hashes derived on the summary job's least-loaded thread
+09 77d5a97 HOG: one set of accumulators through a sub-chunk's four quarters where the lanes allow it
+10 b0e95e2 HOG: the energy short of each ray by mask, and no side sum

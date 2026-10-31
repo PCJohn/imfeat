@@ -277,6 +277,24 @@ def report(args: argparse.Namespace) -> None:
     fig.savefig(out / f"latency_by_commit{tag}.png", dpi=130)
     print("wrote", out / f"latency_by_commit{tag}.csv", out / f"latency_by_commit{tag}.md",
           out / f"latency_by_commit{tag}.png")
+    if args.zoom_from is None:
+        return
+    # the same series from one commit on, each on its own axis: a bundle of small steps
+    # is invisible on the axis the original build sets
+    z = args.zoom_from
+    fig, axes = plt.subplots(len(table), 1, figsize=(11, 2.2 * len(table)), sharex=True)
+    for ax, (name, ys) in zip(axes, table.items()):
+        ax.plot(x[z:], [y if y is not None else float("nan") for y in ys[z:]], marker="o", ms=4)
+        ax.set_ylabel("ms", fontsize=8)
+        ax.set_title(name, fontsize=9, loc="left")
+        ax.grid(True, alpha=0.3)
+    axes[-1].set_xticks(x[z:])
+    axes[-1].set_xticklabels([h for _, h, _ in commits[z:]], rotation=90, fontsize=7)
+    axes[-1].set_xlabel(f"code commit, oldest first (from {commits[z][1]})")
+    fig.suptitle("imfeat latency by commit, the bundle alone (pinned minima)", fontsize=10)
+    fig.tight_layout()
+    fig.savefig(out / f"latency_by_commit{tag}_zoom.png", dpi=130)
+    print("wrote", out / f"latency_by_commit{tag}_zoom.png")
 
 
 def main() -> None:
@@ -300,6 +318,8 @@ def main() -> None:
                    help="which logs to report (their name suffix); several, comma-separated, "
                         "report the minimum per number over those runs")
     r.add_argument("--name", default="", help="output suffix when several tags are given")
+    r.add_argument("--zoom-from", type=int, default=None,
+                   help="also chart the series from this commit index on, one axis each")
     args = ap.parse_args()
     if args.cmd == "sweep":
         args.base = args.base or git("merge-base", "main", args.head)
