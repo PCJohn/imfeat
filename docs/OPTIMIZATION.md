@@ -7,11 +7,13 @@ and how every change was measured and verified.
 The constraints throughout: no approximations; every integer sum bit-exact; no float
 tolerance loosened; nothing tuned to one machine (no "more threads", no per-CPU parameters).
 
-The branch of October 28–29, 2026 (steps 10–27) has a companion checkpoint report,
-[oct-28-2026-optimization-bundle.md](oct-28-2026-optimization-bundle.md): its starting and ending commits, the benchmark suite's
-latencies at every code commit (with the chart and the CSV), the ideas that did not
-work grouped by what they assumed, and the trends to steer further work by. This log has
-each step's mechanism; that report has the measured timeline.
+The branch of October 28–29, 2026 (steps 10–27) and that of October 30 (steps 28–36)
+each have a companion report, [oct-28-2026-optimization-bundle.md](oct-28-2026-optimization-bundle.md)
+and [oct-30-2026-optimization-bundle.md](oct-30-2026-optimization-bundle.md): its starting
+and ending commits, the benchmark suite's latencies at every code commit (with the chart
+and the CSV), the ideas that did not work grouped by what they assumed, and the trends to
+steer further work by. This log has each step's mechanism; the reports have the measured
+timeline.
 
 ## Starting point
 

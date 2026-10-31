@@ -20,10 +20,10 @@ detail. Read this one first, that one for the how.
 | end | the commit that adds this file | 2026-10-30 | this report, its sweep, and the measurement tools added on the way |
 
 Between the start and the end: 9 commits that change `src/imfeat/core.cpp` (the log's steps
-28–36, one commit each), 2 that add measurement tools under `scripts/measure/` (the target
-profile's scripts; the pipe probes and the order search), and some 30 that change only the
-log: every idea tried and reverted has its own entry in its own commit, and every round of
-looking has an account. The log's step 28 opened with a per-loop profile of the target
+28–36, one commit each) and some 35 that change only the log, the measurement tools under
+`scripts/measure/` (the target profile's scripts, the loop-body copies, the pipe probes and
+the order search) and these reports: every idea tried and reverted has its own entry in its
+own commit, and every round of looking has an account. The log's step 28 opened with a per-loop profile of the target
 scenario itself, which the first bundle had never profiled (it had profiled the headline
 and a 1080p gate frame), and most of this bundle's steps came from it.
 
@@ -44,15 +44,17 @@ summary, stayed reverted.
   the timed calls; everything else is the run's noise). The script gained one option here,
   `--include`, to time the original base in the same sitting as a later bundle's commits.
 * **Eleven builds in one sitting.** The original `3957392`, the start `cf40d37` and the
-  nine code commits of this bundle, built and timed one after another, so that the ratios
-  below compare numbers taken within an hour and a half of each other on the same cores.
+  nine code commits of this bundle, built and timed one after another in one sitting of
+  about two hours, so that the ratios below compare numbers taken on the same cores under
+  the same load.
   The first report's rows 27–34 were the same commits timed on a busier day by three runs
   resumed over them alone; this table supersedes them.
 * **Three runs, the minimum kept**, as before: the suite in full twice, pinned to cores 5,
-  6, 7 and 3 (the busiest core of each complex avoided: another job held core 4 and part of
-  core 2 all day), and the target scenario alone a third time pinned inside one complex
-  (cores 4–7), since a frame whose threads straddle the two complexes reads 20–30% slower
-  at two and four threads (lesson 10 of the first report).
+  6, 7 and 3 (the busiest core of each complex avoided: another job held core 4 all day),
+  and the target scenario alone a third time pinned inside one complex (cores 4–7), since a
+  frame whose threads straddle the two complexes reads 20–80% slower at two and four threads
+  in the full runs (lesson 10 of the first report); the 2- and 4-thread columns below come
+  from that third run, the 1-thread ones mostly from the full runs.
 * **The log's numbers are a different sitting.** The engineering log's "where the target
   stands" paragraphs give 5.58 / 2.85 / 1.485 ms at 1 / 2 / 4 threads after step 36 and
   call it 1.76× / 1.78× / 1.82× over "the original build in the same session", that build
@@ -109,14 +111,17 @@ effect against the commit before it on the target at one thread:
 | 09 | `77d5a97` | 1.75× | 1.77× | 1.80× | 1.76× | -0.7% | HOG: one set of accumulators through a sub-chunk's four quarters where the lanes allow it |
 | 10 | `b0e95e2` | 1.75× | 1.77× | 1.79× | 1.77× | -0.4% | HOG: the energy short of each ray by mask, and no side sum |
 
-Over the bundle, the target went from 5.939 / 3.049 / 1.614 ms at the start to 5.616 / 2.898 / 1.514 at the end at 1 / 2 / 4 threads (−5.4% / −5.0% / −6.2%), and against the original timed in the same sitting, 9.855 / 5.135 / 2.708 ms, the end is 1.75× / 1.77× / 1.79×. The suite's headline (four levels, no conversion) went 5.352 → 5.061 ms, 1.77× the original.
-Commit by commit the lines are not monotone: steps 30 and 33 read +1.3% and +1.0% at one
-thread here, and the log took both on other evidence (step 30 on executed divider counts and
-the samples outside loops, 0.3%; step 33 on the four-thread frame, where it reads −1.0%
-below), while the three steps the log measured at −1% or better at one thread (28, 32, 35)
-are the three visible drops. Below 2% a single commit's wall clock on this host is placement
-and load (lesson 5 of the first report); the bundle's total, −5.4% / −5.0% / −6.2%, is what
-the sweep resolves.
+Over the bundle, the target went from 5.939 / 3.049 / 1.614 ms at the start to 5.616 /
+2.898 / 1.514 at the end at 1 / 2 / 4 threads (−5.4% / −5.0% / −6.2%), and against the
+original timed in the same sitting, 9.855 / 5.135 / 2.708 ms, the end is 1.75× / 1.77× /
+1.79×. The suite's headline (four levels, no conversion) went 5.352 → 5.061 ms, 1.77× the
+original. Commit by commit the lines are not monotone: steps 30 and 33 read +1.3% and +1.0%
+at one thread here, and the log took both on other evidence (step 30 on a count of executed
+divides and the samples outside loops, 0.3%; step 33 on the four-thread frame, where it
+reads −1.5% above), while the steps the log measured at one thread, 28 at −3.3%, 32 at
+−1.1% and 35 at −1.2%, read −3.7%, −1.5% and −0.7% here. Below 2% a single commit's wall
+clock on this host is placement and load (lesson 5 of the first report); the bundle's total,
+−5.4% / −5.0% / −6.2%, is what the sweep resolves.
 
 ## 4. What worked: the committed changes
 
@@ -150,7 +155,7 @@ tail being the summary job's cross-core reads, which the contract fixes.
 
 Everything below was built, verified bit-exact where it got that far, measured and
 reverted; each has a paragraph in the engineering log ("Tried after step N", "Looked at
-after step N"), and the two that mattered most for understanding have tools in
+after step N"); the loop-body copies and probes the measuring took are in
 `scripts/measure/micro`. Grouped by what the attempt assumed.
 
 **Moving a phase out of the kernel function to give its loop the registers.** The bar
@@ -262,7 +267,8 @@ What the bundle as a whole says, for whoever picks this up (the engineering log'
    and verified, were the price of finding them. The log's reverted entries are the map of
    where not to go again.
 8. **The multi-thread tail is at the contract's limit.** Two steps (33, 34) moved serial
-   work into the bands and took the four-thread frame down 3.5%; what is left is the
+   work into the bands and off the serial tail, 2.3% of the four-thread frame by the log
+   (1.563 → 1.531 ms, −2.0%, in the sweep); what is left is the
    summary job's reads of per-cell records other cores wrote, which only the
    output-changing band-independent summary removes. The first report's lesson 4 stands.
 
@@ -276,8 +282,8 @@ python scripts/latency_by_commit.py sweep --include 3957392 --base cf40d37 --hea
 ```
 
 builds and benchmarks the original, the start and every code commit of the bundle into
-`docs/oct-30-2026-optimization-bundle/` (about 2.5 minutes per commit on this host, nearly
-all of it the suite), and
+`docs/oct-30-2026-optimization-bundle/` (2.5 to 4 minutes per commit on this host by its
+load, nearly all of it the suite), and
 
 ```bash
 python scripts/latency_by_commit.py report --out docs/oct-30-2026-optimization-bundle \
